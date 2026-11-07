@@ -210,23 +210,23 @@ def start_submit(site, job_id, hook_dir=None):
     environment = dict(site["base"])
     if hook_dir:
         environment["VM_HOOK_DIR"] = str(hook_dir)
-    process = subprocess.Popen(
-        [sys.executable, str(site["deployment"] / "remote/control.py")],
-        env=environment,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
     payload = {
         "action": "submit",
         "job_id": job_id,
         "kind": "detect",
         "media_path": str(site["media"] / "face.png"),
     }
-    process.stdin.write(json.dumps(payload))
-    process.stdin.close()
-    return process
+    request = site["tmp"] / f"submit-{job_id}.json"
+    request.write_text(json.dumps(payload))
+    with request.open() as stdin:
+        return subprocess.Popen(
+            [sys.executable, str(site["deployment"] / "remote/control.py")],
+            env=environment,
+            stdin=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
 
 def finish_submit(process):
