@@ -40,6 +40,8 @@ PARAMETERS = {
     "StrengthEnableToggle",
     "StrengthAmountSlider",
 }
+# Demuxers that read only the file they are given (mov is MP4/MOV, matroska is MKV/WebM).
+DEMUXERS = "mov,matroska,avi,mpegts,png_pipe,jpeg_pipe,webp_pipe,bmp_pipe"
 MAX_DETECT_FRAMES = 64
 CONTROLS = {
     "DetectorModelSelection",
@@ -242,13 +244,36 @@ def artifact_path(job_id, name):
     return path
 
 
+def ffmpeg_input(path, ffprobe=False):
+    """Arguments that open `path` as one confined FFmpeg or FFprobe input.
+
+    Libavformat refuses a detected format outside DEMUXERS before reading its header, so
+    playlists and concat lists cannot open files input_path never checked. Only local files
+    are readable. FFprobe also accepts image2, which some JPEGs are detected as, with pattern
+    expansion off; the FFmpeg CLI rejects -pattern_type for other demuxers, so it never uses it.
+    """
+    formats = DEMUXERS + (",image2" if ffprobe else "")
+    options = ["-protocol_whitelist", "file", "-format_whitelist", formats]
+    if ffprobe:
+        options += ["-pattern_type", "none"]
+    return [*options, "-i", str(path)]
+
+
 def probe(path):
     result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
-        check=True,
+        ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json"]
+        + ffmpeg_input(path, ffprobe=True),
         capture_output=True,
         timeout=30,
     )
+    refused = re.search(rb"^\[(\w+) @ [^]]*\] Format not on whitelist", result.stderr, re.M)
+    if refused:
+        raise ValueError(
+            f"Unsupported container '{refused[1].decode()}'; use a self-contained video (MP4, "
+            "MOV, Matroska, WebM, AVI or MPEG-TS) or image (PNG, JPEG, WebP or BMP), not a "
+            "playlist or concat list"
+        )
+    result.check_returncode()
     return json.loads(result.stdout)
 
 

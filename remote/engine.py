@@ -21,6 +21,7 @@ from common import (
     REVISION,
     SETTINGS,
     atomic_json,
+    ffmpeg_input,
     input_path,
     layouts,
     probe,
@@ -161,7 +162,7 @@ def decode(path, stream, start, count):
     if start:
         # Accurate input seek drops frames before this point; half a frame early absorbs rounding.
         command += ["-ss", str(float((start - Fraction(1, 2)) / fps))]
-    command += ["-i", str(path), "-map", "0:v:0", "-frames:v", str(count), "-fps_mode"]
+    command += [*ffmpeg_input(path), "-map", "0:v:0", "-frames:v", str(count), "-fps_mode"]
     command += ["passthrough", "-vf", scale_filter(stream, "in") + ",format=bgr24"]
     command += ["-f", "rawvideo", "pipe:1"]
     decoder = subprocess.Popen(command, stdout=subprocess.PIPE)
@@ -492,7 +493,7 @@ def validate_timing(source, fps, stream, end=None):
     command = ["ffprobe", "-v", "error", "-select_streams", "v:0"]
     if end is not None:
         command += ["-read_intervals", f"%+#{end + 32}"]
-    command += ["-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", str(source)]
+    command += ["-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", *ffmpeg_input(source)]
     output = subprocess.check_output(command, text=True, timeout=120)
     timestamps = []
     for line in output.splitlines():
@@ -585,12 +586,10 @@ def render_video(window, request, directory, worker):
             "error",
             "-nostdin",
             "-y",
-            "-i",
-            str(video_only),
+            *ffmpeg_input(video_only),
             "-ss",
             str(float(Fraction(start, 1) / fps)),
-            "-i",
-            str(source),
+            *ffmpeg_input(source),
             "-map",
             "0:v:0",
             "-map",
@@ -667,7 +666,7 @@ def normalize_command(source, output, stream, audio, rate):
     duration = float(stream.get("duration") or 0)
     command = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-nostats", "-progress", "pipe:1"]
     # Keep source timestamps so the filters see the start times ffprobe reported.
-    command += ["-copyts", "-i", str(source), "-map", "0:v:0"]
+    command += ["-copyts", *ffmpeg_input(source), "-map", "0:v:0"]
     # Padding by at most one pixel on the right/bottom keeps every face pixel, unlike cropping.
     command += ["-vf", f"setpts=PTS-STARTPTS,fps={rate},pad=ceil(iw/2)*2:ceil(ih/2)*2"]
     pixels = "yuv420p10le" if deep_color(stream) else "yuv420p"

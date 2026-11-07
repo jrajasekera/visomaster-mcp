@@ -135,7 +135,7 @@ SSH calls use `BatchMode=yes` and share one multiplexed connection through `~/.s
 | Key | Required | Default | Rules |
 | --- | --- | --- | --- |
 | `version` | yes | | `1` |
-| `media_root` | yes | | Existing absolute directory. Media paths and references must resolve inside it |
+| `media_root` | yes | | Existing absolute directory. Media paths and references must resolve inside it and be self-contained video or image files; playlists and concat lists are refused |
 | `fusion_dir` | no | `<media_root>/tools/visomaster-fusion` | Fusion checkout containing `.git` and its layout definition files |
 | `state_dir` | no | `<media_root>/runtime/visomaster-mcp` | Inside `media_root` (uploads and artifacts are reused as inputs), not inside `fusion_dir`; created with mode 0700 |
 | `gpu` | no | `"0"` | GPU index as a string, without leading zeros. Sets `CUDA_VISIBLE_DEVICES` (with `CUDA_DEVICE_ORDER=PCI_BUS_ID`) and names the lock `gpu-<index>.lock` |
