@@ -579,9 +579,9 @@ def git(repository, *arguments):
         GIT_CONFIG_GLOBAL=os.devnull,
         GIT_CONFIG_NOSYSTEM="1",
         GIT_AUTHOR_NAME="test",
-        GIT_AUTHOR_EMAIL="test@example.invalid",
+        GIT_AUTHOR_EMAIL="test@example.com",
         GIT_COMMITTER_NAME="test",
-        GIT_COMMITTER_EMAIL="test@example.invalid",
+        GIT_COMMITTER_EMAIL="test@example.com",
     )
     return subprocess.run(
         ["git", "-C", str(repository), *arguments],
