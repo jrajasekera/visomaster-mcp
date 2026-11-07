@@ -165,25 +165,27 @@ The supervisor starts each GPU job as `<runner...> <release>/engine.py <job dire
 | `get_settings` | Supported Fusion settings with effective defaults and limits |
 | `upload_media` | Stream a local image/video into private workstation storage, reusing identical uploads |
 | `inspect_media` | FFprobe metadata for a workstation file |
-| `detect_faces` | Queue detection at a selected frame and produce reference crops, or sample up to 64 frames (`sample_frames` or `frames`) and group faces into identities with one reference crop each |
+| `detect_faces` | Queue detection at a selected frame and produce reference crops, or sample up to 64 frames (`sample_frames` or `frames`) and group faces into identities (optional `similarity_threshold`) with one reference crop each; only verified crops get a `reference_path` |
 | `submit_swap` | Queue a frame/image preview or a video render with explicit face mappings |
 | `normalize_media` | Queue a CPU-only FFmpeg conversion to a render-ready video (CFR, zero start, even dimensions, rotation and flips applied); does not wait for the GPU |
 | `job_status` | State, frame progress and result manifest; `wait_seconds` (≤ 50) long-polls for the next change; log tail on request or failure |
-| `list_jobs` | Recent job summaries shared across clients (kind, media, frames, timing, status, progress), filterable by `status` and `kind`, `limit` up to 200 |
+| `list_jobs` | Recent job summaries shared across clients (kind, media, frame selection or sampling, timing, status, progress), filterable by `status` and `kind`, `limit` up to 200 |
 | `cancel_job` | Request cancellation, then poll for terminal state |
 | `delete_job` | Permanently remove a terminal job's directory, logs and artifacts |
 | `prune_storage` | Report (dry run, default) or delete old terminal jobs, unused uploads and crash leftovers |
 | `view_artifact` | Return a completed job's PNG/JPEG as an inline MCP image, such as a detection's `contact.jpg` grid of labelled crops |
 | `download_artifact` | Stream a completed artifact to the client |
 
-Multi-frame detection embeds every detected face with the configured recognition model and groups faces greedily, largest first, into identities. A face joins the identity whose mean embedding scores highest on Fusion's similarity scale (50 + 50 × cosine similarity, the scale `SimilarityThresholdSlider` uses) if that score reaches the slider's default of 60. Two faces from the same frame never share an identity. Each identity reports its appearances, frames, up to five sample boxes and a representative crop: the largest of its five largest faces whose crop re-detects as exactly one face (`reference_verified`).
+Multi-frame detection embeds every detected face with the configured recognition model and groups faces greedily, largest first, into identities. A face joins the identity whose mean embedding scores highest on Fusion's similarity scale (50 + 50 × cosine similarity, the scale `SimilarityThresholdSlider` uses) if that score reaches `similarity_threshold`, by default the slider's default of 60. Two faces from the same frame never share an identity. A profile view can score below 50 against the same person's frontal views, about as low as a different person, so it can form its own identity; lowering `similarity_threshold` merges it but can also merge different people who never share a frame, so check the contact sheet. Each identity reports its appearances, frames, up to five sample boxes and a representative crop from the largest of its five largest faces whose crop is verified.
+
+A crop is verified when it is a reference `submit_swap` accepts for that same face: it re-detects as exactly one face under the same detector limit, the detected box overlaps the original by an IoU of at least 0.5, and its embedding scores at least the default `SimilarityThresholdSlider` against the original detection. When the 30% padding takes in a neighbouring face, a crop padded by 10% is tried. Single-frame `faces` and multi-frame `identities` carry `reference_verified`; an unverified crop keeps its `artifact` for inspection but has `reference_path: null`, is marked `*` and framed in red on `contact.jpg`, and a result with no verified crop carries a `warning`.
 
 ## Typical workflow
 
 1. Call `health_check` and `get_settings`.
 2. Use an absolute workstation media path under `media_root`, or upload a local file with `upload_media`.
 3. Call `detect_faces` on a representative frame, or with `sample_frames` (for example 16) to find everyone who appears across a video. Call `job_status` with `wait_seconds: 50` until `completed`, then inspect the returned crops with `view_artifact`; `contact.jpg` shows them all in one labelled grid.
-4. Use the selected crop's or identity's `reference_path` as `target_face`. Supply one or more reference images of the replacement identity as `source_faces`. Each reference image must contain exactly one detected face.
+4. Use the selected crop's or identity's `reference_path` as `target_face` (it is null for unverified crops). Supply one or more reference images of the replacement identity as `source_faces`. Each reference image must contain exactly one detected face.
 5. Submit a `preview`, inspect its image, then submit a short `render`. After reviewing that clip, submit the full frame range.
 6. Follow the job with `job_status` and `wait_seconds`, then download `result.mp4` or `result.png` after completion.
 
@@ -213,6 +215,8 @@ Example `submit_swap` arguments:
 ```
 
 For video, use `mode="render"`, `start_frame` and `max_frames`. A null `max_frames` processes through the end. Frame indices start at zero. Give each intended job a stable `job_id` (1–64 letters, digits, underscores or hyphens, starting with a letter or digit) so a retried submission returns the same job, even after its inputs have been moved or pruned. Reusing an ID with changed settings is rejected, and an empty ID is an error; only an omitted or null ID is generated. Submit a new ID to retry a failed or cancelled job.
+
+Each mapping swaps only its single best-matching face per frame, because the adapter turns on Fusion's `SwapOnlyBestMatchEnableToggle` by default. Without it, any face that clears the mapping's `SimilarityThresholdSlider` is swapped, which on two-person footage swapped the other person intermittently. Pass `"controls": {"SwapOnlyBestMatchEnableToggle": false}` only when one identity appears several times in a frame and every instance should change. Best match cannot help in frames where the target is absent and another face clears the threshold; if a preview or short render shows that, raise `SimilarityThresholdSlider` (75 removed it on the qualified clip).
 
 ## Storage
 

@@ -26,7 +26,7 @@ def test_stdio_discovery():
                 assert prune["dry_run"]["default"] is True
                 assert prune["older_than_days"]["minimum"] == 0
                 detect = tools["detect_faces"].inputSchema["properties"]
-                assert {"frame", "sample_frames", "frames"} <= detect.keys()
+                assert {"frame", "sample_frames", "frames", "similarity_threshold"} <= detect.keys()
                 assert detect["sample_frames"]["anyOf"][0]["maximum"] == 64
                 assert tools["submit_swap"].outputSchema["type"] == "object"
                 assert "mappings" in tools["submit_swap"].inputSchema["required"]

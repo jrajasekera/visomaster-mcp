@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from common import (
+    ADAPTER_CONTROLS,
     APP,
     CONFIG_ERROR,
     REVISION,
@@ -45,17 +46,7 @@ def initialize(controls):
 
     torch.set_num_threads(2)
     control_specs, parameter_specs = layouts()
-    control = {k: v["default"] for k, v in control_specs.items()}
-    control.update(
-        {
-            "DetectorModelSelection": "Yolov8",
-            "MaxFacesToDetectSlider": 20,
-            "LandmarkDetectToggle": False,
-            "ForceSwapToggle": False,
-            "SwapOnlyBestMatchEnableToggle": False,
-        }
-    )
-    control.update(controls)
+    control = initial_controls(control_specs, controls)
     defaults = {k: v["default"] for k, v in parameter_specs.items()}
     window = SimpleNamespace(
         gpu_id=0,
@@ -73,6 +64,14 @@ def initialize(controls):
     window.models_processor.update_provider_configuration("CUDA")
     window.function_worker = FunctionWorker(window.models_processor)
     return window
+
+
+def initial_controls(specs, requested):
+    """Fusion's control defaults, then the adapter's, then the request's validated controls."""
+    control = {k: v["default"] for k, v in specs.items()}
+    control.update(ADAPTER_CONTROLS, LandmarkDetectToggle=False, ForceSwapToggle=False)
+    control.update(requested)
+    return control
 
 
 def display_transform(stream):
@@ -303,14 +302,132 @@ def detect(window, bgr, max_faces=None):
     return tensor, boxes, points
 
 
-def crop_face(image, box):
-    """Pad a detection box by 30% so the crop re-detects as exactly one face."""
+def detect_reference(window, image):
+    """Detections deciding whether an image is a single-face reference, as submit_swap checks."""
+    return detect(window, image, max_faces=20)
+
+
+def recognize(window, tensor, point):
+    """A detected face's embedding from the recognition model Fusion matches with, or None."""
+    model = window.control["RecognitionModelSelection"]
+    embedding = window.function_worker.run_recognize_direct(tensor, point, "Auto", model)[0]
+    return None if embedding is None else [float(v) for v in embedding.ravel()]
+
+
+def unit(vector):
+    norm = math.sqrt(sum(v * v for v in vector)) or 1.0
+    return [v / norm for v in vector]
+
+
+def similarity(a, b):
+    """Fusion's match score: 100 - 50 * cosine distance (FunctionWorker.findCosineDistance)."""
+    return 50 + 50 * sum(x * y for x, y in zip(unit(a), unit(b)))
+
+
+# Crops pad a face's box by a share of its longer side, enough to re-detect; when the padding
+# takes in a neighbouring face, the tighter crop is tried.
+PADDING = (0.3, 0.1)
+
+
+def crop_bounds(box, ratio, limits):
+    """`box` padded by `ratio` of its longer side and clamped to `limits`, both x1, y1, x2, y2."""
     x1, y1, x2, y2 = box
-    pad = int(max(x2 - x1, y2 - y1) * 0.3)
-    return image[
-        max(0, y1 - pad) : min(image.shape[0], y2 + pad),
-        max(0, x1 - pad) : min(image.shape[1], x2 + pad),
-    ]
+    pad = int(max(x2 - x1, y2 - y1) * ratio)
+    return (
+        max(limits[0], x1 - pad),
+        max(limits[1], y1 - pad),
+        min(limits[2], x2 + pad),
+        min(limits[3], y2 + pad),
+    )
+
+
+def region(image, bounds):
+    x1, y1, x2, y2 = bounds
+    return image[y1:y2, x1:x2]
+
+
+def find_faces(window, image, frame):
+    """Faces detected in `image`, each with its box, embedding (None if unrecognized) and
+    padded crop, whose top-left corner in the image is `origin`."""
+    tensor, boxes, points = detect(window, image)
+    faces = []
+    for box, point in zip(boxes, points):
+        box = [int(v) for v in box[:4]]
+        bounds = crop_bounds(box, PADDING[0], (0, 0, image.shape[1], image.shape[0]))
+        faces.append(
+            {
+                "frame": frame,
+                "box": box,
+                "area": (box[2] - box[0]) * (box[3] - box[1]),
+                "embedding": recognize(window, tensor, point),
+                "crop": region(image, bounds).copy(),
+                "origin": bounds[:2],
+            }
+        )
+    return faces
+
+
+def overlap(a, b):
+    """Intersection over union of two boxes."""
+    width, height = min(a[2], b[2]) - max(a[0], b[0]), min(a[3], b[3]) - max(a[1], b[1])
+    if width <= 0 or height <= 0:
+        return 0.0
+    shared = width * height
+    return shared / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - shared)
+
+
+def reference_crop(window, face, threshold):
+    """The first crop of `face` that submit_swap accepts as a reference to this face, or None.
+
+    submit_swap requires a target_face image to re-detect as exactly one face. Here that face
+    must also be this one: its box overlaps the original by an IoU of at least 0.5, and its
+    embedding scores at least `threshold` against the original's. A neighbour inside the
+    padding fails the count and a lone neighbour fails the match; the tighter crop is next.
+    """
+    if face["embedding"] is None:
+        return None
+    image, (left, top) = face["crop"], face["origin"]
+    x1, y1, x2, y2 = face["box"]
+    box = [x1 - left, y1 - top, x2 - left, y2 - top]
+    for ratio in PADDING:
+        bounds = crop_bounds(box, ratio, (0, 0, image.shape[1], image.shape[0]))
+        candidate = region(image, bounds)
+        tensor, boxes, points = detect_reference(window, candidate)
+        if len(boxes) != 1:
+            continue
+        found = [float(v) + shift for v, shift in zip(boxes[0][:4], bounds[:2] * 2)]
+        if overlap(found, box) < 0.5:
+            continue
+        embedding = recognize(window, tensor, points[0])
+        if embedding is not None and similarity(embedding, face["embedding"]) >= threshold:
+            return candidate
+    return None
+
+
+def save_reference(window, candidates, threshold, path):
+    """Save the first verified reference crop of `candidates`, else the first padded crop.
+
+    Returns the face it shows, the image and whether it is verified."""
+    for face in candidates:
+        image = reference_crop(window, face, threshold)
+        if image is not None:
+            save_image(path, image)
+            return face, image, True
+    save_image(path, candidates[0]["crop"])
+    return candidates[0], candidates[0]["crop"], False
+
+
+UNVERIFIED = (
+    "No crop re-detected as exactly its own face, so none is a ready target_face; the crops are "
+    "for inspection only. Detect other frames, or pass a reference image showing one face."
+)
+
+
+def references(result, entries):
+    """`result` with a warning when it has faces but no verified reference."""
+    if entries and not any(entry["reference_verified"] for entry in entries):
+        result["warning"] = UNVERIFIED
+    return result
 
 
 def cluster_faces(embeddings, frames, threshold):
@@ -321,11 +438,6 @@ def cluster_faces(embeddings, frames, threshold):
     similar identity whose normalized mean embedding scores at least `threshold` and that has
     no face from the same frame; otherwise it starts a new identity. Returns one label per face.
     """
-
-    def unit(vector):
-        norm = math.sqrt(sum(v * v for v in vector)) or 1.0
-        return [v / norm for v in vector]
-
     identities, labels = [], []
     for embedding, frame in zip(embeddings, frames):
         vector = unit(embedding)
@@ -352,6 +464,34 @@ def sample_frames(total, count):
     return sorted({(2 * index + 1) * total // (2 * count) for index in range(count)})
 
 
+def detect_frame(window, request, directory):
+    """Every face of one frame, with a reference crop each."""
+    number = request.get("frame", 0)
+    image = load_frame(input_path(request["media_path"]), number)
+    threshold = layouts()[1]["SimilarityThresholdSlider"]["default"]
+    artifacts = directory / "artifacts"
+    faces, tiles = [], []
+    for index, face in enumerate(find_faces(window, image, number)):
+        name = f"face-{index}.png"
+        _, shown, verified = save_reference(window, [face], threshold, artifacts / name)
+        tiles.append((f"face {index}" + ("" if verified else " *"), shown, verified))
+        faces.append(
+            {
+                "index": index,
+                "box": face["box"],
+                "reference_path": str(artifacts / name) if verified else None,
+                "reference_verified": verified,
+                "artifact": name,
+            }
+        )
+    save_image(artifacts / "frame.jpg", image)
+    names = ["frame.jpg"] + [f["artifact"] for f in faces]
+    if tiles:
+        contact_sheet(artifacts / "contact.jpg", tiles)
+        names.insert(1, "contact.jpg")
+    return references({"faces": faces, "artifacts": names}, faces)
+
+
 def detect_identities(window, request, directory):
     import cv2
 
@@ -366,31 +506,17 @@ def detect_identities(window, request, directory):
         frames = sample_frames(len(timing.times), request["sample_frames"])
     elif frames[-1]:
         timing = timeline(path, frames[-1] + 1)
-    model = window.control["RecognitionModelSelection"]
     faces = []
     for done, number in enumerate(frames):
         atomic_json(
             directory / "progress.json",
             {"stage": "detecting", "frames": done, "total_frames": len(frames)},
         )
-        image = load_frame(path, number, timing)
-        tensor, boxes, points = detect(window, image)
-        for box, point in zip(boxes, points):
-            embedding = window.function_worker.run_recognize_direct(tensor, point, "Auto", model)[0]
-            if embedding is None:
-                continue
-            box = [int(v) for v in box[:4]]
-            faces.append(
-                {
-                    "frame": number,
-                    "box": box,
-                    "area": (box[2] - box[0]) * (box[3] - box[1]),
-                    "embedding": [float(v) for v in embedding.ravel()],
-                    "crop": crop_face(image, box).copy(),
-                }
-            )
-    faces.sort(key=lambda face: -face["area"])
-    threshold = layouts()[1]["SimilarityThresholdSlider"]["default"]
+        faces += find_faces(window, load_frame(path, number, timing), number)
+    faces = sorted((f for f in faces if f["embedding"] is not None), key=lambda f: -f["area"])
+    # References are verified at the threshold submit_swap matches with by default.
+    reference = layouts()[1]["SimilarityThresholdSlider"]["default"]
+    threshold = request.get("similarity_threshold", reference)
     labels = cluster_faces([f["embedding"] for f in faces], [f["frame"] for f in faces], threshold)
     groups = {}
     for face, label in zip(faces, labels):
@@ -398,16 +524,12 @@ def detect_identities(window, request, directory):
     artifacts = directory / "artifacts"
     identities, tiles = [], []
     for number, members in enumerate(sorted(groups.values(), key=lambda m: -len(m))):
-        # Members are largest first; keep the first crop that re-detects as one face, as
-        # submit_swap requires of target_face.
-        best, verified = members[0], False
-        for member in members[:5]:
-            if len(detect(window, member["crop"], max_faces=20)[1]) == 1:
-                best, verified = member, True
-                break
+        # Members are largest first; the first of the five largest with a verified crop wins.
         name = f"identity-{number}.png"
-        save_image(artifacts / name, best["crop"])
-        tiles.append((f"id {number}: {len(members)}x" + ("" if verified else " *"), best["crop"]))
+        best, shown, verified = save_reference(window, members[:5], reference, artifacts / name)
+        tiles.append(
+            (f"id {number}: {len(members)}x" + ("" if verified else " *"), shown, verified)
+        )
         identities.append(
             {
                 "identity": number,
@@ -415,7 +537,7 @@ def detect_identities(window, request, directory):
                 "frames": sorted({m["frame"] for m in members}),
                 "frame": best["frame"],
                 "box": best["box"],
-                "reference_path": str(artifacts / name),
+                "reference_path": str(artifacts / name) if verified else None,
                 "reference_verified": verified,
                 "artifact": name,
                 "samples": [
@@ -428,13 +550,14 @@ def detect_identities(window, request, directory):
     if tiles:
         contact_sheet(artifacts / "contact.jpg", tiles)
         names.insert(0, "contact.jpg")
-    return {
+    result = {
         "frames": frames,
         "detections": len(faces),
         "similarity_threshold": threshold,
         "identities": identities,
         "artifacts": names,
     }
+    return references(result, identities)
 
 
 class TargetFace:
@@ -459,7 +582,7 @@ def configure_faces(window, mappings):
         image = cv2.imread(str(input_path(path)))
         if image is None:
             raise ValueError(f"Face reference must be an image: {path}")
-        tensor, boxes, points = detect(window, image, max_faces=20)
+        tensor, boxes, points = detect_reference(window, image)
         if len(boxes) != 1:
             raise ValueError(
                 f"Reference must contain exactly one detected face: {path} ({len(boxes)})"
@@ -543,14 +666,16 @@ def save_image(path, image):
 
 
 def contact_sheet(path, tiles, size=200, columns=6):
-    """Write labelled face crops as one grid image, so a single view shows every face."""
+    """Write labelled face crops as one grid image, so a single view shows every face.
+
+    Tiles are (label, image, verified); unverified ones are framed and labelled in red."""
     import cv2
     import numpy as np
 
     cell, label = size + 8, 36
     rows = -(-len(tiles) // columns)
     sheet = np.full((rows * (cell + label), min(len(tiles), columns) * cell, 3), 32, np.uint8)
-    for number, (text, image) in enumerate(tiles):
+    for number, (text, image, verified) in enumerate(tiles):
         top, left = [v * c for v, c in zip(divmod(number, columns), (cell + label, cell))]
         scale = size / max(image.shape[:2])
         width, height = [max(1, round(v * scale)) for v in (image.shape[1], image.shape[0])]
@@ -559,13 +684,17 @@ def contact_sheet(path, tiles, size=200, columns=6):
         sheet[y : y + height, x : x + width] = cv2.resize(
             image, (width, height), None, 0, 0, interpolation
         )
+        colour = (255, 255, 255) if verified else (0, 0, 255)
+        if not verified:
+            corner = (left + cell - 2, top + cell + label - 2)
+            cv2.rectangle(sheet, (left + 1, top + 1), corner, colour, 2)
         cv2.putText(
             sheet,
             text,
             (left + 8, top + cell + 26),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.75,
-            (255, 255, 255),
+            colour,
             2,
             cv2.LINE_AA,
         )
@@ -965,29 +1094,7 @@ def run(directory):
     if request["kind"] == "detect" and (request.get("frames") or request.get("sample_frames")):
         result = detect_identities(window, request, directory)
     elif request["kind"] == "detect":
-        image = load_frame(input_path(request["media_path"]), request.get("frame", 0))
-        _, boxes, _ = detect(window, image)
-        faces, tiles = [], []
-        for index, box in enumerate(boxes):
-            box = [int(v) for v in box[:4]]
-            name = f"face-{index}.png"
-            crop = crop_face(image, box)
-            save_image(artifacts / name, crop)
-            tiles.append((f"face {index}", crop))
-            faces.append(
-                {
-                    "index": index,
-                    "box": box,
-                    "reference_path": str(artifacts / name),
-                    "artifact": name,
-                }
-            )
-        save_image(artifacts / "frame.jpg", image)
-        names = ["frame.jpg"] + [f["artifact"] for f in faces]
-        if tiles:
-            contact_sheet(artifacts / "contact.jpg", tiles)
-            names.insert(1, "contact.jpg")
-        result = {"faces": faces, "artifacts": names}
+        result = detect_frame(window, request, directory)
     else:
         configure_faces(window, request["mappings"])
         # Fusion's tracking is opt-in and only meaningful across consecutive render frames.

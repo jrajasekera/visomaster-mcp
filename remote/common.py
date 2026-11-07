@@ -54,6 +54,13 @@ CONTROLS = {
     "ByteTrackTrackBufferSlider",
     "KPSSmoothingEnableToggle",
     "KPSEmaAlphaSlider",
+    "SwapOnlyBestMatchEnableToggle",
+}
+# Defaults the adapter applies over Fusion's; get_settings reports them.
+ADAPTER_CONTROLS = {
+    "DetectorModelSelection": "Yolov8",
+    "MaxFacesToDetectSlider": 20,
+    "SwapOnlyBestMatchEnableToggle": True,
 }
 
 
@@ -450,6 +457,9 @@ def validate_fusion_request(request):
             raise ValueError("Use either frames or sample_frames")
         if request.get("frame", 0):
             raise ValueError("Use frame or multi-frame detection, not both")
+    threshold = request.get("similarity_threshold")
+    if threshold is not None and frames is None and samples is None:
+        raise ValueError("similarity_threshold applies only to multi-frame detection")
     if samples is not None and (type(samples) is not int or not 1 <= samples <= MAX_DETECT_FRAMES):
         raise ValueError(f"sample_frames must be 1–{MAX_DETECT_FRAMES}")
     if frames is not None and (
@@ -463,6 +473,12 @@ def validate_fusion_request(request):
     if count is not None and (type(count) is not int or count < 1):
         raise ValueError("max_frames must be positive")
     control, parameters = layouts()
+    if threshold is not None:
+        # Identities are grouped on SimilarityThresholdSlider's scale, within its limits.
+        spec = parameters.get("SimilarityThresholdSlider", {})
+        low, high = int(spec.get("min_value", 1)), int(spec.get("max_value", 100))
+        if type(threshold) is not int or not low <= threshold <= high:
+            raise ValueError(f"similarity_threshold must be an integer from {low} to {high}")
     validate_settings(request.get("controls", {}), control, CONTROLS)
     mappings = request.get("mappings", [])
     if request["kind"] not in {"detect", "normalize"} and not mappings:

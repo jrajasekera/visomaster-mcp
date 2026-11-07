@@ -127,3 +127,44 @@ The existing installation was upgraded in place. Client registrations received e
 | Clients | The Claude Code registration connected; the Codex registration carries the same settings |
 
 Rollback is pointing the `remote` symlink back at the previous release and reverting the client commit; the registrations work with both versions.
+
+# Detection reference and best-match qualification on 2026-11-07
+
+Issues `vmcp-review-remediation-qpn.11`, `vmcp-detect-threshold-ljb` and `vmcp-best-match-dnq` were qualified on the same workstation class (Maxwell, compute capability 5.2, 24 GB VRAM class) and Fusion commit, through a separate deployment root with its own state directory that shared the production GPU lock. Jobs were driven through the MCP SDK client and the client-side server; production was not changed. The GPU and the Fusion GUI were idle before the runs.
+
+## Automated checks
+
+`tests/test_detect.py` drives detection with a stubbed detector and recognizer over synthetic scenes: a neighbour inside the padding, a lone neighbour re-detection, an overlapping face of another identity, clean crops in both modes accepted by `configure_faces`, all-unverified results, clustering thresholds, threshold validation, list summaries, the client schema and the best-match control and default.
+
+## Detection references
+
+| Run | Observed result |
+| --- | --- |
+| Two-person clip, single frame | Both faces verified; each crop contained only its own face (contact sheet inspected) |
+| Close-up clip, 8 sampled frames | The main subject verified in 8/8; four small, blurred background faces unverified, framed in red and marked `*`, with null `reference_path` |
+| Three-person clip, single frame and 16 sampled frames | Single frame: all three faces verified. Sampled: three people verified; the mother's strong profile view (2 frames) formed a fourth identity and was unverified |
+| Reference check diagnostics on the three-person clip (frames 102, 114, 126) | Every crop re-detected one face. Frontal and three-quarter faces re-recognized at 62–99 against their full-frame embeddings with IoU 0.69–0.94; the profile views scored 47–50 (IoU about 0.6), and their 10% crops detected no face |
+| Two-person clip, verified crop as target | Used as the render target below; matched on 96/96 frames |
+
+The profile view's own crop scores below the default threshold against the face it came from, so it would not reliably match that face at swap time; the previous count-only check had marked it verified.
+
+## Clustering threshold
+
+On the three-person clip with 16 sampled frames, thresholds 60 (default), 55 and 50 gave four identities, the mother's profile view separate. Thresholds 45 and 40 gave three identities, each with 16 appearances and a verified crop. Pairwise scores between different people in these frames were 45–53, between the profile and the mother's three-quarter view 60–64 and between the profile and her frontal views lower; a threshold low enough to merge the profile is therefore close to the scores of different people, and the contact sheet should confirm a merge. `list_jobs` showed `sample_frames` and `similarity_threshold` for multi-frame detection and `frame` for single-frame detection.
+
+## Best-match swapping
+
+96-frame renders of the two-person clip with a synthetic source face, target the man. Swapped frames were counted per face region by pixel change against the source (a region counts when more than 1% of its pixels change by a mean level above 25); this measure reproduced the earlier tracking baselines exactly (51/96 and 0/96).
+
+| Best match | `SimilarityThresholdSlider` | Non-target frames swapped | Target frames swapped | Swaps reported | Speed |
+| --- | --- | --- | --- | --- | --- |
+| off | 60 | 50/96 | 96/96 | 146 | 5.2 fps |
+| on (new default) | 60 | 0/96 | 96/96 | 96 | 6.8 fps |
+| off | 75 | 0/96 | 96/96 | 96 | 6.6 fps |
+| on | 75 | 0/96 | 96/96 | 96 | 6.7 fps |
+
+Frames 0, 32, 64 and 95 of the default render were inspected: the woman's face was unchanged and the man's swapped. `get_settings` reported `SwapOnlyBestMatchEnableToggle` with default `true`, and `health_check` reported `code_matches: true`.
+
+## Remaining limits
+
+Best match was qualified on one two-person clip with one mapping. Multiple mappings, crowds, mirrors or a target absent while a look-alike remains, and tracking combined with best match were not exercised. Native Claude/Codex UI sessions were not opened.

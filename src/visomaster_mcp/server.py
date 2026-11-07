@@ -126,20 +126,38 @@ async def detect_faces(
     frame: int = 0,
     sample_frames: Annotated[int | None, Field(ge=1, le=64)] = None,
     frames: Annotated[list[int] | None, Field(min_length=1, max_length=64)] = None,
+    similarity_threshold: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            le=100,
+            description="Multi-frame only: score (Fusion's 1-100 similarity scale) at which faces "
+            "join an identity; default is Fusion's SimilarityThresholdSlider default (60). Lower "
+            "it (e.g. 50) when one person's profile and frontal views split into identities.",
+        ),
+    ] = None,
     controls: dict | None = None,
     job_id: JobId = None,
 ) -> dict[str, Any]:
     """Queue face detection. Poll job_status, then inspect crops with view_artifact.
 
-    Single-frame detection (`frame`, zero based) returns `faces` with crop reference paths
-    usable as FaceMapping.target_face. To find who appears across a video, pass
-    `sample_frames` (N evenly spaced frames) or explicit `frames` (at most 64) instead: faces
-    are grouped into `identities` by recognition-embedding similarity at Fusion's default
-    similarity threshold. Each identity lists its appearances, frames, sample boxes and a
-    representative crop (`reference_path`, verified to re-detect as one face) usable as
-    target_face. Both modes write contact.jpg, one grid of every crop labelled "face N" or
-    "id N: <appearances>x" (* marks an unverified reference); view it first.
+    Single-frame detection (`frame`, zero based) returns `faces`. To find who appears across a
+    video, pass `sample_frames` (N evenly spaced frames) or explicit `frames` (at most 64)
+    instead: faces are grouped into `identities` by recognition-embedding similarity at
+    `similarity_threshold`, each with its appearances, frames and sample boxes. Every face or
+    identity has a crop `artifact`. Its `reference_path` is usable as FaceMapping.target_face
+    only when `reference_verified` is true: the crop re-detects as exactly one face, the same
+    face, as submit_swap requires (a tighter crop is tried when a neighbour intrudes).
+    Otherwise `reference_path` is null and the crop is for inspection only; a result without
+    any verified reference also carries a `warning`. Both modes write contact.jpg, one grid of
+    every crop labelled "face N" or "id N: <appearances>x"; unverified crops are marked * and
+    framed in red. View it first.
     """
+    optional = (
+        ("sample_frames", sample_frames),
+        ("frames", frames),
+        ("similarity_threshold", similarity_threshold),
+    )
     return await command(
         "submit",
         job_id=uuid.uuid4().hex if job_id is None else job_id,
@@ -148,9 +166,7 @@ async def detect_faces(
         frame=frame,
         controls=controls or {},
         # Omitted when unset so single-frame requests keep their earlier, idempotent form.
-        **{
-            k: v for k, v in (("sample_frames", sample_frames), ("frames", frames)) if v is not None
-        },
+        **{k: v for k, v in optional if v is not None},
     )
 
 
@@ -172,7 +188,11 @@ async def submit_swap(
     with the selected interval's first audio stream encoded to AAC, or no audio if that stream
     has no samples there. Preview defaults to Inswapper128. Consult get_settings before changing parameters. GPU jobs run one at a time.
     Renders reject VFR, nonzero start times, odd dimensions, rotation and display flips; use
-    normalize_media.
+    normalize_media. Each target swaps only its best-matching face per frame by default
+    (control SwapOnlyBestMatchEnableToggle), so a look-alike that clears the mapping's
+    SimilarityThresholdSlider is left alone while the target is in frame. Turn it off only to
+    swap several faces of one identity in a frame. When the target leaves the frame, another
+    face can still match; raise SimilarityThresholdSlider (e.g. 75) if the preview shows that.
     """
     return await command(
         "submit",
@@ -244,7 +264,8 @@ async def list_jobs(
 ) -> list[dict[str, Any]]:
     """List the most recently updated jobs, including jobs submitted by another client.
 
-    Each summary has kind, status, media_path, frame (start_frame/max_frames for renders, fps
+    Each summary has kind, status, media_path, frame (sample_frames or frames, and any
+    similarity_threshold, for multi-frame detection; start_frame/max_frames for renders; fps
     for normalization), created/started/finished timestamps, elapsed_seconds since submission
     (until finish), error and progress. Use job_status for results and logs.
     """

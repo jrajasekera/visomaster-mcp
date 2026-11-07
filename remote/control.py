@@ -25,6 +25,7 @@ if __name__ == "__main__" and os.path.realpath(__file__) != os.path.abspath(__fi
     os.execv(sys.executable, [sys.executable, os.path.realpath(__file__), *sys.argv[1:]])
 
 from common import (  # noqa: E402
+    ADAPTER_CONTROLS,
     APP,
     BASE,
     CONFIG_ERROR,
@@ -143,6 +144,10 @@ def list_jobs(only_status=None, only_kind=None, limit=50):
         frames = {"render": ("start_frame", "max_frames"), "normalize": ("fps",)}.get(
             request.get("kind"), ("frame",)
         )
+        if request.get("kind") == "detect":
+            # Multi-frame detection reports its sampling instead of the unused single frame.
+            multi = ("sample_frames", "frames", "similarity_threshold")
+            frames = tuple(k for k in multi if request.get(k) is not None) or frames
         created, end = state.get("created_at"), state.get("finished_at") or time.time()
         jobs.append(
             {
@@ -768,8 +773,9 @@ def dispatch(action, request):
         raise ValueError(CONFIG_ERROR)
     if action == "settings":
         controls, parameters = layouts()
-        controls["DetectorModelSelection"]["default"] = "Yolov8"
-        controls["MaxFacesToDetectSlider"]["default"] = 20
+        for key, value in ADAPTER_CONTROLS.items():
+            if key in controls:
+                controls[key]["default"] = value
         parameters["SwapModelSelection"]["options"] = [
             value
             for value in parameters["SwapModelSelection"]["options"]
