@@ -124,7 +124,7 @@ Set these in the MCP client registration. They are validated on the first tool c
 | `VISOMASTER_REMOTE` | yes | none | Absolute workstation deployment directory; letters, digits and `_./-`, no `..` |
 | `VISOMASTER_REMOTE_PYTHON` | no | `python3` | Workstation interpreter for control commands: a command name or an absolute path |
 | `VISOMASTER_SSH` | no | `ssh` | Client SSH program |
-| `VISOMASTER_DOWNLOADS` | no | `~/Downloads/visomaster-mcp` | Local directory for `download_artifact` |
+| `VISOMASTER_DOWNLOADS` | no | `~/Downloads/visomaster-mcp` | Local directory for `download_artifact`; absolute or starting with `~`, relative paths are rejected |
 
 SSH calls use `BatchMode=yes` and share one multiplexed connection through `~/.ssh/visomaster-%C`, which persists for 120 seconds after the last call. Nothing relies on SSH environment forwarding or remote shell profiles.
 

@@ -1,6 +1,8 @@
 """MCP transport on the Mac; authenticated SSH controls the GPU workstation."""
 
 import asyncio
+import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -266,15 +268,97 @@ async def prune_storage(
     return await command("prune", older_than_days=older_than_days, dry_run=dry_run)
 
 
+INLINE_LIMIT = 10_000_000
+
+
+async def stream_artifact(job_id, name, receive, limit=None, timeout=45):
+    """Stream a completed artifact's bytes to the writer that receive(header) returns.
+
+    The workstation opens the file once and sends a JSON header with its size, then exactly that
+    many bytes from the same descriptor, so metadata and content come from one job generation.
+    At most size + 1 bytes are read before a mismatch fails the transfer.
+    """
+    settings = transport()
+    arguments = settings.control("artifact", job_id, name, *([] if limit is None else [str(limit)]))
+    process = await asyncio.create_subprocess_exec(
+        *settings.ssh_prefix(),
+        settings.command(arguments),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    errors = asyncio.ensure_future(process.stderr.read())
+
+    async def transfer():
+        header = await process.stdout.readline()
+        try:
+            response = json.loads(header)
+        except ValueError:
+            await process.wait()
+            message = (header + await errors).decode(errors="replace")[-6000:]
+            raise RuntimeError(
+                settings.hint(message) if process.returncode == 255 else message
+            ) from None
+        if "error" in response:
+            raise RuntimeError(response["error"])
+        info = response["result"]
+        size = info["size"]
+        if limit is not None and size > limit:
+            raise ValueError(f"Artifact is larger than the {limit}-byte limit")
+        write, received = receive(info), 0
+        while chunk := await process.stdout.read(min(1024 * 1024, size - received + 1)):
+            received += len(chunk)
+            if received > size:
+                raise RuntimeError("Artifact transfer exceeded the announced size")
+            write(chunk)
+        if await process.wait() or received != size:
+            raise RuntimeError("Artifact transfer was interrupted or its size changed")
+        return info
+
+    try:
+        return await asyncio.wait_for(transfer(), timeout)
+    finally:
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            # Reading resumes the paused pipe, so its end of file lets wait() finish.
+            while await process.stdout.read(1024 * 1024):
+                pass
+            await process.wait()
+        errors.cancel()
+
+
 @mcp.tool(annotations=READ)
 async def view_artifact(job_id: str, name: str = "preview.jpg") -> Image:
     """Show a completed job's PNG/JPEG crop or preview inline in Claude or Codex."""
-    info = await command("artifact", job_id=job_id, name=name)
-    suffix = Path(info["path"]).suffix.lower()
-    if suffix not in {".png", ".jpg", ".jpeg"} or info["size"] > 10_000_000:
+    suffix = Path(name).suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg"}:
         raise ValueError("Inline artifacts must be PNG/JPEG images smaller than 10 MB")
-    data = await ssh(["cat", "--", info["path"]])
-    return Image(data=data, format="png" if suffix == ".png" else "jpeg")
+    data = bytearray()
+    await stream_artifact(job_id, name, lambda info: data.extend, limit=INLINE_LIMIT)
+    return Image(data=bytes(data), format="png" if suffix == ".png" else "jpeg")
+
+
+def plain_name(value):
+    if value in ("", ".", "..") or "/" in value or "\0" in value:
+        raise ValueError(f"{value!r} is not a plain file name")
+    return value
+
+
+def download_directory(root, job_id):
+    """Open the job's download directory below the root descriptor, refusing symlinks."""
+    try:
+        os.mkdir(plain_name(job_id), dir_fd=root)
+    except FileExistsError:
+        pass
+    try:
+        return os.open(job_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise RuntimeError(
+                f"Download directory {job_id} must be a real directory inside the downloads root"
+            ) from None
+        raise
 
 
 @mcp.tool(annotations=WRITE)
@@ -283,20 +367,38 @@ async def download_artifact(job_id: str, name: str = "result.mp4") -> dict[str, 
 
     Returns its absolute Mac path. Large videos stream directly to disk.
     """
-    info = await command("artifact", job_id=job_id, name=name)
-    directory = transport().downloads / job_id
-    directory.mkdir(parents=True, exist_ok=True)
-    destination = directory / Path(info["path"]).name
-    temporary = directory / f".download-{uuid.uuid4().hex}"
+    downloads = transport().downloads
+    downloads.mkdir(parents=True, exist_ok=True)
+    # The configured root is the trust boundary: the partial file stays in it, and the job
+    # directory is reopened without following symlinks when the complete file is published.
+    root = os.open(downloads, os.O_RDONLY | os.O_DIRECTORY)
+    temporary = f".download-{uuid.uuid4().hex}"
+    output = None
+
+    def receive(info):
+        nonlocal output
+        plain_name(name)
+        os.close(download_directory(root, job_id))  # Refuse a bad directory before streaming.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        output = open(os.open(temporary, flags, 0o666, dir_fd=root), "wb")
+        return output.write
+
     try:
-        with temporary.open("xb") as stream:
-            await ssh(["cat", "--", info["path"]], timeout=3600, stdout=stream)
-        if temporary.stat().st_size != info["size"]:
-            raise RuntimeError("Download size does not match the artifact")
-        os.replace(temporary, destination)
+        try:
+            info = await stream_artifact(job_id, name, receive, timeout=3600)
+        finally:
+            if output is not None:
+                output.close()
+        directory = download_directory(root, job_id)
+        try:
+            os.replace(temporary, name, src_dir_fd=root, dst_dir_fd=directory)
+        finally:
+            os.close(directory)
     finally:
-        temporary.unlink(missing_ok=True)
-    return {"path": str(destination), "bytes": info["size"]}
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=root)
+        os.close(root)
+    return {"path": str(downloads / job_id / name), "bytes": info["size"]}
 
 
 def sha256_file(path):

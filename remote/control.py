@@ -2,6 +2,7 @@
 
 import contextlib
 import copy
+import errno
 import fcntl
 import hashlib
 import json
@@ -10,6 +11,7 @@ import platform
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,7 +33,6 @@ from common import (
     STATE,
     TERMINAL,
     ConfigError,
-    artifact_path,
     atomic_json,
     config_path,
     input_path,
@@ -693,10 +694,9 @@ def dispatch(action, request):
     if action == "list":
         return list_jobs(request.get("status"), request.get("kind"), request.get("limit", 50))
     if action == "artifact":
-        if status(request["job_id"])["status"] != "completed":
-            raise ValueError("Artifacts become available after successful completion")
-        path = artifact_path(request["job_id"], request["name"])
-        return {"path": str(path), "size": path.stat().st_size}
+        descriptor, path, size = open_artifact(request["job_id"], request["name"])
+        os.close(descriptor)
+        return {"path": str(path), "size": size}
     if action == "delete":
         return delete_job(request["job_id"])
     if action == "prune":
@@ -704,6 +704,59 @@ def dispatch(action, request):
     if action == "find_upload":
         return find_upload(request["sha256"], request["suffix"], request["size"])
     raise ValueError(f"Unknown action {action}")
+
+
+def open_artifact(job_id, name):
+    """Open a completed job's artifact through one job-directory descriptor.
+
+    State, size and bytes then belong to one job generation, even if the job is deleted and its
+    ID reused while a transfer runs. Symlinks and names other than one plain component are refused.
+    """
+    directory = job_path(job_id)
+    if not isinstance(name, str) or name in ("", ".", "..") or "/" in name or "\0" in name:
+        raise ValueError("Artifact path escapes the job")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptors = []
+    try:
+        try:
+            descriptors.append(os.open(directory, flags | os.O_DIRECTORY))
+            with open(os.open("state.json", flags | os.O_NONBLOCK, dir_fd=descriptors[0])) as state:
+                completed = json.load(state).get("status") == "completed"
+            if not completed:
+                raise ValueError("Artifacts become available after successful completion")
+            descriptors.append(os.open("artifacts", flags | os.O_DIRECTORY, dir_fd=descriptors[0]))
+            descriptor = os.open(name, flags | os.O_NONBLOCK, dir_fd=descriptors[1])
+        except OSError as error:
+            if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise ValueError("Artifact path escapes the job") from None
+            raise
+    finally:
+        for value in descriptors:
+            os.close(value)
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode):
+        os.close(descriptor)
+        raise ValueError("Artifact path escapes the job")
+    return descriptor, directory / "artifacts" / name, info.st_size
+
+
+def stream_artifact(job_id, name, limit=None):
+    """Write a JSON header line with the artifact's size, then exactly that many of its bytes."""
+    descriptor, path, size = open_artifact(job_id, name)
+    with open(descriptor, "rb") as source:
+        if limit is not None and size > int(limit):
+            raise ValueError(f"Artifact is larger than the {int(limit)}-byte limit")
+        stdout = sys.stdout.buffer
+        stdout.write(json.dumps({"result": {"path": str(path), "size": size}}).encode() + b"\n")
+        stdout.flush()
+        remaining = size
+        while remaining:
+            chunk = source.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValueError("Artifact shrank during transfer")
+            stdout.write(chunk)
+            remaining -= len(chunk)
+        stdout.flush()
 
 
 def upload_destination(upload_id, suffix, expected_size):
@@ -771,6 +824,15 @@ def upload(upload_id, suffix, expected_size):
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "supervise":
         supervise(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) in (4, 5) and sys.argv[1] == "artifact":
+        try:
+            if CONFIG_ERROR:
+                raise ValueError(CONFIG_ERROR)
+            stream_artifact(*sys.argv[2:])
+        except Exception as error:
+            # After the header this trails partial bytes; the client sees the exit status.
+            print(json.dumps({"error": str(error)}))
+            sys.exit(1)
     else:
         try:
             if len(sys.argv) == 5 and sys.argv[1] == "upload":
