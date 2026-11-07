@@ -42,6 +42,18 @@ from common import (
 )
 
 MAX_WAIT = 50
+GRACE = 10  # Seconds a cancelled worker gets to exit on SIGTERM before its group is killed.
+# Leads the job's process group so the group ID stays reserved until the supervisor reaps it. It
+# ignores the cancellation SIGTERM and kills the whole group when the supervisor's pipe closes,
+# which also covers a supervisor that dies.
+GUARD = """import os, signal
+for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(number, signal.SIG_IGN)
+os.write(1, b"+")
+while os.read(0, 1):
+    pass
+os.killpg(0, signal.SIGKILL)
+"""
 
 
 def current(directory):
@@ -56,8 +68,16 @@ def current(directory):
             else:
                 state = read_json(directory / "state.json")
                 if state["status"] not in TERMINAL and time.time() - state["created_at"] > 15:
-                    state.update(status="failed", error="Supervisor exited or host restarted")
+                    state.update(
+                        status="failed",
+                        error="Supervisor exited or host restarted",
+                        finished_at=time.time(),
+                    )
                     atomic_json(directory / "state.json", state)
+    if state["status"] in TERMINAL and not state.get("finished_at"):
+        # Terminal records written before finish times were recorded: the state file is never
+        # rewritten once terminal, so its modification time is the finish time.
+        state["finished_at"] = modified(directory / "state.json")
     progress = directory / "progress.json"
     if progress.exists():
         state["progress"] = read_json(progress)
@@ -177,7 +197,7 @@ def submit(request):
                 )
             except Exception as error:
                 state = read_json(directory / "state.json")
-                state.update(status="failed", error=str(error))
+                state.update(status="failed", error=str(error), finished_at=time.time())
                 atomic_json(directory / "state.json", state)
                 raise
     return status(job_id)
@@ -234,6 +254,44 @@ def valid_job_directory(value):
     )
 
 
+def spawn(arguments, group, **options):
+    """Start a process in process group `group`, or in a new group it leads when `group` is 0."""
+    if sys.version_info >= (3, 11):
+        return subprocess.Popen(arguments, process_group=group, **options)
+    # Older system Pythons lack process_group; the supervisor is single-threaded.
+    return subprocess.Popen(arguments, preexec_fn=lambda: os.setpgid(0, group), **options)
+
+
+def signal_group(group, number):
+    try:
+        os.killpg(group, number)
+    except (ProcessLookupError, PermissionError):
+        pass  # Only exited members remain; macOS reports EPERM for those.
+
+
+def stop(guard, worker):
+    """Kill the job's process group, then reap the worker and the guard.
+
+    The unreaped guard reserves the group ID, so the signal cannot reach another group.
+    """
+    if guard is None or guard.returncode is not None:
+        return
+    signal_group(guard.pid, signal.SIGKILL)
+    if worker is not None:
+        worker.wait()
+    guard.wait()
+    guard.stdin.close()
+    guard.stdout.close()
+    # Killed members finish exiting asynchronously. Signal 0 cannot affect a reused group ID.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(guard.pid, 0)
+        except (ProcessLookupError, PermissionError):
+            break
+        time.sleep(0.02)
+
+
 def supervise(job_directory, identity):
     directory = Path(job_directory)
     if not valid_job_directory(directory):
@@ -242,7 +300,7 @@ def supervise(job_directory, identity):
     with (directory / "lease").open("a") as lease:
         fcntl.flock(lease, fcntl.LOCK_EX)
         state = {"job_id": directory.name, "status": "queued"}
-        child = None
+        guard = child = None
         try:
             # Terminal state always goes to this directory, whatever the configuration says now.
             state = read_json(directory / "state.json")
@@ -283,12 +341,20 @@ def supervise(job_directory, identity):
                     str(Path(__file__).with_name("engine.py")),
                     str(directory),
                 ]
+                guard = spawn(
+                    [sys.executable, "-I", "-S", "-c", GUARD],
+                    0,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                )
+                if guard.stdout.read(1) != b"+":
+                    raise RuntimeError("Cannot start the process group guard")
                 # Inherit the GPU lease so a supervisor crash cannot release it while rendering.
                 try:
-                    child = subprocess.Popen(
+                    child = spawn(
                         arguments,
+                        guard.pid,
                         env=environment,
-                        start_new_session=True,
                         pass_fds=(gpu_lock.fileno(),) if gpu else (),
                     )
                 except OSError as error:
@@ -297,14 +363,15 @@ def supervise(job_directory, identity):
                     ) from None
                 while child.poll() is None:
                     if (directory / "cancel").exists():
-                        os.killpg(child.pid, signal.SIGTERM)
+                        signal_group(guard.pid, signal.SIGTERM)
                         try:
-                            child.wait(timeout=10)
+                            child.wait(timeout=GRACE)
                         except subprocess.TimeoutExpired:
-                            os.killpg(child.pid, signal.SIGKILL)
-                            child.wait()
+                            pass
                         break
                     time.sleep(0.2)
+                # Helpers left in the group, whatever the worker's exit, die before any result.
+                stop(guard, child)
                 # A cancel arriving after the worker finished must not discard its result.
                 if child.returncode == 0 and (directory / "result.json").exists():
                     state["status"] = "completed"
@@ -320,11 +387,22 @@ def supervise(job_directory, identity):
         except Exception as error:
             state.update(status="failed", error=str(error))
         finally:
-            if child is not None and child.poll() is None:
-                os.killpg(child.pid, signal.SIGKILL)
-                child.wait()
+            stop(guard, child)
             state["finished_at"] = time.time()
             atomic_json(directory / "state.json", state)
+
+
+def cancel(job_id):
+    directory = job_path(job_id)
+    # Delete and resubmission replace job directories under the submit lock, so holding it from
+    # the status check to the marker keeps a replacement job from receiving this cancellation.
+    with (STATE / "submit.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = status(job_id)
+        active = state["status"] not in TERMINAL
+        if active:
+            (directory / "cancel").touch()
+    return {"job_id": job_id, "cancel_requested": active, "status": state["status"]}
 
 
 def tree_bytes(path):
@@ -544,15 +622,7 @@ def dispatch(action, request):
             request["job_id"], request.get("wait_seconds", 0), request.get("include_log", False)
         )
     if action == "cancel":
-        directory = job_path(request["job_id"])
-        current = status(request["job_id"])
-        if current["status"] not in TERMINAL:
-            (directory / "cancel").touch()
-        return {
-            "job_id": request["job_id"],
-            "cancel_requested": current["status"] not in TERMINAL,
-            "status": current["status"],
-        }
+        return cancel(request["job_id"])
     if action == "list":
         return list_jobs(request.get("status"), request.get("kind"), request.get("limit", 50))
     if action == "artifact":
