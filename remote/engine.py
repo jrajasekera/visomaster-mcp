@@ -152,16 +152,26 @@ def color_tags(stream):
     return tags
 
 
-def decode(path, stream, start, count):
-    """Yield BGR frames start..start+count-1 on the same CFR timeline used for audio offsets."""
+def decode(path, stream, start, count, times=None):
+    """Yield BGR frames start..start+count-1 in decoded order.
+
+    `times` are presentation times of frames 0..start from a Timeline; without them the stream
+    must be CFR from zero, as validate_timing checks. Seeks use the video stream's own clock:
+    without -seek_timestamp FFmpeg offsets -ss by the container start, which an earlier audio
+    stream can move.
+    """
     import numpy as np
 
     width, height = int(stream["width"]), int(stream["height"])
-    fps = Fraction(stream["avg_frame_rate"])
     command = ["ffmpeg", "-v", "error", "-nostdin", "-threads", "2", "-noautorotate"]
     if start:
-        # Accurate input seek drops frames before this point; half a frame early absorbs rounding.
-        command += ["-ss", str(float((start - Fraction(1, 2)) / fps))]
+        # Accurate seeking drops frames before a point midway between the previous frame and
+        # this one, which absorbs timestamp rounding.
+        if times:
+            point = (times[start - 1] + times[start]) / 2
+        else:
+            point = float((start - Fraction(1, 2)) / Fraction(stream["avg_frame_rate"]))
+        command += ["-seek_timestamp", "1", "-ss", str(point)]
     command += [*ffmpeg_input(path), "-map", "0:v:0", "-frames:v", str(count), "-fps_mode"]
     command += ["passthrough", "-vf", scale_filter(stream, "in") + ",format=bgr24"]
     command += ["-f", "rawvideo", "pipe:1"]
@@ -180,7 +190,12 @@ def decode(path, stream, start, count):
         decoder.stdout.close()
 
 
-def load_frame(path, frame_number=0):
+def load_frame(path, frame_number=0, timing=None):
+    """Read zero-based decoded frame `frame_number`, selected on the video stream's timeline.
+
+    `timing` is a Timeline reaching that frame; without it a bounded scan is made here. Packet
+    timestamps give each ordinal's actual time, so variable frame rates select exact frames.
+    """
     import cv2
 
     image = cv2.imread(str(path))
@@ -188,11 +203,18 @@ def load_frame(path, frame_number=0):
         if frame_number:
             raise ValueError("Images only have frame 0")
         return image
-    frames = decode(path, video_stream(probe(path)), frame_number, 1)
+    stream, times = video_stream(probe(path)), None
+    if frame_number:
+        times = (timing or timeline(path, frame_number + 1)).times
+        if frame_number >= len(times):
+            raise ValueError(
+                f"Frame {frame_number} is out of range; the video has {len(times)} frames"
+            )
+    decoded = decode(path, stream, frame_number, 1, times)
     try:
-        frame = next(frames, None)
+        frame = next(decoded, None)
     finally:
-        frames.close()
+        decoded.close()
     if frame is None:
         raise ValueError(f"Cannot read frame {frame_number} from {path}")
     return frame
@@ -259,25 +281,25 @@ def cluster_faces(embeddings, frames, threshold):
     return labels
 
 
-def sample_frames(path, count):
-    """Pick `count` frame indices at the centres of equal spans of the video."""
-    import cv2
-
-    if cv2.imread(str(path)) is not None:
-        return [0]
-    metadata = probe(path)
-    stream = video_stream(metadata)
-    total = int(stream.get("nb_frames") or 0) or int(
-        float(metadata["format"]["duration"]) * Fraction(stream["avg_frame_rate"])
-    )
-    if total <= 0:
-        raise ValueError("Cannot determine the video frame count")
+def sample_frames(total, count):
+    """Pick `count` frame indices at the centres of equal spans of `total` frames."""
     return sorted({(2 * index + 1) * total // (2 * count) for index in range(count)})
 
 
 def detect_identities(window, request, directory):
+    import cv2
+
     path = input_path(request["media_path"])
-    frames = sorted(request.get("frames") or []) or sample_frames(path, request["sample_frames"])
+    frames, timing = sorted(request.get("frames") or []), None
+    if cv2.imread(str(path)) is not None:
+        frames = frames or [0]
+    elif not frames:
+        # The scan counts the selected video stream's frames; container metadata can describe
+        # a longer audio track or be missing.
+        timing = timeline(path)
+        frames = sample_frames(len(timing.times), request["sample_frames"])
+    elif frames[-1]:
+        timing = timeline(path, frames[-1] + 1)
     model = window.control["RecognitionModelSelection"]
     faces = []
     for done, number in enumerate(frames):
@@ -285,7 +307,7 @@ def detect_identities(window, request, directory):
             directory / "progress.json",
             {"stage": "detecting", "frames": done, "total_frames": len(frames)},
         )
-        image = load_frame(path, number)
+        image = load_frame(path, number, timing)
         tensor, boxes, points = detect(window, image)
         for box, point in zip(boxes, points):
             embedding = window.function_worker.run_recognize_direct(tensor, point, "Auto", model)[0]
@@ -484,34 +506,64 @@ def contact_sheet(path, tiles, size=200, columns=6):
     save_image(path, sheet)
 
 
-def validate_timing(source, fps, stream, end=None):
-    """Check presentation timestamps of the first `end` frames (all if None); metadata can hide VFR.
+class Timeline:
+    """Presentation times (seconds, ascending) of the first video stream's frames.
 
-    Packet timestamps avoid decoding. Packets arrive in decode order, so read enough extra packets
-    to cover B-frame reordering, then sort.
+    times[n] is decoded frame n on the stream's own clock, whatever the container start.
+    """
+
+    def __init__(self, times):
+        if not times:
+            raise ValueError("No video timestamps found")
+        self.times = times
+        self.start = times[0]
+
+    def constant(self, fps, tolerance):
+        """Whether frame n lies n/fps after the start for every frame read."""
+        return all(abs(t - self.start - n / fps) <= tolerance for n, t in enumerate(self.times))
+
+    @property
+    def duration(self):
+        """Seconds through the end of the last frame, taken to last the average interval."""
+        count = len(self.times)
+        return (self.times[-1] - self.start) * count / (count - 1) if count > 1 else None
+
+
+def timeline(source, end=None):
+    """Read the Timeline of the first `end` frames (all if None) from packets, without decoding.
+
+    Packets arrive in decode order, so a bounded read takes enough extra packets to cover
+    B-frame reordering, then sorts. Discarded (edit-list) packets are skipped. A packet without
+    a timestamp leaves frame order unknown.
     """
     command = ["ffprobe", "-v", "error", "-select_streams", "v:0"]
     if end is not None:
         command += ["-read_intervals", f"%+#{end + 32}"]
     command += ["-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", *ffmpeg_input(source)]
     output = subprocess.check_output(command, text=True, timeout=120)
-    timestamps = []
+    times = []
     for line in output.splitlines():
         value, _, flags = line.partition(",")
-        if value.strip() and value.strip() != "N/A" and "D" not in flags:
-            timestamps.append(float(value))
-    timestamps = sorted(timestamps)[:end]
-    if not timestamps:
-        raise ValueError("No video timestamps found")
+        value = value.strip()
+        if not value or "D" in flags:
+            continue
+        if value == "N/A":
+            raise ValueError("Video packets lack timestamps; run normalize_media first")
+        times.append(float(value))
+    return Timeline(sorted(times)[:end])
+
+
+def validate_timing(source, fps, stream, end=None):
+    """Require CFR timestamps from zero over the first `end` frames (all if None); metadata can
+    hide VFR. Returns the number of frames checked."""
+    timing = timeline(source, end)
     tick = float(Fraction(stream["time_base"]))
     tolerance = max(0.00001, tick * 1.1)
-    first = timestamps[0]
-    if abs(first) > tolerance:
+    if abs(timing.start) > tolerance:
         raise ValueError("Video timestamps must start at zero; run normalize_media first")
-    for count, timestamp in enumerate(timestamps):
-        if abs(timestamp - first - count / float(fps)) > tolerance:
-            raise ValueError("Variable frame timestamps detected; run normalize_media first")
-    return len(timestamps)
+    if not timing.constant(float(fps), tolerance):
+        raise ValueError("Variable frame timestamps detected; run normalize_media first")
+    return len(timing.times)
 
 
 def render_video(window, request, directory, worker):
@@ -587,6 +639,9 @@ def render_video(window, request, directory, worker):
             "-nostdin",
             "-y",
             *ffmpeg_input(video_only),
+            # Frame `start` on the video clock; the container start may be earlier audio.
+            "-seek_timestamp",
+            "1",
             "-ss",
             str(float(Fraction(start, 1) / fps)),
             *ffmpeg_input(source),
@@ -681,6 +736,21 @@ def normalize_command(source, output, stream, audio, rate):
     return command + ["-movflags", "+faststart", str(output)]
 
 
+def video_extent(source, stream):
+    """Seconds spanned by the first video stream, or None if unknown.
+
+    Uses the stream's own duration, else a scan of its packet timestamps; the container
+    duration can come from a longer audio track.
+    """
+    duration = float(stream.get("duration") or 0)
+    if duration > 0:
+        return duration
+    try:
+        return timeline(source).duration
+    except (ValueError, subprocess.TimeoutExpired):
+        return None
+
+
 def normalize_video(request, directory):
     source = input_path(request["media_path"])
     metadata = probe(source)
@@ -692,8 +762,9 @@ def normalize_video(request, directory):
     rotation = next(
         (d["rotation"] for d in stream.get("side_data_list", []) if d.get("rotation")), 0
     )
-    duration = float(stream.get("duration") or metadata["format"].get("duration") or 0)
-    expected = max(round(duration * rate), 1)
+    extent = video_extent(source, stream)
+    # An estimate for progress and a truncation check; output validation establishes the count.
+    expected = max(round(extent * rate), 1) if extent else None
     temporary = directory / "normalized.partial.mp4"
     encoder = subprocess.Popen(
         normalize_command(source, temporary, stream, audio, rate),
@@ -707,14 +778,15 @@ def normalize_video(request, directory):
             if key == "frame" and value.isdigit():
                 frames = int(value)
                 speed = frames / max(time.monotonic() - started, 1e-6)
+                eta = expected and round(max(expected - frames, 0) / max(speed, 1e-6), 1)
                 atomic_json(
                     directory / "progress.json",
                     {
                         "stage": "normalizing",
                         "frames": frames,
-                        "total_frames": expected,
+                        "estimated_total_frames": expected,
                         "frames_per_second": round(speed, 2),
-                        "eta_seconds": round(max(expected - frames, 0) / max(speed, 1e-6), 1),
+                        "eta_seconds": eta,
                     },
                 )
         if encoder.wait(timeout=60) != 0:
@@ -734,7 +806,7 @@ def normalize_video(request, directory):
     output_duration = float(video["duration"])
     if int(video["nb_frames"]) != frames or abs(output_duration - frames / rate) > 1 / rate:
         raise RuntimeError("Normalized frame count or duration validation failed")
-    if abs(frames - expected) > max(2, expected / 100):
+    if expected is not None and abs(frames - expected) > max(2, expected / 100):
         raise RuntimeError(f"Normalized output has {frames} frames, expected about {expected}")
     output_audio = next((s for s in verified["streams"] if s["codec_type"] == "audio"), None)
     if audio and output_audio is None:
