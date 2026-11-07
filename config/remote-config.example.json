@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "media_root": "/srv/visomaster",
+  "fusion_dir": "/srv/visomaster/fusion",
+  "state_dir": "/srv/visomaster/runtime/mcp",
+  "gpu": "0",
+  "runner": ["/srv/visomaster/bin/fusion-runner"],
+  "lock_dir": null
+}

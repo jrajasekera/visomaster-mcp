@@ -1,0 +1,43 @@
+# Python and tooling
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local agent and IDE state
+.idea/
+.serena/
+.claude/worktrees/
+.claude/settings.local.json
+AGENTS.local.md
+CLAUDE.local.md
+
+# Local configuration and secrets (examples stay tracked)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_*
+/remote-config.json
+
+# Runtime output and media
+/runtime/
+/downloads/
+/media/
+*.log
+*.mp4
+*.mkv
+*.mov
+*.webm
+
+# Model weights
+*.onnx
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.engine
+*.trt
+*.dfm

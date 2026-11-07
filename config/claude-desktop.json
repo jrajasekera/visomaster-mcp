@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "visomaster": {
+      "command": "<checkout>/.venv/bin/visomaster-mcp",
+      "args": [],
+      "env": {
+        "VISOMASTER_HOST": "gpu-host",
+        "VISOMASTER_REMOTE": "/srv/visomaster/mcp"
+      }
+    }
+  }
+}

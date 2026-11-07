@@ -1,0 +1,7 @@
+# Beads Project Configuration
+# issue_prefix: vmcp
+# default_priority: 2
+# default_type: task
+
+# Neutral actor for created_by, comment author and dependency created_by (privacy).
+actor: maintainer

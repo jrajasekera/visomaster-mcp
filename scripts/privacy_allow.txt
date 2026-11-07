@@ -1,0 +1,8 @@
+# Tracked allowlist for scripts/privacy_audit.py. Only neutral, non-identifying values.
+# "actor NAME" permits a Beads actor (created_by, comment author, dependency created_by).
+# "allow VALUE" permits an exact generic-rule match, such as a documentation placeholder.
+actor maintainer
+actor assistant
+actor codex
+actor claude
+allow git@github.com

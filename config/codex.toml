@@ -1,0 +1,10 @@
+# Example only: replace <checkout>, gpu-host and the deployment path with your own values.
+# It does not work unmodified. Merge it into your Codex configuration (~/.codex/config.toml).
+[mcp_servers.visomaster]
+command = "<checkout>/.venv/bin/visomaster-mcp"
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+
+[mcp_servers.visomaster.env]
+VISOMASTER_HOST = "gpu-host"
+VISOMASTER_REMOTE = "/srv/visomaster/mcp"
