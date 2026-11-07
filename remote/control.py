@@ -510,11 +510,10 @@ def claim_job(directory, referenced, cutoff=None, remove=False):
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError("Job is still active; cancel it and wait for a terminal state")
-        state_file = directory / "state.json"
-        state = read_json(state_file)
+        state = current(directory)  # The generation renamed below, with its finish time.
         if state["status"] not in TERMINAL:
             raise ValueError("Only completed, failed or cancelled jobs can be deleted")
-        finished = state.get("finished_at") or state_file.stat().st_mtime
+        finished = state["finished_at"]
         if cutoff is not None and finished >= cutoff:
             return None
         # Artifacts such as normalized media or face crops can be another job's input.

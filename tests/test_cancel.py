@@ -106,6 +106,8 @@ def seed(job_id, **request):
     job = common.job_path(job_id)
     (job / "artifacts").mkdir(parents=True)
     common.atomic_json(job / "request.json", request)
+    # As submit stores it; an active record without it makes retention protect every input.
+    common.atomic_json(job / "resolved.json", control.resolve_inputs(request))
     common.atomic_json(
         job / "state.json", {"job_id": job_id, "status": "queued", "created_at": time.time()}
     )
