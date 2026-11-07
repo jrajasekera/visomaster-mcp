@@ -167,7 +167,7 @@ The supervisor starts each GPU job as `<runner...> <release>/engine.py <job dire
 | `inspect_media` | FFprobe metadata for a workstation file |
 | `detect_faces` | Queue detection at a selected frame and produce reference crops, or sample up to 64 frames (`sample_frames` or `frames`) and group faces into identities with one reference crop each |
 | `submit_swap` | Queue a frame/image preview or a video render with explicit face mappings |
-| `normalize_media` | Queue a CPU-only FFmpeg conversion to a render-ready video (CFR, zero start, even dimensions, rotation applied); does not wait for the GPU |
+| `normalize_media` | Queue a CPU-only FFmpeg conversion to a render-ready video (CFR, zero start, even dimensions, rotation and flips applied); does not wait for the GPU |
 | `job_status` | State, frame progress and result manifest; `wait_seconds` (≤ 50) long-polls for the next change; log tail on request or failure |
 | `list_jobs` | Recent job summaries shared across clients (kind, media, frames, timing, status, progress), filterable by `status` and `kind`, `limit` up to 200 |
 | `cancel_job` | Request cancellation, then poll for terminal state |
@@ -187,7 +187,7 @@ Multi-frame detection embeds every detected face with the configured recognition
 5. Submit a `preview`, inspect its image, then submit a short `render`. After reviewing that clip, submit the full frame range.
 6. Follow the job with `job_status` and `wait_seconds`, then download `result.mp4` or `result.png` after completion.
 
-Renders reject variable frame rate video, video whose timestamps do not start at zero, odd frame dimensions and rotation metadata. When a render fails for one of these reasons, call `normalize_media` with the same `media_path` (optionally `fps`, such as `25` or `"30000/1001"`), wait for the job, and use its result's `media_path` (the job's `normalized.mp4` artifact) for detection, preview and rendering. Frame indices then refer to the normalized timeline.
+Renders reject variable frame rate video, video whose timestamps do not start at zero, odd frame dimensions and rotated or mirrored display metadata. When a render fails for one of these reasons, call `normalize_media` with the same `media_path` (optionally `fps`, such as `25` or `"30000/1001"`), wait for the job, and use its result's `media_path` (the job's `normalized.mp4` artifact) for detection, preview and rendering. Frame indices then refer to the normalized timeline.
 
 Example `submit_swap` arguments:
 

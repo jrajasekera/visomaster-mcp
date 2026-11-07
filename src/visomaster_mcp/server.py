@@ -171,7 +171,8 @@ async def submit_swap(
     (None means through the end). Outputs are new job artifacts. Video output is H.264,
     with the selected interval's first audio stream encoded to AAC, or no audio if that stream
     has no samples there. Preview defaults to Inswapper128. Consult get_settings before changing parameters. GPU jobs run one at a time.
-    Renders reject VFR, nonzero start times, odd dimensions and rotation; use normalize_media.
+    Renders reject VFR, nonzero start times, odd dimensions, rotation and display flips; use
+    normalize_media.
     """
     return await command(
         "submit",
@@ -197,10 +198,11 @@ async def normalize_media(
 ) -> dict[str, Any]:
     """Queue conversion of a video into a render-ready copy. Runs on CPU without the GPU lock.
 
-    Output is CFR H.264 (CRF 18, yuv420p) starting at zero, with rotation applied, metadata
-    removed and odd dimensions padded by one pixel. The first audio stream becomes AAC aligned
-    to the first video frame and ending with the video. A clip shorter than half a frame period
-    keeps one frame. Without fps, the source average rate is used, snapped to a
+    Output is CFR H.264 (CRF 18, 4:2:0, 10-bit for deeper sources) starting at zero, with
+    rotation and flips applied, metadata removed and odd dimensions padded by one pixel. The
+    first audio stream becomes AAC aligned to the first video frame and ending with the video.
+    A clip shorter than half a frame period keeps one frame. Without fps, the source average
+    rate is used, snapped to a
     standard rate within 2%. The completed result's media_path is usable in submit_swap.
     """
     return await command(

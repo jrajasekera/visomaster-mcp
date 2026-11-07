@@ -252,7 +252,7 @@ def test_encoder_preserves_source_color_and_depth():
     assert formats(command) == ["bgr24", "yuv420p10le"]
     assert option(command, "-vf").startswith("scale=out_color_matrix=bt709:out_range=tv:")
     assert option(command, "-colorspace") == "bt709"
-    assert option(command, "-color_trc") == "bt709"
+    assert "setparams=color_primaries=bt709:color_trc=bt709" in option(command, "-vf")
     assert option(command, "-color_range") == "tv"
     assert command[-1] == "out.mp4"
 
@@ -261,7 +261,7 @@ def test_encoder_preserves_source_color_and_depth():
     assert formats(command) == ["bgr24", "yuv420p"]
     assert option(command, "-vf").startswith("scale=out_color_matrix=smpte170m:out_range=pc:")
     assert option(command, "-color_range") == "pc"
-    assert "-color_trc" not in command and "-color_primaries" not in command
+    assert "setparams" not in option(command, "-vf")
 
     # Untagged input keeps swscale's default matrix on both sides and stays untagged.
     assert "color_matrix" not in engine.scale_filter({"pix_fmt": "yuv420p"}, "in")
@@ -691,7 +691,7 @@ def test_normalize_command_rebases_time_and_pads():
     command = engine.normalize_command("in.mov", "out.mp4", stream, Fraction(24000, 1001))
     assert "-copyts" in command and command[-1] == "out.mp4"
     video = command[command.index("-vf") + 1]
-    assert video == "setpts=PTS-STARTPTS,fps=24000/1001,pad=ceil(iw/2)*2:ceil(ih/2)*2"
+    assert video.startswith("setpts=PTS-STARTPTS,fps=24000/1001,pad=ceil(iw/2)*2:ceil(ih/2)*2,")
     # Audio joins afterwards, cut to the encoded video (see test_audio).
     assert "-af" not in command and "0:a:0" not in command
     assert command[command.index("-crf") + 1] == "18" and "yuv420p" in command

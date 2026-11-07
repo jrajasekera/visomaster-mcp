@@ -2,10 +2,11 @@
 
 import contextlib
 import ctypes
+import functools
 import io
+import json
 import math
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -74,12 +75,23 @@ def initialize(controls):
     return window
 
 
+def display_transform(stream):
+    """FFprobe's display rotation and whether the display matrix mirrors the picture."""
+    for data in stream.get("side_data_list", []):
+        lines = data.get("displaymatrix", "").splitlines()
+        m = [int(v) for line in lines for v in line.partition(":")[2].split()]
+        if data.get("rotation") or len(m) == 9:
+            return data.get("rotation") or 0, len(m) == 9 and m[0] * m[4] < m[1] * m[3]
+    return 0, False
+
+
 def video_stream(metadata):
     stream = next((s for s in metadata["streams"] if s["codec_type"] == "video"), None)
     if stream is None:
         raise ValueError("Media has no video stream")
-    if any(d.get("rotation") for d in stream.get("side_data_list", [])):
-        raise ValueError("Rotated video is not supported; run normalize_media first")
+    # Frames are decoded as stored; a flip can have rotation 0, so the matrix itself is checked.
+    if display_transform(stream) != (0, False):
+        raise ValueError("Rotated or mirrored video is not supported; run normalize_media first")
     return stream
 
 
@@ -96,52 +108,114 @@ MATRICES = {
 SWS_FLAGS = "accurate_rnd+full_chroma_int+full_chroma_inp"
 
 
+@functools.cache
+def pixel_formats():
+    """FFmpeg's pixel format descriptors by name: flags and per-component bit depths."""
+    command = ["ffprobe", "-v", "error", "-show_pixel_formats", "-of", "json"]
+    output = subprocess.check_output(command, timeout=30)
+    return {f["name"]: f for f in json.loads(output)["pixel_formats"]}
+
+
+def pixel_format(stream):
+    name = stream.get("pix_fmt")
+    return pixel_formats().get(name, {}) if name else {}
+
+
+def rgb(stream):
+    """Whether the source is RGB (or paletted RGB) rather than YUV or gray."""
+    flags = pixel_format(stream).get("flags", {})
+    return bool(flags.get("rgb") or flags.get("palette")) or stream.get("color_space") == "gbr"
+
+
 def color(stream):
-    """Source YUV matrix and range; decode and encode share them so unswapped pixels keep color."""
+    """Source YUV matrix and range for decoding; RGB has no matrix and is full range."""
     transfer = stream.get("color_transfer")
     if transfer in HDR:
         raise ValueError(
             f"HDR ({HDR[transfer]}) video is not supported because faces are processed as 8-bit "
             "SDR; tone-map the input to SDR first"
         )
-    full = stream.get("color_range") == "pc" or stream.get("pix_fmt", "").startswith("yuvj")
+    if rgb(stream):
+        return None, "pc"
+    tagged = stream.get("color_range")
+    # Untagged gray is full range, as swscale treats it and FFmpeg 8 reports it.
+    gray = pixel_format(stream).get("nb_components", 3) < 3 and tagged != "tv"
+    full = tagged == "pc" or stream.get("pix_fmt", "").startswith("yuvj") or gray
     return MATRICES.get(stream.get("color_space")), "pc" if full else "tv"
 
 
-def scale_filter(stream, side):
-    matrix, value = color(stream)
-    options = [f"{side}_range={value}", f"flags={SWS_FLAGS}"]
-    if matrix:
-        options.insert(0, f"{side}_color_matrix={matrix}")
-    return "scale=" + ":".join(options)
+def output_color(stream):
+    """YUV matrix and range to encode: the source's, so unswapped pixels keep their color, or
+    BT.709 limited range for RGB, whose identity matrix a YUV output cannot carry."""
+    source = color(stream)  # Also rejects HDR.
+    return ("bt709", "tv") if rgb(stream) else source
+
+
+def scale_filter(stream, *sides):
+    """swscale options converting from the source's colors ("in") and to the output's ("out")."""
+    options = []
+    for side in sides:
+        matrix, value = color(stream) if side == "in" else output_color(stream)
+        options += [f"{side}_color_matrix={matrix}"] if matrix else []
+        options.append(f"{side}_range={value}")
+    return "scale=" + ":".join(options + [f"flags={SWS_FLAGS}"])
 
 
 def deep_color(stream):
-    return re.search(r"p1[0-6](le|be)$", stream.get("pix_fmt", "")) is not None
+    """Whether the source has more than 8 bits per component. The decoder's raw sample depth
+    is authoritative; when FFprobe reports none, the decoded pixel format's deepest component."""
+    try:
+        depth = int(stream.get("bits_per_raw_sample") or 0)
+    except ValueError:
+        depth = 0
+    components = pixel_format(stream).get("components", [])
+    return (depth or max((c["bit_depth"] for c in components), default=8)) > 8
 
 
-def encode_command(stream, fps, output):
-    """Encode bgr24 frames with the source's matrix, range, tags and (8- or 10-bit) depth."""
-    width, height = int(stream["width"]), int(stream["height"])
-    pixels = "yuv420p10le" if deep_color(stream) else "yuv420p"
-    command = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-threads", "2", "-f", "rawvideo"]
-    command += ["-pix_fmt", "bgr24", "-s", f"{width}x{height}", "-r", str(fps), "-i", "pipe:0"]
-    command += ["-an", "-vf", scale_filter(stream, "out") + f",format={pixels}", "-c:v", "libx264"]
-    command += ["-threads", "2", "-preset", "medium", "-crf", "18", "-pix_fmt", pixels]
-    return command + color_tags(stream) + [str(output)]
+def output_pixels(stream):
+    """H.264 pixel format for renders and normalization alike: 10-bit for deeper sources."""
+    return "yuv420p10le" if deep_color(stream) else "yuv420p"
+
+
+def sample_aspect(stream):
+    """The stream's sample aspect ratio; unknown (absent or 0:1) means square pixels."""
+    numerator, _, denominator = stream.get("sample_aspect_ratio", "").partition(":")
+    try:
+        return Fraction(int(numerator), int(denominator)) or Fraction(1)
+    except (ValueError, ZeroDivisionError):
+        return Fraction(1)
+
+
+def output_filters(stream, *sides):
+    """Convert to the output's matrix, range and depth, and tag the source's primaries and
+    transfer on the frames: FFmpeg 8 takes those from frames and ignores encoder options."""
+    filters = [scale_filter(stream, *sides), f"format={output_pixels(stream)}"]
+    tags = [
+        f"{option}={stream[key]}"
+        for option, key in (("color_primaries", "color_primaries"), ("color_trc", "color_transfer"))
+        if stream.get(key, "unknown") not in ("unknown", "reserved")
+    ]
+    return ",".join(filters + (["setparams=" + ":".join(tags)] if tags else []))
 
 
 def color_tags(stream):
-    """Output options that keep the source's range, matrix, primaries and transfer tags."""
-    tags = ["-color_range", color(stream)[1]]
-    for option, key in (
-        ("-colorspace", "color_space"),
-        ("-color_primaries", "color_primaries"),
-        ("-color_trc", "color_transfer"),
-    ):
-        if stream.get(key, "unknown") not in ("unknown", "reserved"):
-            tags += [option, stream[key]]
-    return tags
+    """Encoder options tagging the output's range and matrix."""
+    tags = ["-color_range", output_color(stream)[1]]
+    space = "bt709" if rgb(stream) else stream.get("color_space", "unknown")
+    return tags + (["-colorspace", space] if space not in ("unknown", "reserved") else [])
+
+
+def encode_command(stream, fps, output):
+    """Encode bgr24 frames with the source's matrix, range, tags, depth and pixel aspect."""
+    width, height = int(stream["width"]), int(stream["height"])
+    pixels, sar = output_pixels(stream), sample_aspect(stream)
+    # The raw pipe carries no pixel aspect, so the source's is set again.
+    filters = f"{output_filters(stream, 'out')},setsar={sar.numerator}/{sar.denominator}"
+    command = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-threads", "2", "-f", "rawvideo"]
+    command += ["-pix_fmt", "bgr24", "-s", f"{width}x{height}", "-r", str(fps), "-i", "pipe:0"]
+    command += ["-an", "-vf", filters, "-c:v", "libx264"]
+    command += ["-threads", "2", "-preset", "medium", "-crf", "18", "-pix_fmt", pixels]
+    return command + color_tags(stream) + [str(output)]
 
 
 def decode(path, stream, start, count, times=None):
@@ -683,6 +757,8 @@ def render_video(window, request, directory, worker):
         fps
     ):
         raise RuntimeError("Encoded frame count or duration validation failed")
+    if sample_aspect(video) != sample_aspect(stream):
+        raise RuntimeError("Encoded pixel aspect ratio differs from the source")
     emitted = output_audio(verified, audio, duration, "Audio missing from output")
     video_only.unlink()
     return {
@@ -727,8 +803,8 @@ def normalized_rate(stream, override=None):
 
 
 def normalize_command(source, output, stream, rate, extent=None):
-    """Encode the video alone. FFmpeg autorotates by default; the filters then rebase time,
-    resample to CFR and pad.
+    """Encode the video alone. FFmpeg applies display matrices (rotations and flips) by default;
+    the filters then rebase time, resample to CFR, pad and convert to the output's colors.
 
     The fps filter rounds the video's end to the nearest frame, which leaves nothing of a clip
     under half a target frame period. Passing the last frame at the end rounds up instead, so
@@ -740,8 +816,11 @@ def normalize_command(source, output, stream, rate, extent=None):
     # Keep source timestamps so the filters see the start times ffprobe reported.
     command += ["-copyts", *ffmpeg_input(source), "-map", "0:v:0"]
     # Padding by at most one pixel on the right/bottom keeps every face pixel, unlike cropping.
-    command += ["-vf", f"setpts=PTS-STARTPTS,fps={rate}{eof},pad=ceil(iw/2)*2:ceil(ih/2)*2"]
-    pixels = "yuv420p10le" if deep_color(stream) else "yuv420p"
+    # An explicit conversion fixes the matrix and range, which FFmpeg versions negotiate apart.
+    convert = output_filters(stream, "in", "out")
+    pad = "pad=ceil(iw/2)*2:ceil(ih/2)*2"
+    command += ["-vf", f"setpts=PTS-STARTPTS,fps={rate}{eof},{pad},{convert}"]
+    pixels = output_pixels(stream)
     command += ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", pixels]
     command += color_tags(stream)
     command += ["-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1"]
@@ -770,9 +849,7 @@ def normalize_video(request, directory):
     if stream is None:
         raise ValueError("Media has no video stream")
     rate = normalized_rate(stream, request.get("fps"))
-    rotation = next(
-        (d["rotation"] for d in stream.get("side_data_list", []) if d.get("rotation")), 0
-    )
+    rotation, reflection = display_transform(stream)
     extent = video_extent(source, stream)
     # An estimate for progress and a truncation check; output validation establishes the count.
     expected = max(round(extent * rate), 1) if extent else None
@@ -841,6 +918,7 @@ def normalize_video(request, directory):
         "width": width,
         "height": height,
         "rotation_applied": rotation,
+        "reflection_applied": reflection,
         "source": {
             "width": int(stream["width"]),
             "height": int(stream["height"]),
