@@ -682,30 +682,28 @@ def test_normalized_rate_snaps_to_standard_rates():
         rate({"avg_frame_rate": "0/0", "r_frame_rate": "0/0"})
 
 
-def test_normalize_command_rebases_time_pads_and_aligns_audio():
+def test_normalize_command_rebases_time_and_pads():
     from fractions import Fraction
 
     import engine
 
     stream = {"start_time": "1.5", "duration": "4.0"}
-    command = engine.normalize_command("in.mov", "out.mp4", stream, True, Fraction(24000, 1001))
+    command = engine.normalize_command("in.mov", "out.mp4", stream, Fraction(24000, 1001))
     assert "-copyts" in command and command[-1] == "out.mp4"
     video = command[command.index("-vf") + 1]
     assert video == "setpts=PTS-STARTPTS,fps=24000/1001,pad=ceil(iw/2)*2:ceil(ih/2)*2"
-    audio = command[command.index("-af") + 1]
-    assert audio.startswith("atrim=start=1.5:end=5.5,asetpts=PTS-1.5/TB,aresample=async=1")
+    # Audio joins afterwards, cut to the encoded video (see test_audio).
+    assert "-af" not in command and "0:a:0" not in command
     assert command[command.index("-crf") + 1] == "18" and "yuv420p" in command
     assert command[command.index("-map_metadata") + 1] == "-1"
-    silent = engine.normalize_command("in.mp4", "out.mp4", {}, False, Fraction(25))
-    assert "-af" not in silent and "0:a:0" not in silent
     # Normalizing must not undo bit depth or color tags that renders preserve.
     deep = {"pix_fmt": "yuv420p10le", "color_space": "bt709", "color_range": "pc"}
-    command = engine.normalize_command("in.mov", "out.mp4", deep, False, Fraction(25))
+    command = engine.normalize_command("in.mov", "out.mp4", deep, Fraction(25))
     assert command[command.index("-pix_fmt") + 1] == "yuv420p10le"
     assert command[command.index("-colorspace") + 1] == "bt709"
     assert command[command.index("-color_range") + 1] == "pc"
     with pytest.raises(ValueError, match="HDR"):
-        engine.normalize_command("in.mov", "out.mp4", {"color_transfer": "smpte2084"}, False, 25)
+        engine.normalize_command("in.mov", "out.mp4", {"color_transfer": "smpte2084"}, 25)
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="FFmpeg is not installed")

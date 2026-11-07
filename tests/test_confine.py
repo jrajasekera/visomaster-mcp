@@ -90,7 +90,7 @@ def test_every_ffmpeg_entry_point_refuses_manifests(media, name, monkeypatch):
     with pytest.raises(subprocess.CalledProcessError):
         engine.validate_timing(source, Fraction(25), stream)
     output = media.outside / f"{name}.normalized.mp4"
-    command = engine.normalize_command(source, output, stream, True, Fraction(25))
+    command = engine.normalize_command(source, output, stream, Fraction(25))
     assert subprocess.run(command, capture_output=True).returncode != 0
     assert not output.exists()
 

@@ -558,6 +558,57 @@ def validate_timing(source, fps, stream, end=None):
     return len(timing.times)
 
 
+def audio_window(source, start, duration):
+    """Input arguments reading `duration` seconds of `source` from `start` on the video clock.
+
+    Without -seek_timestamp FFmpeg offsets -ss by the container start, which an earlier audio
+    stream can move.
+    """
+    return ["-seek_timestamp", "1", "-ss", str(start), "-t", str(duration), *ffmpeg_input(source)]
+
+
+def audio_overlaps(source, metadata, start, duration):
+    """Whether the first audio stream, the one muxed, has samples in the video interval.
+
+    It can end before the interval or begin after it. Decoding one frame through the mux's
+    own input window avoids durations that metadata can omit or offset by encoder priming.
+    """
+    if not any(s["codec_type"] == "audio" for s in metadata["streams"]):
+        return False
+    command = ["ffmpeg", "-v", "error", "-nostdin", *audio_window(source, start, duration)]
+    command += ["-map", "0:a:0", "-frames:a", "1", "-f", "s16le", "pipe:1"]
+    return bool(subprocess.run(command, stdout=subprocess.PIPE, check=True).stdout)
+
+
+def mux(video, output, audio=None, options=()):
+    """Copy `video` into `output` with faststart, adding `audio` = (source, start, duration).
+
+    The first audio stream of that source window becomes AAC; silence pads audio that starts
+    later than the video, so it stays aligned with the first frame.
+    """
+    inputs, outputs = ffmpeg_input(video), ["-map", "0:v:0", "-c:v", "copy"]
+    if audio:
+        inputs += audio_window(*audio)
+        outputs += ["-map", "1:a:0", "-af", "aresample=async=1:first_pts=0"]
+        outputs += ["-c:a", "aac", "-b:a", "192k"]
+    command = ["ffmpeg", "-v", "error", "-nostdin", "-y", *inputs, *outputs, *options]
+    subprocess.run(command + ["-movflags", "+faststart", str(output)], check=True)
+
+
+def output_audio(metadata, expected, end, missing):
+    """The output's audio stream, if any. Expected audio must be present, and no audio may run
+    more than one AAC frame (the encoder's padding) past the video's end at `end` seconds."""
+    audio = next((s for s in metadata["streams"] if s["codec_type"] == "audio"), None)
+    if audio is None:
+        if expected:
+            raise RuntimeError(missing)
+        return None
+    finish = float(audio.get("start_time") or 0) + float(audio.get("duration") or 0)
+    if finish > end + 1024 / int(audio["sample_rate"]) + 1e-5:
+        raise RuntimeError(f"Audio ends at {finish:.3f} s, after the video's end at {end:.3f} s")
+    return audio
+
+
 def render_video(window, request, directory, worker):
     source = input_path(request["media_path"])
     metadata = probe(source)
@@ -623,55 +674,23 @@ def render_video(window, request, directory, worker):
         raise RuntimeError("No faces matched the target references in the requested range")
     output = artifacts / "result.mp4"
     duration = float(Fraction(processed, 1) / fps)
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-nostdin",
-            "-y",
-            *ffmpeg_input(video_only),
-            # Frame `start` on the video clock; the container start may be earlier audio.
-            "-seek_timestamp",
-            "1",
-            "-ss",
-            str(float(Fraction(start, 1) / fps)),
-            *ffmpeg_input(source),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0?",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-t",
-            str(duration),
-            "-movflags",
-            "+faststart",
-            str(output),
-        ],
-        check=True,
-        timeout=300,
-    )
+    offset = float(Fraction(start, 1) / fps)
+    audio = audio_overlaps(source, metadata, offset, duration)
+    mux(video_only, output, (source, offset, duration) if audio else None)
     verified = probe(output)
     video = next(s for s in verified["streams"] if s["codec_type"] == "video")
     if int(video["nb_frames"]) != processed or abs(float(video["duration"]) - duration) > 1 / float(
         fps
     ):
         raise RuntimeError("Encoded frame count or duration validation failed")
-    has_audio = any(s["codec_type"] == "audio" for s in metadata["streams"])
-    if has_audio and not any(s["codec_type"] == "audio" for s in verified["streams"]):
-        raise RuntimeError("Audio missing from output")
+    emitted = output_audio(verified, audio, duration, "Audio missing from output")
     video_only.unlink()
     return {
         "frames": processed,
         "fps": str(fps),
         "duration": duration,
         "swapped_faces": worker.swap_count,
-        "audio": "AAC" if has_audio else "none",
+        "audio": "AAC" if emitted else "none",
         "artifacts": ["result.mp4", "preview.jpg", "before.jpg"],
     }
 
@@ -707,23 +726,24 @@ def normalized_rate(stream, override=None):
     return nearest if abs(nearest - rate) <= rate / 50 else rate.limit_denominator(1001)
 
 
-def normalize_command(source, output, stream, audio, rate):
-    """FFmpeg autorotates by default; the filters then rebase time, resample to CFR and pad."""
-    start = float(stream.get("start_time") or 0)
-    duration = float(stream.get("duration") or 0)
+def normalize_command(source, output, stream, rate, extent=None):
+    """Encode the video alone. FFmpeg autorotates by default; the filters then rebase time,
+    resample to CFR and pad.
+
+    The fps filter rounds the video's end to the nearest frame, which leaves nothing of a clip
+    under half a target frame period. Passing the last frame at the end rounds up instead, so
+    such a clip keeps one frame. Both give one frame from half to one and a half periods, so the
+    switch at three quarters tolerates an approximate `extent` in seconds.
+    """
+    eof = ":eof_action=pass" if extent and extent * rate < 0.75 else ""
     command = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-nostats", "-progress", "pipe:1"]
     # Keep source timestamps so the filters see the start times ffprobe reported.
     command += ["-copyts", *ffmpeg_input(source), "-map", "0:v:0"]
     # Padding by at most one pixel on the right/bottom keeps every face pixel, unlike cropping.
-    command += ["-vf", f"setpts=PTS-STARTPTS,fps={rate},pad=ceil(iw/2)*2:ceil(ih/2)*2"]
+    command += ["-vf", f"setpts=PTS-STARTPTS,fps={rate}{eof},pad=ceil(iw/2)*2:ceil(ih/2)*2"]
     pixels = "yuv420p10le" if deep_color(stream) else "yuv420p"
     command += ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", pixels]
     command += color_tags(stream)
-    if audio:
-        # Align audio with the first video frame: trim earlier audio, pad later audio with silence.
-        trim = f"atrim=start={start}" + (f":end={start + duration}" if duration > 0 else "")
-        filters = f"{trim},asetpts=PTS-{start}/TB,aresample=async=1:first_pts=0"
-        command += ["-map", "0:a:0", "-af", filters, "-c:a", "aac", "-b:a", "192k"]
     command += ["-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1"]
     return command + ["-movflags", "+faststart", str(output)]
 
@@ -749,7 +769,6 @@ def normalize_video(request, directory):
     stream = next((s for s in metadata["streams"] if s["codec_type"] == "video"), None)
     if stream is None:
         raise ValueError("Media has no video stream")
-    audio = any(s["codec_type"] == "audio" for s in metadata["streams"])
     rate = normalized_rate(stream, request.get("fps"))
     rotation = next(
         (d["rotation"] for d in stream.get("side_data_list", []) if d.get("rotation")), 0
@@ -757,9 +776,9 @@ def normalize_video(request, directory):
     extent = video_extent(source, stream)
     # An estimate for progress and a truncation check; output validation establishes the count.
     expected = max(round(extent * rate), 1) if extent else None
-    temporary = directory / "normalized.partial.mp4"
+    video_only, temporary = directory / "normalized.video.mp4", directory / "normalized.partial.mp4"
     encoder = subprocess.Popen(
-        normalize_command(source, temporary, stream, audio, rate),
+        normalize_command(source, video_only, stream, rate, extent),
         stdout=subprocess.PIPE,
         text=True,
     )
@@ -787,6 +806,16 @@ def normalize_video(request, directory):
         if encoder.poll() is None:
             encoder.kill()
             encoder.wait()
+    encoded = next((s for s in probe(video_only)["streams"] if s["codec_type"] == "video"), None)
+    if encoded is None or not int(encoded.get("nb_frames") or 0):
+        raise RuntimeError("Normalization produced no video frames")
+    # The first audio stream is cut to the resampled video, which can end before or after the
+    # source's video and is known exactly only now.
+    start, end = float(stream.get("start_time") or 0), float(int(encoded["nb_frames"]) / rate)
+    audio = audio_overlaps(source, metadata, start, end)
+    strip = ["-map_metadata", "-1", "-map_chapters", "-1"]
+    mux(video_only, temporary, (source, start, end) if audio else None, strip)
+    video_only.unlink()
     verified = probe(temporary)
     video = video_stream(verified)
     width, height = int(video["width"]), int(video["height"])
@@ -800,9 +829,8 @@ def normalize_video(request, directory):
         raise RuntimeError("Normalized frame count or duration validation failed")
     if expected is not None and abs(frames - expected) > max(2, expected / 100):
         raise RuntimeError(f"Normalized output has {frames} frames, expected about {expected}")
-    output_audio = next((s for s in verified["streams"] if s["codec_type"] == "audio"), None)
-    if audio and output_audio is None:
-        raise RuntimeError("Audio missing from normalized output")
+    missing = "Audio missing from normalized output"
+    emitted = output_audio(verified, audio, float(frames / rate), missing)
     output = directory / "artifacts/normalized.mp4"
     os.replace(temporary, output)
     return {
@@ -820,8 +848,9 @@ def normalize_video(request, directory):
             "r_frame_rate": stream.get("r_frame_rate"),
             "start_time": float(stream.get("start_time") or 0),
         },
-        "audio": "AAC" if output_audio else "none",
-        "audio_start_time": float(output_audio["start_time"]) if output_audio else None,
+        "audio": "AAC" if emitted else "none",
+        "audio_start_time": float(emitted["start_time"]) if emitted else None,
+        "audio_duration": float(emitted["duration"]) if emitted else None,
         "artifacts": ["normalized.mp4"],
     }
 
