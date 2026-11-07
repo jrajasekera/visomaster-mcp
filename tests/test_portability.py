@@ -130,9 +130,9 @@ def test_deploy_and_server_refuse_the_same_settings_before_ssh(site, variable, v
         transport.load({**site["env"], variable: value})
 
 
-def test_deploy_substitute_uploads_preflights_and_switches_on_gnu(site):
-    """Substitute for the workstation deploy: the macOS run stops at the GNU-only switch."""
+def test_deploy_uploads_preflights_and_switches(site):
     result = deploy(site)
+    assert result.returncode == 0, result.stderr
     releases = list((site["deployment"] / "releases").iterdir())
     assert len(releases) == 1
     for file in ("common.py", "control.py", "engine.py"):
@@ -140,11 +140,6 @@ def test_deploy_substitute_uploads_preflights_and_switches_on_gnu(site):
     log = ssh_log(site)
     assert log and all(f" -- {ALIAS} " in f" {line} " for line in log)
     assert any("control.py" in line and sys.executable in line for line in log)
-    gnu = subprocess.run(["mv", "--version"], capture_output=True, text=True)
-    if gnu.returncode != 0 or "GNU" not in gnu.stdout:
-        assert result.returncode != 0 and not (site["deployment"] / "remote").exists()
-        pytest.skip("atomic switch qualified on the Linux workstation (plan §7.3)")
-    assert result.returncode == 0, result.stderr
     assert (site["deployment"] / "remote").resolve() == releases[0].resolve()
 
 

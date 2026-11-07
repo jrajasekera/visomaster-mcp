@@ -77,7 +77,7 @@ The examples below use placeholders. Replace each one with your own value.
    scripts/deploy.sh
    ```
 
-   The script validates these variables exactly as the server does, uploads the three standard-library files into a new directory under `releases/`, runs the new release's health check against `remote-config.json`, and only then points the `remote` symlink at it. It keeps the five newest releases. Jobs keep the release they were submitted with. It refuses to run while jobs are queued or running; wait for them rather than using `--force`, because pruning can remove a release a queued job still needs.
+   The script validates these variables exactly as the server does, uploads the three standard-library files into a new directory under `releases/`, runs the new release's health check against `remote-config.json`, and only then has the new release select itself. Under the lock that job submission takes, the release checks again for queued or running jobs, points the `remote` symlink at itself and removes all but the five newest releases, keeping any release an active job still uses. Each job runs the release that accepted it. The script refuses while jobs are queued or running, or when it cannot list them. A first install is recognized only when the deployment has no `remote` entry at all. `--force` skips both job checks, and cleanup still keeps the releases active jobs use; while a job submitted by an earlier version is active, no release is removed.
 
 8. **Register the client.** Every registration must set `VISOMASTER_HOST` and `VISOMASTER_REMOTE`; there are no defaults.
 
@@ -233,6 +233,7 @@ MCP GPU jobs share a process lock across all client sessions. Fusion's desktop G
 | `The configured runner must exec the Fusion Python interpreter` | End the runner with `exec "$FUSION_PYTHON" "$@"` |
 | `Cannot start the configured runner ...` | Fix the runner path or its permissions |
 | `Remote configuration changed after submission ...` | The file changed while the job was queued; resubmit |
+| `Cannot list active jobs (... query): ...` from `deploy.sh` | The installed release could not report its jobs; fix the named error, or use `--force` if no jobs can be running |
 | `Preflight refused release ...` from `deploy.sh` | The new release rejects `remote-config.json`; the error names the problem, and the active release is unchanged |
 | `checks` shows `nvidia-smi`, `ffmpeg` or `ffprobe` false | Install it, or put it on the `PATH` of noninteractive SSH sessions |
 
@@ -246,7 +247,7 @@ uv run --locked ruff format --check .
 uv run --locked python scripts/privacy_audit.py
 ```
 
-The suite runs locally with temporary job backends, stdio clients and an SSH shim that clears the environment, as real SSH does. Linux-only behavior (the parent-death signal and the `mv -T` release switch) is exercised only on a workstation. There is no CI.
+The suite runs locally with temporary job backends, stdio clients and an SSH shim that clears the environment, as real SSH does. Linux-only behavior (the parent-death signal) is exercised only on a workstation. There is no CI.
 
 The opt-in GPU check needs a short workstation video and a single-face replacement image. It creates persistent jobs, runs detection, preview and a short render, checks idempotent submission, reconnects with a new session and cancels a running job. It stops before queuing anything unless `health_check` reports `code_matches: true`, and records whether cancellation hit a running job, a queued one, or was unexercised because the render finished first. It uses the first detected face as its target.
 

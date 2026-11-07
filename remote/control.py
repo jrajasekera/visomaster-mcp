@@ -18,7 +18,13 @@ import tempfile
 import time
 from pathlib import Path
 
-from common import (
+# Pin each command to one release. One started through the deployment's `remote` symlink re-runs
+# from the release directory it resolves to before any project module loads, so a concurrent
+# switch cannot mix releases within the command, its supervisor or its engine.
+if __name__ == "__main__" and os.path.realpath(__file__) != os.path.abspath(__file__):
+    os.execv(sys.executable, [sys.executable, os.path.realpath(__file__), *sys.argv[1:]])
+
+from common import (  # noqa: E402
     APP,
     BASE,
     CONFIG_ERROR,
@@ -45,6 +51,9 @@ from common import (
     validate_request,
 )
 
+RELEASE = Path(os.path.realpath(__file__)).parent
+CODE = ("common.py", "control.py", "engine.py")
+KEEP_RELEASES = 5  # Newest release directories kept, besides any an active job still uses.
 MAX_WAIT = 50
 GRACE = 10  # Seconds a cancelled worker gets to exit on SIGTERM before its group is killed.
 # Leads the job's process group so the group ID stays reserved until the supervisor reaps it. It
@@ -157,6 +166,19 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+class Superseded(Exception):
+    """Another release became selected before this submission took the submit lock."""
+
+
+def selected_release():
+    """The release the deployment's `remote` link selects now; a checkout or flat directory
+    outside a releases directory selects itself."""
+    if RELEASE.parent.name != "releases":
+        return RELEASE
+    selected = Path(os.path.realpath(RELEASE.parent.parent / "remote"))
+    return selected if (selected / "control.py").is_file() else RELEASE
+
+
 def submit(request):
     request = dict(request)
     job_id = request.pop("job_id")
@@ -164,6 +186,11 @@ def submit(request):
     (STATE / "jobs").mkdir(parents=True, exist_ok=True, mode=0o700)
     with (STATE / "submit.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        # Promotion switches releases under this lock, so a deployment either sees this job or
+        # the job is submitted, supervised and run by the release it selected.
+        selected = selected_release()
+        if selected != RELEASE:
+            raise Superseded(selected)
         # An exact retry returns the persisted job before its inputs are consulted, so it still
         # answers after they are moved or pruned. Canonical JSON keeps 1, 1.0 and true distinct.
         if directory.exists():
@@ -186,6 +213,7 @@ def submit(request):
                     "created_at": time.time(),
                     "gpu": GPU,
                     "config_sha256": SETTINGS.sha256,
+                    "release": str(RELEASE),  # Deployment cleanup keeps it while the job is active.
                 },
             )
             os.replace(staging, directory)
@@ -193,7 +221,7 @@ def submit(request):
         # remote-config.json cannot make it look the job up elsewhere.
         supervisor = [
             sys.executable,
-            str(Path(__file__).resolve()),
+            str(RELEASE / "control.py"),
             "supervise",
             str(directory),
             SETTINGS.sha256,
@@ -350,7 +378,7 @@ def supervise(job_directory, identity):
                 )
                 arguments = [
                     *settings.runner,
-                    str(Path(__file__).with_name("engine.py")),
+                    str(RELEASE / "engine.py"),
                     str(directory),
                 ]
                 guard = spawn(
@@ -604,6 +632,72 @@ def prune(older_than_days, dry_run=True):
     return result
 
 
+def active_jobs():
+    """Queued and running job IDs with the release each records (None if unknown); callers hold
+    the submit lock. Unreadable state counts as active."""
+    jobs = {}
+    for directory in listing(STATE / "jobs"):
+        if not (directory / "request.json").exists():
+            continue  # Not a job, or deleted.
+        try:
+            state = current(directory)
+        except (OSError, ValueError, KeyError, TypeError):
+            state = {}
+        if state.get("status") not in TERMINAL:
+            jobs[directory.name] = state.get("release")
+    return jobs
+
+
+def prune_releases(releases, jobs):
+    """Remove release directories beyond the newest few, except this one and active jobs' ones."""
+    if None in jobs.values():
+        return []  # A job from an earlier release does not record which release it needs.
+    needed = {RELEASE, *(Path(path) for path in jobs.values())}
+    directories = [path for path in releases.iterdir() if path.is_dir() and not path.is_symlink()]
+    removed = []
+    for path in sorted(directories, key=modified, reverse=True)[KEEP_RELEASES:]:
+        if path not in needed:
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(path.name)
+    return removed
+
+
+def promote(force=False):
+    """Select this release; deploy.sh runs it from the new candidate after its preflight.
+
+    The final active-job check, the switch and release cleanup hold the submit lock, so a job is
+    either seen here or submitted by the selected release. A unique staging link keeps
+    concurrent deployments from replacing each other's candidate before it is selected.
+    """
+    if not isinstance(force, bool):
+        raise ValueError("force must be a boolean")
+    releases = RELEASE.parent
+    if releases.name != "releases" or not all((RELEASE / name).is_file() for name in CODE):
+        raise ValueError(f"{RELEASE} is not a complete release in a releases directory")
+    root, target = releases.parent, f"releases/{RELEASE.name}"
+    link = root / "remote"
+    with retention_lock():
+        jobs = active_jobs()
+        if jobs and not force:
+            names = " ".join(sorted(jobs))
+            raise ValueError(
+                f"Refusing to deploy while jobs are active: {names} (--force overrides)"
+            )
+        if link.is_dir() and not link.is_symlink():
+            # The flat directory of an earlier deployment becomes an ordinary release.
+            os.rename(link, releases / time.strftime("legacy-%Y%m%dT%H%M%SZ", time.gmtime()))
+        staging = root / f"remote.next-{os.urandom(4).hex()}"
+        staging.symlink_to(target)
+        try:
+            os.replace(staging, link)
+        finally:
+            staging.unlink(missing_ok=True)
+        if os.readlink(link) != target:
+            raise RuntimeError(f"{link} does not select {target} after promotion")
+        removed = prune_releases(releases, jobs)
+    return {"release": RELEASE.name, "active_jobs": sorted(jobs), "removed": removed}
+
+
 def output(arguments):
     """Command output, or None when the tool is missing or fails, so health still answers."""
     try:
@@ -617,7 +711,7 @@ def writable(path):
 
 
 def health():
-    release = Path(__file__).resolve().parent
+    release = RELEASE
     try:
         attempted = str(config_path())
     except ConfigError:
@@ -630,10 +724,7 @@ def health():
     checks["lock_dir_writable"] = writable(LOCK_DIR)
     result = {
         "release": release.name,
-        "code": {
-            name: hashlib.sha256((release / name).read_bytes()).hexdigest()
-            for name in ("common.py", "control.py", "engine.py")
-        },
+        "code": {name: hashlib.sha256((release / name).read_bytes()).hexdigest() for name in CODE},
         "supported_revision": REVISION,
         "config_path": attempted,
         "config_error": CONFIG_ERROR,
@@ -711,6 +802,8 @@ def dispatch(action, request):
         return prune(request["older_than_days"], request.get("dry_run", True))
     if action == "find_upload":
         return find_upload(request["sha256"], request["suffix"], request["size"])
+    if action == "promote":
+        return promote(request.get("force", False))
     raise ValueError(f"Unknown action {action}")
 
 
@@ -829,6 +922,16 @@ def upload(upload_id, suffix, expected_size):
     return {"path": str(destination), "bytes": size, "sha256": digest.hexdigest(), "reused": False}
 
 
+def rerun(release, payload):
+    """Repeat this command from `release`, with the same request on standard input."""
+    with tempfile.TemporaryFile() as stream:
+        stream.write(payload)
+        stream.seek(0)
+        os.dup2(stream.fileno(), 0)
+    sys.stdout.flush()
+    os.execv(sys.executable, [sys.executable, str(release / "control.py"), *sys.argv[1:]])
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "supervise":
         supervise(sys.argv[2], sys.argv[3])
@@ -848,9 +951,12 @@ if __name__ == "__main__":
                     raise ValueError(CONFIG_ERROR)
                 result = upload(*sys.argv[2:])
             else:
-                payload = json.load(sys.stdin)
+                raw = sys.stdin.buffer.read()
+                payload = json.loads(raw)
                 result = dispatch(payload.pop("action"), payload)
             print(json.dumps({"result": result}))
+        except Superseded as moved:
+            rerun(moved.args[0], raw)
         except Exception as error:
             print(json.dumps({"error": str(error)}))
             sys.exit(1)

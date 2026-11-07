@@ -125,8 +125,9 @@ A Git push publishes source. Workstation deployment uses `scripts/deploy.sh`
 with `VISOMASTER_HOST` and `VISOMASTER_REMOTE` exported. The script publishes a
 new release directory, checks that it accepts the existing `remote-config.json`,
 swaps the `remote` symlink and prunes old releases. It never writes
-`remote-config.json`. It refuses while MCP jobs are queued or running; wait for them rather
-than using `--force`, since pruning can remove a release a queued job still needs.
+`remote-config.json`. It refuses while MCP jobs are queued or running, or when it cannot list them;
+wait for them rather than using `--force`. The new release rechecks, switches and prunes under
+the submit lock, keeping releases that active jobs record.
 After deployment, confirm `health_check` reports `code_matches: true` and run the
 checks appropriate to the changed behavior.
 

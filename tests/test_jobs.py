@@ -397,7 +397,7 @@ def test_submitted_job_keeps_its_release_after_deploy(backend, tmp_path, monkeyp
             shutil.copy(source, releases / name)
     link = tmp_path / "remote"
     link.symlink_to("releases/one")
-    monkeypatch.setattr(control, "__file__", str(link / "control.py"))
+    monkeypatch.setattr(control, "RELEASE", (releases / "one").resolve())
     control.submit({"job_id": "pinned", "kind": "detect"})
     # deploy.sh swaps the symlink while the job is still queued or starting.
     (tmp_path / "next").symlink_to("releases/two")
