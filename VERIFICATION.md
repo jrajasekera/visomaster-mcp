@@ -168,3 +168,25 @@ Frames 0, 32, 64 and 95 of the default render were inspected: the woman's face w
 ## Remaining limits
 
 Best match was qualified on one two-person clip with one mapping. Multiple mappings, crowds, mirrors or a target absent while a look-alike remains, and tracking combined with best match were not exercised. Native Claude/Codex UI sessions were not opened.
+
+# Review remediation production deployment on 2026-11-07
+
+All 29 findings from the whole-tree code review (`vmcp-review-remediation-qpn`) plus `vmcp-best-match-dnq` and `vmcp-detect-threshold-ljb` were deployed together. The hardware class and Fusion revision are the same as in the runs above.
+
+## Automated checks
+
+`uv run --locked pytest -q` gave 380 passed on macOS (FFmpeg 8.1). A copy of the same tree on the Linux workstation (FFmpeg 6.1, system Python 3.12) gave 360 passed and 1 skipped, with the 19 privacy-audit tests deselected because that copy had no Git checkout. Ruff check, Ruff format and the privacy audit were clean. No test processes remained after either run.
+
+## Production checks
+
+| Check | Observed result |
+| --- | --- |
+| Deployment | `scripts/deploy.sh` checked the queued and running queries separately, preflighted the candidate and promoted it through `control.py promote` under the submit lock |
+| Health | `code_matches: true`, `compatible: true`, no `compatibility_reason` or `config_error`; the configuration hash matched the previous release |
+| Existing jobs | Earlier jobs still listed after the switch |
+| GPU smoke test, close-up clip with a synthetic source face | Preflight recorded `hash_status: match`. Single-frame detection verified the subject's crop and left four small background faces unverified with null `reference_path`. Preview swapped 1 face. A 24-frame render completed with 24 swaps, 24 frames, 1.001 s and AAC audio. The reconnected session found the disconnect render running, and cancellation was recorded as `passed` on the running path |
+| Client | `claude mcp list` reported the server connected |
+
+## Remaining limits
+
+The supervisor-loss, mirrored-matrix, RGB, 10-bit, anamorphic, VFR and audio-overlap behaviors were verified with synthetic fixtures and stub Fusion workers on both FFmpeg versions, not with live GPU renders. Follow-ups: `vmcp-n88` (artifacts of non-completed jobs are accepted as inputs), `vmcp-y0h` (non-standard source matrices and limited-range gray under FFmpeg 8) and `vmcp-tsb` (descendants survive if the cancellation guard is killed on its own).
