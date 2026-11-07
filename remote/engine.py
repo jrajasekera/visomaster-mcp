@@ -780,7 +780,10 @@ def run(directory):
         raise RuntimeError(CONFIG_ERROR)
     if SETTINGS.sha256 != os.environ.get("VM_CONFIG_SHA256"):
         raise RuntimeError("Remote configuration changed after submission; resubmit the job")
-    request = validate_request(read_json(directory / "request.json"))
+    # Inputs resolved at submission, which retention protects; older jobs keep the raw request.
+    resolved = directory / "resolved.json"
+    request = read_json(resolved if resolved.exists() else directory / "request.json")
+    request = validate_request(request)
     if request["kind"] == "normalize":
         # FFmpeg only: Fusion and the GPU are never loaded.
         atomic_json(directory / "result.json", normalize_video(request, directory))

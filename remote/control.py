@@ -1,5 +1,7 @@
 """Short-lived SSH commands and durable per-job supervisors. No GPU imports here."""
 
+import contextlib
+import copy
 import fcntl
 import hashlib
 import json
@@ -166,6 +168,8 @@ def submit(request):
             staging = Path(temporary)
             (staging / "artifacts").mkdir()
             atomic_json(staging / "request.json", request)
+            # The worker opens and retention protects these files, whatever aliases point to later.
+            atomic_json(staging / "resolved.json", resolve_inputs(request))
             atomic_json(
                 staging / "state.json",
                 {
@@ -421,29 +425,35 @@ def tree_bytes(path):
         return 0
 
 
-def delete_job(job_id):
-    directory = job_path(job_id)
-    status(job_id)  # Reconciles jobs whose supervisor has exited.
+@contextlib.contextmanager
+def retention_lock():
+    """The submit lock: submission, deletion, pruning and upload reuse or publication decide
+    under it, so a retention decision and its removal see one consistent set of jobs and files."""
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (STATE / "submit.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        with (directory / "lease").open("a") as lease:
-            try:
-                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise ValueError("Job is still active; cancel it and wait for a terminal state")
-            state = read_json(directory / "state.json")
-            if state["status"] not in TERMINAL:
-                raise ValueError("Only completed, failed or cancelled jobs can be deleted")
-            # Artifacts such as normalized media or face crops can be another job's input.
-            inside = os.path.realpath(directory) + os.sep
-            if any(path.startswith(inside) for path in active_references()):
-                raise ValueError("A queued or running job uses this job's artifacts as input")
-            size = tree_bytes(directory)
-            # Rename first so the job disappears atomically, then remove it outside the locks.
-            trash = STATE / f"trash-{job_id}-{os.urandom(4).hex()}"
-            os.replace(directory, trash)
-    shutil.rmtree(trash, ignore_errors=True)
-    return {"job_id": job_id, "status": state["status"], "deleted": True, "bytes": size}
+        yield
+
+
+def listing(directory):
+    return sorted(directory.glob("*"))
+
+
+def resolve_inputs(request):
+    """The request with each input path resolved; persisted at submission as resolved.json."""
+    resolved = copy.deepcopy(request)
+    if isinstance(resolved.get("media_path"), str):
+        resolved["media_path"] = os.path.realpath(resolved["media_path"])
+    for mapping in resolved.get("mappings") or []:
+        if isinstance(mapping, dict):
+            if isinstance(mapping.get("target_face"), str):
+                mapping["target_face"] = os.path.realpath(mapping["target_face"])
+            if isinstance(mapping.get("source_faces"), list):
+                mapping["source_faces"] = [
+                    os.path.realpath(path) if isinstance(path, str) else path
+                    for path in mapping["source_faces"]
+                ]
+    return resolved
 
 
 def request_paths(request):
@@ -453,23 +463,83 @@ def request_paths(request):
             paths.append(mapping.get("target_face"))
             sources = mapping.get("source_faces")
             paths.extend(sources if isinstance(sources, list) else [])
-    return {os.path.realpath(path) for path in paths if isinstance(path, str)}
+    return {Path(path) for path in paths if isinstance(path, str)}
 
 
 def active_references():
-    """Input paths of queued/running jobs; callers hold the submit lock."""
+    """Inputs of queued/running jobs as resolved at submission; callers hold the retention lock.
+
+    None means unknown: an active job without resolved.json (submitted by an earlier release)
+    may have resolved an alias differently, so nothing that could be an input is removable.
+    """
     referenced = set()
-    for request_file in (STATE / "jobs").glob("*/request.json"):
+    for directory in listing(STATE / "jobs"):
+        if not (directory / "request.json").exists():
+            continue  # Not a job, or deleted.
         try:
-            if read_json(request_file.with_name("state.json"))["status"] in TERMINAL:
+            if current(directory)["status"] in TERMINAL:
                 continue
-        except (OSError, ValueError, KeyError):
+        except (OSError, ValueError, KeyError, TypeError):
             pass  # Unreadable state counts as active.
         try:
-            referenced |= request_paths(read_json(request_file))
+            referenced |= request_paths(read_json(directory / "resolved.json"))
         except (OSError, ValueError, AttributeError):
-            pass
+            return None
     return referenced
+
+
+def protected(path, referenced):
+    """Whether removing path (a file, or a tree by component ancestry) removes an input."""
+    if referenced is None:
+        return True
+    targets = {Path(os.path.abspath(path)), Path(os.path.realpath(path))}
+    return any(item.is_relative_to(target) for item in referenced for target in targets)
+
+
+def claim_job(directory, referenced, cutoff=None, remove=False):
+    """Retention eligibility shared by delete, prune and its preview; the caller holds the lock.
+
+    Returns None for a job newer than cutoff, raises ValueError for an ineligible one, and
+    otherwise returns its report entry and, when removing, the trash path it was renamed to.
+    The checks and the rename see one generation: replacing a job needs the retention lock,
+    and the lease shows that no supervisor is still publishing its state.
+    """
+    current(directory)  # Reconciles jobs whose supervisor has exited.
+    with (directory / "lease").open("a") as lease:
+        try:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("Job is still active; cancel it and wait for a terminal state")
+        state_file = directory / "state.json"
+        state = read_json(state_file)
+        if state["status"] not in TERMINAL:
+            raise ValueError("Only completed, failed or cancelled jobs can be deleted")
+        finished = state.get("finished_at") or state_file.stat().st_mtime
+        if cutoff is not None and finished >= cutoff:
+            return None
+        # Artifacts such as normalized media or face crops can be another job's input.
+        if protected(directory, referenced):
+            raise ValueError("A queued or running job uses this job's artifacts as input")
+        entry = {
+            "job_id": directory.name,
+            "status": state["status"],
+            "bytes": tree_bytes(directory),
+            "finished_at": finished,
+        }
+        trash = None
+        if remove:
+            # Rename first so the job disappears atomically; callers remove it outside the lock.
+            trash = STATE / f"trash-{directory.name}-{os.urandom(4).hex()}"
+            os.replace(directory, trash)
+        return entry, trash
+
+
+def delete_job(job_id):
+    directory = job_path(job_id)
+    with retention_lock():
+        entry, trash = claim_job(directory, active_references(), remove=True)
+    shutil.rmtree(trash, ignore_errors=True)
+    return {"job_id": job_id, "status": entry["status"], "deleted": True, "bytes": entry["bytes"]}
 
 
 def prune(older_than_days, dry_run=True):
@@ -480,42 +550,38 @@ def prune(older_than_days, dry_run=True):
     now = time.time()
     cutoff = now - older_than_days * 86400
     result = {"dry_run": dry_run, "jobs": [], "uploads": [], "stale": []}
-    for state_file in sorted((STATE / "jobs").glob("*/state.json")):
-        job_id = state_file.parent.name
-        try:
-            state = status(job_id)
-            finished = state.get("finished_at") or state_file.stat().st_mtime
-            if state["status"] not in TERMINAL or finished >= cutoff:
-                continue
-            if dry_run:
-                entry = {
-                    "job_id": job_id,
-                    "status": state["status"],
-                    "bytes": tree_bytes(state_file.parent),
-                }
-            else:
-                entry = delete_job(job_id)
-        except (OSError, ValueError):
-            continue  # Invalid, concurrently deleted or newly active jobs are left alone.
-        entry["finished_at"] = finished
-        result["jobs"].append(entry)
-    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with (STATE / "submit.lock").open("a") as lock:
-        # Submissions validate inputs under this lock, so no new reference can appear mid-prune.
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    trash = []
+    # Previews run the same checks as removal under the same lock, so both report alike.
+    with retention_lock():
         referenced = active_references()
+        for directory in listing(STATE / "jobs"):
+            try:
+                claimed = claim_job(directory, referenced, cutoff, remove=not dry_run)
+            except (OSError, ValueError, KeyError, TypeError):
+                continue  # Invalid, vanished, active or referenced jobs are left alone.
+            if claimed:
+                entry, removed = claimed
+                if removed:
+                    entry["deleted"] = True
+                    trash.append(removed)
+                result["jobs"].append(entry)
         candidates = []
-        for path in sorted((STATE / "uploads").glob("*")):
-            modified = path.lstat().st_mtime
+        for path in listing(STATE / "uploads"):
+            try:
+                modified = path.lstat().st_mtime
+            except FileNotFoundError:
+                continue  # A transfer published or discarded its temporary file.
             if path.name.endswith(".partial"):
                 # Active transfers keep writing; an hour of silence means a dead upload.
                 if modified < min(cutoff, now - 3600):
                     candidates.append(("stale", path))
-            elif modified < cutoff and os.path.realpath(path) not in referenced:
+            elif modified < cutoff and not protected(path, referenced):
                 candidates.append(("uploads", path))
-        # Staging exists only inside submit's lock; trash only until delete_job finishes.
+        # Staging exists only inside submit's lock; trash only until its remover finishes.
         for pattern in ("prepare-*", "trash-*"):
-            candidates += [("stale", path) for path in sorted(STATE.glob(pattern))]
+            candidates += [
+                ("stale", path) for path in sorted(STATE.glob(pattern)) if path not in trash
+            ]
         for category, path in candidates:
             result[category].append({"path": str(path), "bytes": tree_bytes(path)})
             if not dry_run:
@@ -523,6 +589,8 @@ def prune(older_than_days, dry_run=True):
                     shutil.rmtree(path, ignore_errors=True)
                 else:
                     path.unlink(missing_ok=True)
+    for path in trash:
+        shutil.rmtree(path, ignore_errors=True)
     result["total_bytes"] = sum(
         entry["bytes"] for key in ("jobs", "uploads", "stale") for entry in result[key]
     )
@@ -661,13 +729,15 @@ def find_upload(sha256, suffix, size):
     if not isinstance(sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", sha256):
         raise ValueError("sha256 must be 64 lowercase hex digits")
     destination, size = upload_destination(sha256, suffix, size)
-    try:
-        info = destination.lstat()
-    except FileNotFoundError:
-        return None
-    if destination.is_symlink() or not destination.is_file() or info.st_size != size:
-        return None
-    os.utime(destination)  # Reuse counts as recent use for retention pruning.
+    # Prune decides under the same lock: it either sees this refresh or removed the file first.
+    with retention_lock():
+        try:
+            info = destination.lstat()
+            if destination.is_symlink() or not destination.is_file() or info.st_size != size:
+                return None
+            os.utime(destination)  # Reuse counts as recent use for retention pruning.
+        except FileNotFoundError:
+            return None
     return {"path": str(destination), "bytes": size, "sha256": sha256, "reused": True}
 
 
@@ -691,7 +761,9 @@ def upload(upload_id, suffix, expected_size):
             raise ValueError("Upload was interrupted or its size changed")
         if len(upload_id) == 64 and digest.hexdigest() != upload_id:
             raise ValueError("Upload content does not match its SHA-256")
-        os.replace(temporary, destination)
+        # Prune checks age and removes under this lock, so it never removes a fresh publication.
+        with retention_lock():
+            os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
     return {"path": str(destination), "bytes": size, "sha256": digest.hexdigest(), "reused": False}

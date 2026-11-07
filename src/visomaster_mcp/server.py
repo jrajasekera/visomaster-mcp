@@ -260,8 +260,8 @@ async def prune_storage(
     """Report or delete old terminal jobs, unused uploads and files left by crashed transfers.
 
     Removes terminal jobs finished more than `older_than_days` ago and uploads untouched for
-    that long that no queued/running job references. Dry run by default; returns the paths,
-    jobs and byte totals that were (or would be) deleted.
+    that long, except files a queued/running job uses as input. Dry run by default and with
+    the same checks; returns the paths, jobs and byte totals that were (or would be) deleted.
     """
     return await command("prune", older_than_days=older_than_days, dry_run=dry_run)
 
