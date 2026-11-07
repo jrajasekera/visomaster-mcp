@@ -332,9 +332,11 @@ def test_unknown_extent_completes_on_output_validation(media, tmp_path, monkeypa
     assert all(p["eta_seconds"] is None for p in progress)
 
 
-@pytest.mark.parametrize(
-    ("frames", "error"), [(10, "expected about 25"), (0, "normalization failed")]
-)
+# FFmpeg 8 fails an encode without video frames; FFmpeg 6 writes an audio-only file.
+EMPTY = "normalization failed|no video stream"
+
+
+@pytest.mark.parametrize(("frames", "error"), [(10, "expected about 25"), (0, EMPTY)])
 def test_truncated_or_empty_normalization_fails(media, tmp_path, monkeypatch, frames, error):
     command = engine.normalize_command
 
