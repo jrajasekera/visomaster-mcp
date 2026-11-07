@@ -68,7 +68,7 @@ def test_missing_file_names_expected_path(tmp_path):
         ({"media_root": None}, "media_root is required"),
         ({"fusion_dir": "/nonexistent/fusion"}, "fusion_dir"),
         ({"state_dir": "relative"}, "state_dir must be an absolute"),
-        ({"state_dir": "/tmp/outside-media"}, "inside media_root"),
+        ({"state_dir": "/"}, "must not be media_root or contain it"),
         ({"version": 2}, "version must be 1"),
         ({"extra": 1}, "unknown keys extra"),
         ({"gpu": "0;x"}, "gpu must be"),
@@ -92,16 +92,19 @@ def test_invalid_values_are_rejected(media, tmp_path, changes, message):
 
 def test_state_dir_must_differ_from_media_root_and_avoid_fusion(media, tmp_path):
     path = write_config(tmp_path / "c.json", media)
-    with pytest.raises(ConfigError, match="inside media_root"):
+    with pytest.raises(ConfigError, match="must not be media_root"):
         load_config(edit(path, state_dir=str(media)))
     with pytest.raises(ConfigError, match="inside fusion_dir"):
         load_config(edit(path, state_dir=str(media / "fusion/runtime")))
 
 
-def test_fusion_checkout_layout_files_are_required(media, tmp_path):
+def test_fusion_checkout_needs_git_but_not_layout_files(media, tmp_path):
+    # Layout files are read only by Fusion jobs, so normalization works without them.
     path = write_config(tmp_path / "c.json", media)
     (media / "fusion/app/ui/widgets/swapper_layout_data.py").unlink()
-    with pytest.raises(ConfigError, match="swapper_layout_data.py"):
+    load_config(path)
+    (media / "fusion/.git").rmdir()
+    with pytest.raises(ConfigError, match="missing .git"):
         load_config(path)
 
 

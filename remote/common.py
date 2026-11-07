@@ -43,6 +43,7 @@ PARAMETERS = {
 # Demuxers that read only the file they are given (mov is MP4/MOV, matroska is MKV/WebM).
 DEMUXERS = "mov,matroska,avi,mpegts,png_pipe,jpeg_pipe,webp_pipe,bmp_pipe"
 MAX_DETECT_FRAMES = 64
+NORMALIZE_KEYS = {"kind", "media_path", "fps"}
 CONTROLS = {
     "DetectorModelSelection",
     "DetectorScoreSlider",
@@ -137,17 +138,15 @@ def load_config(path=None):
     base = _directory(path, "media_root", raw["media_root"])
     app = raw.get("fusion_dir", str(base / "tools/visomaster-fusion"))
     app = _directory(path, "fusion_dir", app)
-    required = (".git", *(f"app/ui/widgets/{name}_layout_data.py" for name in LAYOUT_NAMES))
-    missing = [name for name in required if not (app / name).exists()]
-    if missing:
-        raise ConfigError(
-            f"{path}: fusion_dir {app} is not a Fusion checkout (missing {', '.join(missing)})"
-        )
+    # Layout files are read only by jobs that need Fusion settings (see layouts), so a missing
+    # one cannot block normalization or status; health reports it as a tracked app change.
+    if not (app / ".git").exists():
+        raise ConfigError(f"{path}: fusion_dir {app} is not a Fusion checkout (missing .git)")
     state = raw.get("state_dir", str(base / "runtime/visomaster-mcp"))
     state = _directory(path, "state_dir", state, must_exist=False)
-    # Uploads and job artifacts are reused as media inputs, which must lie inside media_root.
-    if state == base or not state.is_relative_to(base):
-        raise ConfigError(f"{path}: state_dir must be a directory inside media_root {base}")
+    # Inside media_root or elsewhere; only its uploads and job artifacts are inputs (input_path).
+    if base.is_relative_to(state):
+        raise ConfigError(f"{path}: state_dir must not be media_root or contain it ({base})")
     if state.is_relative_to(app):
         raise ConfigError(f"{path}: state_dir must not lie inside fusion_dir {app}")
     gpu = raw.get("gpu", "0")
@@ -226,13 +225,39 @@ def job_path(job_id):
     return STATE / "jobs" / job_id
 
 
+def managed(path):
+    """Whether a resolved path inside STATE is an upload or a job artifact.
+
+    The rest of the state tree (requests, logs, locks, partial uploads, staging and trash) is
+    never an input, wherever state_dir lies.
+    """
+    parts = path.relative_to(STATE).parts
+    if len(parts) == 2 and parts[0] == "uploads":
+        return not parts[1].endswith(".partial")
+    return (
+        len(parts) >= 4
+        and parts[0] == "jobs"
+        and JOB_ID.fullmatch(parts[1]) is not None
+        and parts[2] == "artifacts"
+    )
+
+
 def input_path(value):
+    """A media input: a regular file in media_root or a managed file of state_dir.
+
+    The path is resolved first, so traversal and symlinks (in the file name or any ancestor)
+    are judged by their target and cannot extend either root.
+    """
     path = Path(value)
     if not path.is_absolute():
         raise ValueError("Media paths must be absolute workstation paths")
     path = path.resolve(strict=True)
-    if not path.is_relative_to(BASE) or not path.is_file():
-        raise ValueError(f"Media must be a regular file inside {BASE}")
+    if STATE is not None and path.is_relative_to(STATE):
+        inside = managed(path)
+    else:
+        inside = path.is_relative_to(BASE)
+    if not inside or not path.is_file():
+        raise ValueError(f"Media must be a regular file inside {BASE}, an upload or a job artifact")
     return path
 
 
@@ -277,11 +302,56 @@ def probe(path):
     return json.loads(result.stdout)
 
 
+def fusion_compatibility(app):
+    """(revision, reason) for the Fusion checkout; reason is None when GPU jobs may load it.
+
+    Health and worker startup share this check: the checkout must be at REVISION with no
+    tracked changes (staged or not) under app/. Untracked files and other directories are
+    not checked.
+    """
+
+    def git(*arguments):
+        try:
+            return subprocess.run(
+                ["git", "-C", str(app), *arguments],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+            ).stdout
+        except subprocess.CalledProcessError as error:
+            raise OSError(error.stderr.strip() or str(error)) from None
+
+    try:
+        revision = git("rev-parse", "HEAD").strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        return None, f"Cannot read the Fusion revision in {app} ({error})"
+    if revision != REVISION:
+        return revision, (
+            f"Fusion revision changed to {revision}, but the adapter supports {REVISION}; "
+            "qualify the adapter before rendering"
+        )
+    try:
+        changed = git("diff", "--no-ext-diff", "HEAD", "--", "app")
+    except (OSError, subprocess.SubprocessError) as error:
+        return revision, f"Cannot check Fusion app for tracked changes ({error})"
+    if changed:
+        return revision, "Fusion app has tracked local changes; qualify them before rendering"
+    return revision, None
+
+
 def layouts():
     """Read literal metadata without importing Qt actions or constructing a GUI."""
     control, parameters = {}, {}
     for name in LAYOUT_NAMES:
-        tree = ast.parse((APP / f"app/ui/widgets/{name}_layout_data.py").read_text())
+        path = APP / f"app/ui/widgets/{name}_layout_data.py"
+        try:
+            tree = ast.parse(path.read_text())
+        except OSError as error:
+            raise ValueError(
+                f"Cannot read Fusion layout {path} ({error.strerror}); fusion_dir must be a "
+                "Fusion checkout (see health_check)"
+            ) from None
         destination = control if name == "settings" else parameters
         for node in ast.walk(tree):
             if not isinstance(node, ast.Dict):
@@ -343,6 +413,7 @@ def validate_settings(values, definitions, allowed):
 
 
 def validate_request(request):
+    """Validate a job request; only detect, preview and render read Fusion's layout metadata."""
     if request.get("kind") not in {"detect", "preview", "render", "normalize"}:
         raise ValueError("Unknown job kind")
     input_path(request["media_path"])
@@ -354,6 +425,19 @@ def validate_request(request):
             rate = None
         if rate is None or not 1 <= rate <= 240 or rate.denominator > 1001:
             raise ValueError("fps must be a rate from 1 to 240, such as 25, 29.97 or 30000/1001")
+    if request["kind"] == "normalize":
+        # FFmpeg-only: GPU fields would be ignored, so they are refused rather than validated.
+        extra = sorted(set(request) - NORMALIZE_KEYS)
+        if extra:
+            raise ValueError(
+                f"Normalization accepts only media_path and fps, not {', '.join(extra)}"
+            )
+        return request
+    return validate_fusion_request(request)
+
+
+def validate_fusion_request(request):
+    """Frame selection, settings and mappings of a detect, preview or render request."""
     for key in ("frame", "start_frame"):
         value = request.get(key, 0)
         if type(value) is not int or value < 0:

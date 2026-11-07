@@ -22,6 +22,7 @@ from common import (
     SETTINGS,
     atomic_json,
     ffmpeg_input,
+    fusion_compatibility,
     input_path,
     layouts,
     probe,
@@ -31,18 +32,9 @@ from common import (
 
 
 def initialize(controls):
-    revision = subprocess.check_output(
-        ["git", "-C", str(APP), "rev-parse", "HEAD"], text=True
-    ).strip()
-    if revision != REVISION:
-        raise RuntimeError(
-            f"Fusion revision changed to {revision}; qualify the adapter before rendering"
-        )
-    changed = subprocess.check_output(
-        ["git", "-C", str(APP), "diff", "HEAD", "--", "app"], text=True
-    )
-    if changed:
-        raise RuntimeError("Fusion app has tracked local changes; qualify them before rendering")
+    _, reason = fusion_compatibility(APP)  # The same check health reports.
+    if reason:
+        raise RuntimeError(reason)
     sys.path.insert(0, str(APP))
     os.chdir(APP)
     import torch

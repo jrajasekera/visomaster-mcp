@@ -33,6 +33,14 @@ mcp = FastMCP(
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False)
 DESTROY = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
+# Only an omitted or null ID is generated; any other value goes to the workstation's validation.
+JobId = Annotated[
+    str | None,
+    Field(
+        description="Stable ID that makes retries idempotent: 1–64 letters, digits, underscores "
+        "or hyphens, starting with a letter or digit. Omit it (or pass null) to generate one."
+    ),
+]
 
 
 class FaceMapping(BaseModel):
@@ -119,7 +127,7 @@ async def detect_faces(
     sample_frames: Annotated[int | None, Field(ge=1, le=64)] = None,
     frames: Annotated[list[int] | None, Field(min_length=1, max_length=64)] = None,
     controls: dict | None = None,
-    job_id: str | None = None,
+    job_id: JobId = None,
 ) -> dict[str, Any]:
     """Queue face detection. Poll job_status, then inspect crops with view_artifact.
 
@@ -134,7 +142,7 @@ async def detect_faces(
     """
     return await command(
         "submit",
-        job_id=job_id or uuid.uuid4().hex,
+        job_id=uuid.uuid4().hex if job_id is None else job_id,
         kind="detect",
         media_path=media_path,
         frame=frame,
@@ -155,7 +163,7 @@ async def submit_swap(
     start_frame: int = 0,
     max_frames: int | None = None,
     controls: dict | None = None,
-    job_id: str | None = None,
+    job_id: JobId = None,
 ) -> dict[str, Any]:
     """Queue an image/frame preview or CFR video render using explicit identity mappings.
 
@@ -167,7 +175,7 @@ async def submit_swap(
     """
     return await command(
         "submit",
-        job_id=job_id or uuid.uuid4().hex,
+        job_id=uuid.uuid4().hex if job_id is None else job_id,
         kind=mode,
         media_path=media_path,
         mappings=[m.model_dump() for m in mappings],
@@ -185,7 +193,7 @@ async def normalize_media(
         str | float | None,
         Field(description="Output rate such as 25, 29.97 or '30000/1001'; default from the source"),
     ] = None,
-    job_id: str | None = None,
+    job_id: JobId = None,
 ) -> dict[str, Any]:
     """Queue conversion of a video into a render-ready copy. Runs on CPU without the GPU lock.
 
@@ -196,7 +204,7 @@ async def normalize_media(
     """
     return await command(
         "submit",
-        job_id=job_id or uuid.uuid4().hex,
+        job_id=uuid.uuid4().hex if job_id is None else job_id,
         kind="normalize",
         media_path=media_path,
         fps=None if fps is None else str(fps),

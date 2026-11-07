@@ -35,6 +35,7 @@ from common import (
     ConfigError,
     atomic_json,
     config_path,
+    fusion_compatibility,
     input_path,
     job_path,
     layouts,
@@ -152,6 +153,10 @@ def list_jobs(only_status=None, only_kind=None, limit=50):
     return jobs
 
 
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
 def submit(request):
     request = dict(request)
     job_id = request.pop("job_id")
@@ -159,12 +164,14 @@ def submit(request):
     (STATE / "jobs").mkdir(parents=True, exist_ok=True, mode=0o700)
     with (STATE / "submit.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        # Validate under the lock so pruning cannot remove an input before the job exists.
-        validate_request(request)
+        # An exact retry returns the persisted job before its inputs are consulted, so it still
+        # answers after they are moved or pruned. Canonical JSON keeps 1, 1.0 and true distinct.
         if directory.exists():
-            if read_json(directory / "request.json") != request:
+            if canonical(read_json(directory / "request.json")) != canonical(request):
                 raise ValueError("job_id already exists with a different request")
             return status(job_id)
+        # Validate under the lock so pruning cannot remove an input before the job exists.
+        validate_request(request)
         with tempfile.TemporaryDirectory(dir=STATE, prefix="prepare-") as temporary:
             staging = Path(temporary)
             (staging / "artifacts").mkdir()
@@ -633,9 +640,9 @@ def health():
         "checks": checks,
     }
     if CONFIG_ERROR:
-        return {**result, "revision": None, "compatible": False}
-    revision = output(["git", "-C", str(APP), "rev-parse", "HEAD"])
-    revision = revision.strip() if revision else None
+        reason = "The remote configuration is invalid; see config_error"
+        return {**result, "revision": None, "compatible": False, "compatibility_reason": reason}
+    revision, reason = fusion_compatibility(APP)  # The check GPU workers run at startup.
     gpus = output(
         [
             "nvidia-smi",
@@ -647,7 +654,8 @@ def health():
     return {
         **result,
         "revision": revision,
-        "compatible": revision == REVISION,
+        "compatible": reason is None,
+        "compatibility_reason": reason,
         "gpu": GPU,
         "gpus": gpus,
         "app": str(APP),

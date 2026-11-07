@@ -21,7 +21,7 @@ Optional: face restoration (`GFPGAN-v1.4` was qualified), expression restoration
 
 ## Fusion revision guard
 
-The adapter imports Fusion's own processing classes, so it is tied to one Fusion commit: `f2d6f5ebe190b631ee5c8972332083cf7f8a3e72` (declared as `REVISION` in `remote/common.py`). GPU jobs refuse to run if the checkout is at another commit or has tracked local changes under `app/`, and `health_check` reports `compatible: false`.
+The adapter imports Fusion's own processing classes, so it is tied to one Fusion commit: `f2d6f5ebe190b631ee5c8972332083cf7f8a3e72` (declared as `REVISION` in `remote/common.py`). GPU jobs refuse to run if the checkout is at another commit or has tracked local changes under `app/` (staged or not), and `health_check` runs the same check: it reports `compatible: false` with the reason in `compatibility_reason`. Normalization does not use Fusion and is unaffected.
 
 To qualify another revision, inspect the installed pipeline at that revision (the processors, worker and layout definitions the adapter calls), run the test suite, run `scripts/smoke_gpu.py` on the target hardware, record the evidence in `VERIFICATION.md`, and only then change `REVISION`. Never relax or bypass the guard without that qualification.
 
@@ -33,7 +33,7 @@ The examples below use placeholders. Replace each one with your own value.
 | --- | --- |
 | `<checkout>` | Absolute path of your clone on the client machine |
 | `gpu-host` | SSH alias of the GPU workstation |
-| `/srv/visomaster` | Workstation media root: every media file and job artifact lives below it |
+| `/srv/visomaster` | Workstation media root: every source media file lives below it |
 | `/srv/visomaster/fusion` | Fusion checkout |
 | `/srv/visomaster/mcp` | Deployment directory (`VISOMASTER_REMOTE`) |
 | `/srv/visomaster/runtime/mcp` | Job state, uploads and logs |
@@ -135,9 +135,9 @@ SSH calls use `BatchMode=yes` and share one multiplexed connection through `~/.s
 | Key | Required | Default | Rules |
 | --- | --- | --- | --- |
 | `version` | yes | | `1` |
-| `media_root` | yes | | Existing absolute directory. Media paths and references must resolve inside it and be self-contained video or image files; playlists and concat lists are refused |
-| `fusion_dir` | no | `<media_root>/tools/visomaster-fusion` | Fusion checkout containing `.git` and its layout definition files |
-| `state_dir` | no | `<media_root>/runtime/visomaster-mcp` | Inside `media_root` (uploads and artifacts are reused as inputs), not inside `fusion_dir`; created with mode 0700 |
+| `media_root` | yes | | Existing absolute directory. Media paths and references must resolve inside it (or to an upload or job artifact in `state_dir`) and be self-contained video or image files; playlists and concat lists are refused |
+| `fusion_dir` | no | `<media_root>/tools/visomaster-fusion` | Fusion checkout containing `.git`. Detection, preview, render and `get_settings` read its layout definition files; normalization does not |
+| `state_dir` | no | `<media_root>/runtime/visomaster-mcp` | Inside `media_root` or on separate storage, but not `media_root` itself, an ancestor of it or inside `fusion_dir`; created with mode 0700. Only `uploads/*` (complete files) and `jobs/<id>/artifacts/**` are accepted as inputs; requests, logs, locks, staging and partial files never are, even when `state_dir` lies inside `media_root`. Paths are resolved before the check, so symlinks and `..` cannot reach other files |
 | `gpu` | no | `"0"` | GPU index as a string, without leading zeros. Sets `CUDA_VISIBLE_DEVICES` (with `CUDA_DEVICE_ORDER=PCI_BUS_ID`) and names the lock `gpu-<index>.lock` |
 | `runner` | yes | | Path, or list of arguments, whose first element is an absolute executable. Never passed through a shell |
 | `lock_dir` | no | `state_dir` | Existing writable directory for `gpu-<index>.lock` |
@@ -212,7 +212,7 @@ Example `submit_swap` arguments:
 }
 ```
 
-For video, use `mode="render"`, `start_frame` and `max_frames`. A null `max_frames` processes through the end. Frame indices start at zero. Give each intended job a stable `job_id` so a retried submission returns the same job. Reusing an ID with changed settings is rejected. Submit a new ID to retry a failed or cancelled job.
+For video, use `mode="render"`, `start_frame` and `max_frames`. A null `max_frames` processes through the end. Frame indices start at zero. Give each intended job a stable `job_id` (1–64 letters, digits, underscores or hyphens, starting with a letter or digit) so a retried submission returns the same job, even after its inputs have been moved or pruned. Reusing an ID with changed settings is rejected, and an empty ID is an error; only an omitted or null ID is generated. Submit a new ID to retry a failed or cancelled job.
 
 ## Storage
 
@@ -229,7 +229,7 @@ MCP GPU jobs share a process lock across all client sessions. Fusion's desktop G
 | `Remote configuration not found at ...` | Create `remote-config.json` in the deployment directory (setup step 6) |
 | `...: <key> ...` from the configuration | Fix the named key in the named file; `health_check` shows `config_path` and `config_error` |
 | `VM_... is no longer read` | Remove the variable from the workstation environment and put the value in `remote-config.json` |
-| `Fusion revision changed to ...` or `compatible: false` | Check out the pinned revision, or qualify the new one (see [Fusion revision guard](#fusion-revision-guard)) |
+| `Fusion revision changed to ...`, `Fusion app has tracked local changes` or `compatible: false` | Read `compatibility_reason`. Check out the pinned revision and discard tracked changes under `app/`, or qualify them (see [Fusion revision guard](#fusion-revision-guard)) |
 | `The configured runner must exec the Fusion Python interpreter` | End the runner with `exec "$FUSION_PYTHON" "$@"` |
 | `Cannot start the configured runner ...` | Fix the runner path or its permissions |
 | `Remote configuration changed after submission ...` | The file changed while the job was queued; resubmit |
