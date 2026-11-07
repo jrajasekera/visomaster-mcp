@@ -248,7 +248,7 @@ uv run --locked python scripts/privacy_audit.py
 
 The suite runs locally with temporary job backends, stdio clients and an SSH shim that clears the environment, as real SSH does. Linux-only behavior (the parent-death signal and the `mv -T` release switch) is exercised only on a workstation. There is no CI.
 
-The opt-in GPU check needs a short workstation video and a single-face replacement image. It creates persistent jobs, runs detection, preview and a short render, checks idempotent submission, reconnects with a new session and cancels a running job. It uses the first detected face as its target.
+The opt-in GPU check needs a short workstation video and a single-face replacement image. It creates persistent jobs, runs detection, preview and a short render, checks idempotent submission, reconnects with a new session and cancels a running job. It stops before queuing anything unless `health_check` reports `code_matches: true`, and records whether cancellation hit a running job, a queued one, or was unexercised because the render finished first. It uses the first detected face as its target.
 
 ```bash
 uv run --locked python scripts/smoke_gpu.py \

@@ -110,7 +110,11 @@ uv run --locked python scripts/smoke_gpu.py \
 
 This script creates persistent jobs and uses the first detected face as its test
 target. Choose fixtures where that selection is intentional. It exercises
-preview/render, duplicate submission, reconnect and cancellation. Record the
+preview/render, duplicate submission, reconnect and cancellation. It refuses to queue
+anything unless `health_check` reports `code_matches: true`, and its JSON evidence
+records the release and hash status plus a separate cancellation result: `passed`
+(running worker cancelled), `passed_queued` (cancelled before it started) or
+`unexercised` (the render finished first; not a pass, so rerun with more frames). Record the
 models, hardware class, checks, observed metrics and remaining gaps in
 `VERIFICATION.md` under descriptive run labels when qualifying behavior. Keep client protocol tests and native client UI
 verification separately identified in the evidence.
