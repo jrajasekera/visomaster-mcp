@@ -31,7 +31,8 @@ mcp = FastMCP(
         "renders (compare_variants previews several settings on the same frames or short clip "
         "in one job), and follow jobs with job_status(wait_seconds=50), "
         "which returns early on any state change, instead of polling rapidly. "
-        "Use a stable job_id to make retries idempotent. Jobs survive client disconnection."
+        "Use a stable job_id to make retries idempotent. Jobs survive client disconnection; "
+        "resume_render continues a failed or cancelled render from its checkpointed chunks."
     ),
 )
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
@@ -358,6 +359,10 @@ async def submit_swap(
     preflight_swap takes these same arguments and reports, without starting anything, whether
     this request can start and what to fix.
 
+    Renders are encoded in validated, checkpointed chunks of 250 frames and joined without
+    re-encoding; the result's `checkpoint` describes them. If a render fails or is cancelled,
+    resume_render queues a new job that reuses the chunks when nothing it depends on changed.
+
     `segments` (renders only) change intent by source-frame range [start_frame, end_frame)
     without changing the timeline: a segment may restrict which `mappings` swap, override
     `parameters` (for every active mapping) or `controls`, or pass frames through untouched.
@@ -651,6 +656,38 @@ async def list_jobs(
 async def cancel_job(job_id: str) -> dict[str, Any]:
     """Request cancellation of a queued/running job. Poll until its state is terminal."""
     return await command("cancel", job_id=job_id)
+
+
+@mcp.tool(annotations=WRITE)
+async def resume_render(
+    from_job_id: Annotated[
+        str, Field(description="The failed or cancelled render to continue; it is not changed")
+    ],
+    job_id: JobId = None,
+    priority: Priority = None,
+) -> dict[str, Any]:
+    """Queue a new render that reuses the verified chunks of a failed or cancelled render.
+
+    Renders are encoded in chunks of 250 source frames, each published only after its frame
+    count and timing are checked and committed with its SHA-256 in a checkpoint manifest. The
+    new job, with its own job_id, repeats the earlier job's request and links to it through
+    `resume_from`; the earlier job keeps its terminal state. Before anything is reused, the
+    media, references, effective settings, model files, Fusion revision, adapter code,
+    configuration and FFmpeg build are hashed and compared with the earlier attempt's; any
+    difference refuses the resume with a list of the changes (submit a fresh render instead).
+    Renders with FaceTrackingEnableToggle or KPSSmoothingEnableToggle are refused, because
+    their tracking state is not checkpointed. The worker reuses the longest run of chunks that
+    still verify, renders the remaining frames and joins all chunks by stream copy, with the
+    audio cut once over the whole range; the result and swap report cover every frame. A retry
+    with the same job_id and arguments returns the same job. Cancelling a job never resumes it.
+    """
+    return await command(
+        "resume",
+        timeout=HASHING_TIMEOUT,
+        job_id=uuid.uuid4().hex if job_id is None else job_id,
+        from_job_id=from_job_id,
+        **({} if priority is None else {"priority": priority}),
+    )
 
 
 @mcp.tool(annotations=DESTROY)

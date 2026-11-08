@@ -22,6 +22,8 @@ from types import SimpleNamespace
 
 from common import (
     APP,
+    CHECKPOINT_FORMAT,
+    CHECKPOINT_VERSION,
     CONFIG_ERROR,
     CONTROLS,
     MAX_COMPARE_PIXELS,
@@ -30,15 +32,22 @@ from common import (
     SETTINGS,
     Refusal,
     atomic_json,
+    concat_input,
     ffmpeg_input,
+    ffmpeg_version,
     file_sha256,
     fusion_compatibility,
     initial_controls,
     input_path,
+    intent_digest,
     layouts,
     probe,
+    provenance,
+    read_checkpoint,
     read_json,
+    resume_problems,
     segment_plan,
+    temporal,
     validate_request,
     variant_request,
 )
@@ -1171,6 +1180,14 @@ class MappingTelemetry:
         for kind in list(self.open):
             self.close(kind, end)
 
+    def state(self):
+        """Everything but the expected ranges, which come from the request (checkpoints)."""
+        return {key: value for key, value in vars(self).items() if key != "ranges"}
+
+    def restore(self, state):
+        for key, value in state.items():
+            setattr(self, key, value)
+
 
 class Telemetry:
     """Fusion's matching and swapping observed per processed frame, attributed to mappings.
@@ -1264,6 +1281,23 @@ class Telemetry:
     def finish(self, end):
         for mapping in self.mappings.values():
             mapping.finish(end)
+
+    COUNTERS = ("processed", "with_faces", "detections", "scored_faces")
+
+    def state(self):
+        """Counters and open runs between frames, which a render checkpoint stores with each
+        chunk so a resumed attempt reports the whole range as one uninterrupted run would."""
+        state = {key: getattr(self, key) for key in self.COUNTERS}
+        state["mappings"] = {face_id: m.state() for face_id, m in self.mappings.items()}
+        return state
+
+    def restore(self, state):
+        if set(state["mappings"]) != set(self.mappings):
+            raise ValueError("The checkpointed swap telemetry has other mappings")
+        for key in self.COUNTERS:
+            setattr(self, key, state[key])
+        for face_id, values in state["mappings"].items():
+            self.mappings[face_id].restore(values)
 
 
 CONVENTIONS = (
@@ -1651,12 +1685,13 @@ def audio_overlaps(source, metadata, start, duration):
 
 
 def mux(video, output, audio=None, options=()):
-    """Copy `video` into `output` with faststart, adding `audio` = (source, start, duration).
+    """Copy the video of input arguments `video` into `output` with faststart, adding `audio` =
+    (source, start, duration).
 
     The first audio stream of that source window becomes AAC; silence pads audio that starts
     later than the video, so it stays aligned with the first frame.
     """
-    inputs, outputs = ffmpeg_input(video), ["-map", "0:v:0", "-c:v", "copy"]
+    inputs, outputs = list(video), ["-map", "0:v:0", "-c:v", "copy"]
     if audio:
         inputs += audio_window(*audio)
         outputs += ["-map", "1:a:0", "-af", "aresample=async=1:first_pts=0"]
@@ -1850,19 +1885,325 @@ def preview_source(source, frame):
     return stream
 
 
-def render_video(window, request, directory, worker):
+def stop_encoder(process):
+    """Kill an encoder that is still running and close its pipe; the worker may go on."""
+    if process is None:
+        return
+    if process.poll() is None:
+        process.kill()
+        process.wait()
+    with contextlib.suppress(OSError):
+        process.stdin.close()
+
+
+class Encoder:
+    """One H.264 encode of a whole clip into a video-only file (comparison clips)."""
+
+    def __init__(self, path):
+        self.path, self.process = path, None
+
+    def begin(self, stream, fps, start, end, worker, plan):
+        self.process = subprocess.Popen(
+            encode_command(stream, fps, self.path), stdin=subprocess.PIPE
+        )
+        return start
+
+    def write(self, index, frame):
+        self.process.stdin.write(frame.tobytes())
+
+    def finish(self):
+        """Input arguments of the finished video."""
+        self.process.stdin.close()
+        if self.process.wait(timeout=120) != 0:
+            raise RuntimeError("FFmpeg video encoding failed")
+        return ffmpeg_input(self.path)
+
+    def close(self):
+        stop_encoder(self.process)
+
+    def cleanup(self):
+        self.path.unlink()
+
+
+# Render checkpoints (DESIGN.md, Checkpoints).
+CHUNK_FRAMES = 250  # Source frames per chunk; libx264's default keyframe interval.
+CHUNKING = (
+    "Chunk n holds source frames [start_frame + n * chunk_frames, start_frame + (n + 1) * "
+    "chunk_frames), clipped to the rendered range, encoded alone as video-only H.264 that "
+    "starts with a keyframe. Chunks are rendered in order, and the output joins them by stream "
+    "copy in index order."
+)
+# Codec parameters, the decoder configuration (SPS and PPS) included, that must be identical
+# for chunks to join without re-encoding.
+CODEC_KEYS = (
+    "codec_name",
+    "profile",
+    "level",
+    "width",
+    "height",
+    "pix_fmt",
+    "sample_aspect_ratio",
+    "color_range",
+    "color_space",
+    "color_transfer",
+    "color_primaries",
+    "time_base",
+    "r_frame_rate",
+    "extradata_hash",
+)
+
+
+class Checkpoint:
+    """A render's validated chunks and the manifest that commits them (DESIGN.md, Checkpoints).
+
+    Each chunk is published after its frame count, timing and codec parameters are checked,
+    with the render's accounting after its last frame. A resumed attempt starts from a copy of
+    the earlier manifest (inherited.json) and hard links of its chunks, both made at
+    submission, and reuses the longest prefix of chunks that verify; it renders the rest.
+    """
+
+    def __init__(self, directory, request, record=None):
+        self.job_id, self.request, self.record = directory.name, request, record
+        self.root = directory / "checkpoint"
+        self.chunks = self.root / "chunks"
+        self.chunks.mkdir(parents=True, exist_ok=True)
+        self.encoder = self.inherited = None
+        self.reused = []
+        resume = request.get("resume")
+        if resume:
+            source = resume["from_job_id"]
+            try:
+                self.inherited = read_checkpoint(self.root / "inherited.json")
+            except ValueError as error:
+                raise Refusal("checkpoint_unusable", f"Cannot resume {source}: {error}") from None
+            problems = resume_problems(self.inherited, request, record)
+            if problems:
+                raise Refusal(
+                    "checkpoint_incompatible",
+                    f"Cannot reuse the chunks of {source}:\n- "
+                    + "\n- ".join(problems)
+                    + "\nSubmit a fresh render with submit_swap instead",
+                )
+
+    def bounds(self, number):
+        low = self.start + number * self.size
+        return low, min(low + self.size, self.end)
+
+    def begin(self, stream, fps, start, end, worker, plan):
+        """Write the manifest with the verified inherited prefix, restore the accounting at its
+        end and return the first frame left to render."""
+        self.stream, self.fps, self.start, self.end = stream, fps, start, end
+        self.worker, self.plan = worker, plan
+        self.size = self.inherited["chunk_frames"] if self.inherited else CHUNK_FRAMES
+        controls = self.record["settings"]["controls"] if self.record else {}
+        self.manifest = {
+            "format": CHECKPOINT_FORMAT,
+            "version": CHECKPOINT_VERSION,
+            "job_id": self.job_id,
+            "created_at": time.time(),
+            "resumed_from": (self.request.get("resume") or {}).get("from_job_id"),
+            "intent_sha256": intent_digest(self.request),
+            "range": {
+                "start_frame": start,
+                "end_frame": end,
+                "frames": end - start,
+                "fps": str(fps),
+            },
+            "chunk_frames": self.size,
+            "chunking": CHUNKING,
+            "temporal": bool(temporal(controls or self.request.get("controls") or {})),
+            "runtime": ffmpeg_version(),
+            "codec": None,
+            "provenance": self.record,
+            "chunks": [],
+        }
+        state = None
+        if self.inherited:
+            if self.inherited["range"] != self.manifest["range"]:
+                raise Refusal(
+                    "checkpoint_incompatible",
+                    f"The checkpointed range {self.inherited['range']} differs from this "
+                    f"render's {self.manifest['range']}; submit a fresh render instead",
+                )
+            for number, entry in enumerate(self.inherited["chunks"]):
+                found = self.trusted(number, entry)
+                if found is None:
+                    break  # Later chunks' accounting builds on this one, so they are redone too.
+                state, self.reused = found, self.reused + [entry]
+            if self.reused:
+                self.manifest["codec"] = self.inherited["codec"]
+        self.manifest["chunks"] = list(self.reused)
+        kept = {entry[key] for entry in self.reused for key in ("file", "state")}
+        for path in self.chunks.iterdir():
+            if path.name not in kept:
+                path.unlink()  # Partial writes and unlisted or untrusted chunks.
+        atomic_json(self.root / "manifest.json", self.manifest)
+        if state is None:
+            return start
+        worker.swap_count = state["swap_count"]
+        worker.telemetry.restore(state["telemetry"])
+        if plan:
+            if len(state["runs"]) != len(plan.stats):
+                raise ValueError("The checkpointed segment counts do not match the plan")
+            plan.stats = [dict(stats) for stats in state["runs"]]
+        return state["end_frame"]
+
+    def trusted(self, number, entry):
+        """The accounting a listed chunk ends with, if its files have the recorded bytes."""
+        low, high = self.bounds(number)
+        name = f"{number:05d}"
+        expected = {
+            "index": number,
+            "start_frame": low,
+            "end_frame": high,
+            "frames": high - low,
+            "file": f"{name}.mp4",
+            "state": f"{name}.json",
+        }
+        if not isinstance(entry, dict) or low >= self.end:
+            return None
+        if any(entry.get(key) != value for key, value in expected.items()):
+            return None
+        video, record = self.chunks / expected["file"], self.chunks / expected["state"]
+        try:
+            if video.is_symlink() or record.is_symlink() or video.stat().st_size != entry["bytes"]:
+                return None
+            if file_sha256(video) != entry["sha256"]:
+                return None
+            if file_sha256(record) != entry["state_sha256"]:
+                return None
+            state = read_json(record)
+        except (OSError, ValueError, KeyError):
+            return None
+        return state if isinstance(state, dict) and state.get("end_frame") == high else None
+
+    def write(self, index, frame):
+        number = (index - self.start) // self.size
+        if self.encoder is None:
+            self.partial = self.chunks / f"{number:05d}.partial.mp4"
+            command = encode_command(self.stream, self.fps, self.partial)
+            self.encoder = subprocess.Popen(command, stdin=subprocess.PIPE)
+        self.encoder.stdin.write(frame.tobytes())
+        if index + 1 == self.bounds(number)[1]:
+            self.publish(number)
+
+    def publish(self, number):
+        """Validate a finished chunk, then publish it, its accounting and its manifest entry, each
+        atomically and in that order. A crash between steps leaves a chunk the manifest does not
+        list, which a resumed attempt deletes and renders again."""
+        low, high = self.bounds(number)
+        encoder, self.encoder = self.encoder, None
+        encoder.stdin.close()
+        if encoder.wait(timeout=120) != 0:
+            raise RuntimeError(f"FFmpeg encoding of chunk {number} failed")
+        codec = self.validate(number, high - low)
+        known = self.manifest["codec"]
+        if known is None:
+            self.manifest["codec"] = codec
+        elif codec != known:
+            keys = ", ".join(key for key in CODEC_KEYS if codec.get(key) != known.get(key))
+            raise RuntimeError(
+                f"Chunk {number} differs from the earlier chunks in {keys}, so they cannot be "
+                "joined without re-encoding; submit a fresh render"
+            )
+        with self.partial.open("rb") as stream:
+            os.fsync(stream.fileno())  # The bytes are durable before the chunk is named.
+        digest, size = file_sha256(self.partial), self.partial.stat().st_size
+        name = f"{number:05d}"
+        video, record = self.chunks / f"{name}.mp4", self.chunks / f"{name}.json"
+        os.replace(self.partial, video)
+        state = {
+            "chunk": number,
+            "end_frame": high,
+            "swap_count": self.worker.swap_count,
+            "telemetry": self.worker.telemetry.state(),
+            "runs": self.plan.stats if self.plan else None,
+        }
+        atomic_json(record, state)
+        self.manifest["chunks"].append(
+            {
+                "index": number,
+                "start_frame": low,
+                "end_frame": high,
+                "frames": high - low,
+                "file": video.name,
+                "sha256": digest,
+                "bytes": size,
+                "state": record.name,
+                "state_sha256": file_sha256(record),
+                "job_id": self.job_id,
+                "published_at": time.time(),
+            }
+        )
+        atomic_json(self.root / "manifest.json", self.manifest)
+
+    def validate(self, number, frames):
+        """A chunk's codec parameters, after checking its frame count, constant-rate timestamps
+        from zero, dimensions and pixel aspect."""
+        command = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_streams"]
+        command += ["-show_data_hash", "SHA256", "-of", "json"]
+        command += ffmpeg_input(self.partial, ffprobe=True)
+        video = json.loads(subprocess.check_output(command, timeout=60))["streams"][0]
+        try:
+            counted = validate_timing(self.partial, self.fps, video)
+        except ValueError as error:
+            raise RuntimeError(f"Chunk {number} failed timestamp validation: {error}") from None
+        if int(video.get("nb_frames") or 0) != frames or counted != frames:
+            raise RuntimeError(f"Chunk {number} has {counted} frames, expected {frames}")
+        size = (int(video["width"]), int(video["height"]))
+        if size != (int(self.stream["width"]), int(self.stream["height"])) or sample_aspect(
+            video
+        ) != sample_aspect(self.stream):
+            raise RuntimeError(f"Chunk {number} has other dimensions or pixel aspect")
+        return {key: video.get(key) for key in CODEC_KEYS}
+
+    def finish(self):
+        """Input arguments joining every chunk by stream copy. Each chunk's listed duration is
+        rounded so the running total stays exact to the microsecond; FFmpeg's own sum of
+        rounded chunk durations drifts by a tick every few dozen chunks at NTSC rates."""
+        chunks = self.manifest["chunks"]
+        count = -(-(self.end - self.start) // self.size)
+        if [entry["index"] for entry in chunks] != list(range(count)):
+            raise RuntimeError("The checkpoint does not cover the rendered range")
+        lines, edge = ["ffconcat version 1.0"], 0
+        for entry in chunks:
+            following = round(Fraction(entry["end_frame"] - self.start) / self.fps * 10**6)
+            span, edge = following - edge, following
+            lines += [
+                f"file 'chunks/{entry['file']}'",
+                f"duration {span // 10**6}.{span % 10**6:06d}",
+            ]
+        listing = self.root / "concat.txt"
+        listing.write_text("\n".join(lines) + "\n")
+        return concat_input(listing)
+
+    def close(self):
+        stop_encoder(self.encoder)
+
+    def cleanup(self):
+        """Chunks stay until the supervisor publishes completion, then it removes them."""
+
+    def summary(self):
+        return {
+            "chunks": len(self.manifest["chunks"]),
+            "chunk_frames": self.size,
+            "reused_chunks": len(self.reused),
+            "reused_frames": sum(entry["frames"] for entry in self.reused),
+            "resumed_from": self.manifest["resumed_from"],
+        }
+
+
+def render_video(window, request, directory, worker, checkpoint=None):
     artifacts = directory / "artifacts"
-    shown = False
-
-    def first(offset, frame, swapped):
-        nonlocal shown
-        if not shown:  # The first frame processed, which follows any leading passthrough.
-            save_image(artifacts / "before.jpg", frame)
-            save_image(artifacts / "preview.jpg", swapped)
-            shown = True
-
-    clip = encode_range(request, directory, worker, "result.mp4", first)
+    checkpoint = checkpoint or Checkpoint(directory, request)
+    clip = encode_range(request, directory, worker, "result.mp4", checkpoint=checkpoint)
     report, fps, start = clip.report, clip.fps, clip.start
+    # The first processed frame, after any leading passthrough, from the source and the
+    # published output, so an interrupted and resumed render shows the same pair.
+    runs = clip.plan.runs if clip.plan else []
+    shown = next((run["start_frame"] for run in runs if not run["passthrough"]), start)
+    save_image(artifacts / "before.jpg", read_frame(clip.source, clip.stream, shown))
+    save_image(artifacts / "preview.jpg", read_frame(clip.output, clip.video, shown - start))
     # Review pairs come from the source and the published output, decoded at the same frame.
     limit = report["options"]["review_images"]
     for number, (mapping, frame, reason) in enumerate(review_frames(report, limit), 1):
@@ -1892,6 +2233,7 @@ def render_video(window, request, directory, worker):
         "swapped_faces": worker.swap_count,
         "audio": clip.audio,
         "swap_report": report_summary(report),
+        "checkpoint": checkpoint.summary(),
         "artifacts": ["result.mp4", "preview.jpg", "before.jpg", "swap-report.json", *names],
     }
     if clip.plan:
@@ -1899,41 +2241,39 @@ def render_video(window, request, directory, worker):
     return result
 
 
-def encode_range(request, directory, worker, name, observe, progress=None):
+def encode_range(request, directory, worker, name, observe=None, progress=None, checkpoint=None):
     """Process a render request's range into the validated video artifact `name`.
 
     `observe(offset, source frame, swapped frame)` sees each processed frame before it is
     encoded; passthrough frames of a segmented render are encoded as decoded, unobserved.
-    `progress` adds fields to each progress record (stage "rendering" by default). Returns the
-    clip's source, streams, rate, range, audio, segment plan (None for a uniform render) and swap
-    report (review images not yet added).
+    `progress` adds fields to each progress record (stage "rendering" by default). With a
+    `checkpoint` the frames are encoded in chunks, starting after any it reuses; otherwise in
+    one piece. Returns the clip's source, streams, rate, range, audio, segment plan (None for a
+    uniform render) and swap report (review images not yet added).
     """
     source = input_path(request["media_path"])
     metadata, stream, fps, start, expected = clip_range(source, request)
+    end = start + expected
     options = request.get("report") or {}
     telemetry = worker.telemetry
-    telemetry.expect(expected_ranges(options, start + expected))
+    telemetry.expect(expected_ranges(options, end))
     segments, plan = request.get("segments"), None
     artifacts = directory / "artifacts"
     if segments:
         # The whole plan is resolved, and refused if a segment misses the frames, before work.
-        runs = segment_plan(segments, start, start + expected, len(request["mappings"]))
+        runs = segment_plan(segments, start, end, len(request["mappings"]))
         plan = Segments(worker, runs)
-        atomic_json(artifacts / "plan.json", plan.document(segments, start, start + expected))
-    video_only = directory / f"{Path(name).stem}.video-only.mp4"
-    encoder = None
-    frames = decode(source, stream, start, expected)
-    processed = 0
+        atomic_json(artifacts / "plan.json", plan.document(segments, start, end))
+    sink = checkpoint or Encoder(directory / f"{Path(name).stem}.video-only.mp4")
     width, height = int(stream["width"]), int(stream["height"])
+    frames = (frame for frame in ())
     try:
-        encoder = subprocess.Popen(
-            encode_command(stream, fps, video_only),
-            stdin=subprocess.PIPE,
-        )
+        first = sink.begin(stream, fps, start, end, worker, plan)
+        if first < end:
+            frames = decode(source, stream, first, end - first)
         started = time.monotonic()
-        for offset in range(expected):
+        for index in range(first, end):
             frame = next(frames, None)
-            index = start + offset
             if frame is None:
                 raise RuntimeError(f"Input decoding stopped at {index}, expected {expected} frames")
             number = plan.at(index) if plan else None
@@ -1947,44 +2287,37 @@ def encode_range(request, directory, worker, name, observe, progress=None):
                 swapped = process(worker, frame, index)
                 if swapped.shape[:2] != (height, width):
                     raise RuntimeError("Fusion changed the frame dimensions")
-                observe(offset, frame, swapped)
+                if observe:
+                    observe(index - start, frame, swapped)
             if plan:
                 plan.count(number, worker.swap_count - swaps)
-            encoder.stdin.write(swapped.tobytes())
-            processed += 1
-            rate = processed / max(time.monotonic() - started, 1e-6)
+            rate = (index + 1 - first) / max(time.monotonic() - started, 1e-6)
             atomic_json(
                 directory / "progress.json",
                 {
                     "stage": "rendering",
                     **(progress or {}),
-                    "frames": processed,
+                    "frames": index + 1 - start,
                     "total_frames": expected,
                     "swapped_faces": worker.swap_count,
                     "frames_per_second": round(rate, 2),
-                    "eta_seconds": round((expected - processed) / rate, 1),
+                    "eta_seconds": round((end - index - 1) / rate, 1),
                     **({"segment": plan.runs[number]["segment"]} if plan else {}),
+                    **({"reused_frames": first - start} if checkpoint else {}),
                 },
             )
-        encoder.stdin.close()
-        if encoder.wait(timeout=120) != 0:
-            raise RuntimeError("FFmpeg video encoding failed")
+            sink.write(index, swapped)
+        joined = sink.finish()
     finally:
         frames.close()
-        if encoder is not None and encoder.poll() is None:
-            encoder.kill()
-            encoder.wait()
-        if encoder is not None:
-            # A comparison's worker goes on to other variants, so the pipe must not leak.
-            with contextlib.suppress(OSError):
-                encoder.stdin.close()
+        sink.close()  # A comparison's worker goes on to other variants, so nothing may leak.
     if worker.swap_count == 0:
         # Passthrough frames request no swap; the frames that do must swap a face somewhere.
         raise RuntimeError(
             "No faces matched the target references in the requested range"
             + (" outside passthrough segments" if plan else "")
         )
-    telemetry.finish(start + processed)
+    telemetry.finish(end)
     report = swap_report(request, telemetry, fps, start)
     if plan:
         report["plan"] = {"artifact": "plan.json", "runs": plan.summary()}
@@ -1996,20 +2329,27 @@ def encode_range(request, directory, worker, name, observe, progress=None):
             + "; ".join(shortfalls)
         )
     output = artifacts / name
-    duration = float(Fraction(processed, 1) / fps)
+    duration = float(Fraction(expected, 1) / fps)
     offset = float(Fraction(start, 1) / fps)
     audio = audio_overlaps(source, metadata, offset, duration)
-    mux(video_only, output, (source, offset, duration) if audio else None)
+    mux(joined, output, (source, offset, duration) if audio else None)
     verified = probe(output)
     video = next(s for s in verified["streams"] if s["codec_type"] == "video")
-    if int(video["nb_frames"]) != processed or abs(float(video["duration"]) - duration) > 1 / float(
+    if int(video["nb_frames"]) != expected or abs(float(video["duration"]) - duration) > 1 / float(
         fps
     ):
         raise RuntimeError("Encoded frame count or duration validation failed")
+    try:
+        # Every frame at its exact time from zero: no gap or duplicate where pieces join.
+        counted = validate_timing(output, fps, video)
+    except ValueError as error:
+        raise RuntimeError(f"Encoded timestamps failed validation: {error}") from None
+    if counted != expected:
+        raise RuntimeError(f"Encoded output has {counted} timestamps, expected {expected}")
     if sample_aspect(video) != sample_aspect(stream):
         raise RuntimeError("Encoded pixel aspect ratio differs from the source")
     emitted = output_audio(verified, audio, duration, "Audio missing from output")
-    video_only.unlink()
+    sink.cleanup()
     return SimpleNamespace(
         source=source,
         stream=stream,
@@ -2017,7 +2357,7 @@ def encode_range(request, directory, worker, name, observe, progress=None):
         video=video,
         fps=fps,
         start=start,
-        frames=processed,
+        frames=expected,
         duration=duration,
         audio="AAC" if emitted else "none",
         plan=plan,
@@ -2423,7 +2763,7 @@ def normalize_video(request, directory):
     start, end = float(stream.get("start_time") or 0), float(int(encoded["nb_frames"]) / rate)
     audio = audio_overlaps(source, metadata, start, end)
     strip = ["-map_metadata", "-1", "-map_chapters", "-1"]
-    mux(video_only, temporary, (source, start, end) if audio else None, strip)
+    mux(ffmpeg_input(video_only), temporary, (source, start, end) if audio else None, strip)
     video_only.unlink()
     verified = probe(temporary)
     video = video_stream(verified)
@@ -2497,15 +2837,23 @@ def run(directory):
         # FFmpeg only: Fusion and the GPU are never loaded.
         atomic_json(directory / "result.json", normalize_video(request, directory))
         return
-    expected = request.get("media_sha256")
-    if expected is not None:
-        # Recipe jobs name the media bytes they reproduce; hashed once, before Fusion loads.
+    expected, checkpoint, digest = request.get("media_sha256"), None, None
+    if request["kind"] == "render":
+        # A render records its provenance with its chunks before Fusion loads, and a resumed
+        # attempt must match the earlier attempt's (DESIGN.md, Checkpoints).
+        atomic_json(directory / "progress.json", {"stage": "fingerprinting"})
+        record = provenance(request)
+        digest = record["inputs"]["media_path"]["sha256"]
+        checkpoint = Checkpoint(directory, request, record)
+    elif expected is not None:
         atomic_json(directory / "progress.json", {"stage": "verifying_media"})
-        if file_sha256(input_path(request["media_path"])) != expected:
-            raise ValueError(
-                f"Media {request['media_path']} changed after submission (expected SHA-256 "
-                f"{expected}); verify the recipe again and resubmit"
-            )
+        digest = file_sha256(input_path(request["media_path"]))
+    if expected is not None and digest != expected:
+        # Recipe jobs name the media bytes they reproduce; hashed once, before Fusion loads.
+        raise ValueError(
+            f"Media {request['media_path']} changed after submission (expected SHA-256 "
+            f"{expected}); verify the recipe again and resubmit"
+        )
     atomic_json(directory / "progress.json", {"stage": "loading_models"})
     window = initialize(request.get("controls", {}))
     artifacts = directory / "artifacts"
@@ -2542,7 +2890,7 @@ def run(directory):
                 "artifacts": ["result.png", "before.jpg", "preview.jpg", "swap-report.json"],
             }
         else:
-            result = render_video(window, request, directory, worker)
+            result = render_video(window, request, directory, worker, checkpoint)
         result["references"] = used
         result["models"] = loaded_models(window)
         if request.get("recipe"):

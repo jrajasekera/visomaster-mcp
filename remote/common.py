@@ -740,6 +740,13 @@ def validate_fusion_request(request):
         raise ValueError("media_sha256 must be a 64-hex-digit SHA-256")
     if not isinstance(request.get("recipe", {}), dict):
         raise ValueError("recipe must be an object")
+    resume = request.get("resume")
+    if resume is not None and (
+        request["kind"] != "render"
+        or not isinstance(resume, dict)
+        or not isinstance(resume.get("from_job_id"), str)
+    ):
+        raise ValueError("resume links a render to the attempt it resumes; use resume_render")
     control, parameters = layouts()
     if threshold is not None:
         # Identities are grouped on SimilarityThresholdSlider's scale, within its limits.
@@ -1383,4 +1390,98 @@ def provenance_changes(recorded, current):
             else:
                 state = f"has different bytes ({short(was['sha256'])} now {short(now['sha256'])})"
             add("model", name, was.get("sha256"), now.get("sha256"), f"Model {name} {state}")
+    return found
+
+
+# Render checkpoints (DESIGN.md, Checkpoints): validated chunks committed by a versioned
+# manifest, which records the provenance a resumed attempt must match before it reuses them.
+CHECKPOINT_FORMAT, CHECKPOINT_VERSION = "visomaster-checkpoint", 1
+CHECKPOINT_KEYS = {
+    "format",
+    "version",
+    "job_id",
+    "created_at",
+    "resumed_from",
+    "intent_sha256",
+    "range",
+    "chunk_frames",
+    "chunking",
+    "temporal",
+    "runtime",
+    "codec",
+    "provenance",
+    "chunks",
+}
+# Fusion carries tracking and landmark-smoothing state from frame to frame, which a checkpoint
+# does not hold, so renders with either toggle are not resumable.
+TEMPORAL = ("FaceTrackingEnableToggle", "KPSSmoothingEnableToggle")
+
+
+def intent_digest(request):
+    """SHA-256 of what a render's frames depend on in its resolved request: everything except
+    the link to a resumed attempt and the scheduling class."""
+    intent = {key: value for key, value in request.items() if key not in ("resume", "priority")}
+    return hashlib.sha256(canonical(intent).encode()).hexdigest()
+
+
+def temporal(controls):
+    """The temporal toggles a set of effective controls enables."""
+    return [key for key in TEMPORAL if controls.get(key) is True]
+
+
+def ffmpeg_version():
+    """FFmpeg's version line: chunks encoded by another build may not join without re-encoding."""
+    output = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=30)
+    return output.stdout.partition("\n")[0].strip()
+
+
+def concat_input(path):
+    """Arguments that open a checkpoint's concat list as one confined FFmpeg input. The list
+    names chunk files by safe relative paths, and the concat demuxer passes its whitelists on,
+    so each chunk also opens with the file protocol only and as MP4."""
+    options = ["-f", "concat", "-safe", "1", "-protocol_whitelist", "file"]
+    return [*options, "-format_whitelist", "concat,mov", "-i", str(path)]
+
+
+def read_checkpoint(path):
+    """A checkpoint manifest, refused with a reason when it is missing, damaged or newer."""
+    try:
+        document = read_json(path)
+    except FileNotFoundError:
+        raise ValueError("it has no checkpoint manifest") from None
+    except (OSError, ValueError):
+        raise ValueError("its checkpoint manifest is not readable JSON") from None
+    if not isinstance(document, dict) or document.get("format") != CHECKPOINT_FORMAT:
+        raise ValueError("its checkpoint manifest has an unknown format")
+    if document.get("version") != CHECKPOINT_VERSION:
+        raise ValueError(
+            f"its checkpoint manifest has version {document.get('version')!r}; this release "
+            f"reads version {CHECKPOINT_VERSION} only"
+        )
+    if set(document) != CHECKPOINT_KEYS or not isinstance(document["chunks"], list):
+        raise ValueError("its checkpoint manifest has unexpected or missing fields")
+    return document
+
+
+def resume_problems(manifest, request, record):
+    """Why `manifest`'s chunks cannot be reused for `request` now, given its current provenance
+    `record`; empty when they can."""
+    found = []
+    if manifest["intent_sha256"] != intent_digest(request):
+        found.append(
+            "The request differs from the checkpointed render's, or its inputs now resolve to "
+            "other files"
+        )
+    if record is None or manifest["provenance"] is None:
+        return found + ["No provenance was recorded, so compatibility cannot be checked"]
+    enabled = temporal(record["settings"]["controls"])
+    if enabled:
+        found.append(
+            f"{' and '.join(enabled)} carry tracking state from frame to frame, which "
+            "checkpoints do not hold; resuming would restart it at the boundary"
+        )
+    now = ffmpeg_version()
+    if manifest["runtime"] != now:
+        found.append(f"FFmpeg changed ({manifest['runtime']!r} now {now!r})")
+    found += [change["message"] for change in provenance_changes(manifest["provenance"], record)]
     return found

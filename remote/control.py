@@ -55,6 +55,7 @@ from common import (  # noqa: E402
     fusion_compatibility,
     initial_controls,
     input_path,
+    intent_digest,
     job_path,
     job_priority,
     layouts,
@@ -64,10 +65,12 @@ from common import (  # noqa: E402
     probe,
     provenance,
     provenance_changes,
+    read_checkpoint,
     read_json,
     recorded_inputs,
     reference_path,
     required_models,
+    resume_problems,
     setting_variants,
     validate_request,
     validate_settings,
@@ -208,7 +211,11 @@ def list_jobs(only_status=None, only_kind=None, limit=50):
                 "error": state.get("error"),
                 "progress": state.get("progress"),
                 # GPU jobs only, and queue standing only while queued.
-                **{key: state[key] for key in ("priority", "sequence", "queue") if key in state},
+                **{
+                    key: state[key]
+                    for key in ("priority", "sequence", "queue", "resume_from")
+                    if key in state
+                },
             }
         )
         if len(jobs) == limit:
@@ -464,6 +471,8 @@ def submit(request):
             atomic_json(staging / "request.json", request)
             # The worker opens and retention protects these files, whatever aliases point to later.
             atomic_json(staging / "resolved.json", fingerprint(resolve_inputs(request)))
+            if request.get("resume") is not None:
+                inherit(request, staging)
             state = {
                 "job_id": job_id,
                 "status": "queued",
@@ -472,6 +481,8 @@ def submit(request):
                 "config_sha256": SETTINGS.sha256,
                 "release": str(RELEASE),  # Deployment cleanup keeps it while the job is active.
             }
+            if request.get("resume") is not None:
+                state["resume_from"] = request["resume"]["from_job_id"]
             # A GPU job takes its queue sequence and appears in the queue in one step with its
             # publication, so a retry finds the sequence and no scheduler sees a missing job.
             with scheduler(LOCK_DIR, GPU) if priority else contextlib.nullcontext() as queue:
@@ -504,6 +515,106 @@ def submit(request):
                 atomic_json(directory / "state.json", state)
                 raise
     return status(job_id)
+
+
+# Resumed renders (DESIGN.md, Checkpoints).
+RESUME_KEYS = {"job_id", "from_job_id", "priority"}
+CHUNK_NAME = re.compile(r"[0-9]{5}\.(mp4|json)")
+
+
+def resumable(origin):
+    """The resolved request and checkpoint manifest of render `origin`, which must have failed
+    or been cancelled; a refusal says why it cannot be resumed."""
+    source = job_path(origin)
+    try:
+        status = current(source)["status"]
+        recorded = read_json(source / "resolved.json")
+    except (OSError, ValueError, KeyError, TypeError):
+        raise ValueError(
+            f"Job {origin} does not exist or has no readable state and request"
+        ) from None
+    if recorded.get("kind") != "render":
+        raise ValueError(f"Job {origin} is a {recorded.get('kind')} job; only renders resume")
+    if status == "completed":
+        raise ValueError(f"Job {origin} completed; its result is final and nothing is left to do")
+    if status not in TERMINAL:
+        raise ValueError(f"Job {origin} is {status}; wait for it to end, or cancel it, first")
+    try:
+        manifest = read_checkpoint(source / "checkpoint" / "manifest.json")
+    except ValueError as error:
+        raise ValueError(
+            f"Job {origin} cannot be resumed: {error} (it ended before its first chunk, or ran "
+            "before checkpoints existed); submit a fresh render"
+        ) from None
+    return recorded, manifest
+
+
+def inherit(request, staging):
+    """Give a resumed render its own links to the chunks of the attempt it continues.
+
+    The caller holds the submit lock, so that attempt is not deleted or replaced meanwhile.
+    Chunk files are never rewritten, so a hard link shares them safely, and afterwards the
+    links keep them whatever retention does to that attempt. The worker verifies them.
+    """
+    origin = request["resume"]["from_job_id"]
+    recorded, manifest = resumable(origin)
+    if intent_digest(recorded) != intent_digest(request):
+        raise ValueError(
+            f"The request differs from job {origin}'s; a resume repeats the attempt's own "
+            "request (resume_render builds it)"
+        )
+    source, target = job_path(origin) / "checkpoint" / "chunks", staging / "checkpoint" / "chunks"
+    target.mkdir(parents=True)
+    for entry in manifest["chunks"]:
+        for key in ("file", "state"):
+            name = entry.get(key) if isinstance(entry, dict) else None
+            path = source / name if isinstance(name, str) and CHUNK_NAME.fullmatch(name) else None
+            if path is None or path.is_symlink() or not path.is_file():
+                continue  # The worker finds it missing and renders those frames again.
+            try:
+                os.link(path, target / name)
+            except OSError:
+                shutil.copyfile(path, target / name)  # A filesystem without hard links.
+    atomic_json(staging / "checkpoint" / "inherited.json", manifest)
+
+
+def resume_render(request):
+    """Submit a new render that reuses the verified chunks of a failed or cancelled render."""
+    extra = sorted(set(request) - RESUME_KEYS)
+    if extra:
+        raise ValueError(f"resume_render does not accept {', '.join(extra)}")
+    job_id, origin = request.get("job_id"), request.get("from_job_id")
+    directory = job_path(job_id)
+    job_path(origin)
+    if job_id == origin:
+        raise ValueError("A resume is a new job; give it a job_id of its own")
+    invocation = {"from_job_id": origin, "priority": request.get("priority")}
+    # A retry returns the job before the earlier attempt is consulted, so it still answers once
+    # that attempt is deleted.
+    if (directory / "request.json").exists():
+        try:
+            previous = read_json(directory / "request.json")["resume"]["invocation"]
+        except (OSError, ValueError, KeyError, TypeError):
+            previous = None
+        if previous is None or canonical(previous) != canonical(invocation):
+            raise ValueError("job_id already exists with a different request")
+        return status(job_id)
+    recorded, manifest = resumable(origin)
+    new = {key: value for key, value in recorded.items() if key not in ("resume", "priority")}
+    if (request.get("priority") or recorded.get("priority")) is not None:
+        new["priority"] = request.get("priority") or recorded["priority"]
+    attempt = (recorded.get("resume") or {}).get("attempt", 1) + 1
+    new["resume"] = {"from_job_id": origin, "attempt": attempt, "invocation": invocation}
+    # Inputs, settings, models, Fusion, adapter code and configuration are hashed and compared
+    # here for an early answer; the worker compares them again before it reuses anything.
+    problems = resume_problems(manifest, new, provenance(new))
+    if problems:
+        raise ValueError(
+            f"The chunks of job {origin} cannot be reused:\n- "
+            + "\n- ".join(problems)
+            + "\nSubmit a fresh render with submit_swap instead"
+        )
+    return submit({"job_id": job_id, **new})
 
 
 def verify_config(identity, directory):
@@ -789,6 +900,10 @@ def supervise(job_directory, identity):
                     leave(settings, directory)  # Others would drop the ended entry anyway.
             state["finished_at"] = time.time()
             atomic_json(directory / "state.json", state)
+            if state["status"] == "completed":
+                # The output is final, so a render's chunks are no longer needed. Should this
+                # fail, they go with the job when it is deleted or pruned.
+                shutil.rmtree(directory / "checkpoint", ignore_errors=True)
 
 
 def cancel(job_id):
@@ -1287,7 +1402,7 @@ def media_check(request, source):
             metadata, stream, fps, start, frames = engine.clip_range(source, request)
             width, height = int(stream["width"]), int(stream["height"])
             # Bytes per output frame from the source's bit rate or the resolution, whichever is
-            # more; the video-only intermediate and the muxed result coexist briefly.
+            # more; the checkpoint's chunks and the joined result coexist until completion.
             count = int(stream.get("nb_frames") or 0)
             count = count or round(float(stream.get("duration") or 0) * fps)
             per_frame = max(width * height // 20, source.stat().st_size // count if count else 0)
@@ -1773,6 +1888,8 @@ def dispatch(action, request):
         )
     if action == "cancel":
         return cancel(request["job_id"])
+    if action == "resume":
+        return resume_render(request)
     if action == "list":
         return list_jobs(request.get("status"), request.get("kind"), request.get("limit", 50))
     if action == "artifact":

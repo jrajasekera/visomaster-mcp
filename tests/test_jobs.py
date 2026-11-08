@@ -288,10 +288,12 @@ def test_render_progress_reports_throughput_and_eta(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "save_image", lambda *a: None)
     monkeypatch.setattr(engine, "atomic_json", lambda path, value: progress.append(value))
     monkeypatch.setattr(engine.subprocess, "Popen", lambda *a, **kw: encoder)
+    monkeypatch.setattr(engine, "ffmpeg_version", lambda: "ffmpeg version test")
     request = {"media_path": "video.mp4", "start_frame": 7}
-    with pytest.raises(RuntimeError, match="encoding failed"):
+    with pytest.raises(RuntimeError, match="encoding of chunk 0 failed"):
         worker = SimpleNamespace(swap_count=1, telemetry=engine.Telemetry({}))
         engine.render_video(None, request, tmp_path, worker)
+    progress = [p for p in progress if "stage" in p]  # Not the checkpoint manifest.
     assert [p["frames"] for p in progress] == [1, 2, 3]
     assert progress[-1]["eta_seconds"] == 0
     assert all(p["frames_per_second"] > 0 for p in progress)

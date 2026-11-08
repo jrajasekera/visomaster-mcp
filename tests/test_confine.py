@@ -126,6 +126,7 @@ def render(media, source, directory, monkeypatch):
     monkeypatch.setattr(engine, "save_image", lambda *a: None)
     # Only the encoder is faked; the audio mux runs the real FFmpeg.
     run = SimpleNamespace(Popen=Encoder, PIPE=subprocess.PIPE, run=subprocess.run)
+    run.check_output = subprocess.check_output  # The chunk's codec parameters.
     monkeypatch.setattr(engine, "subprocess", run)
     (directory / "artifacts").mkdir()
     request = {"media_path": str(source), "kind": "render"}

@@ -14,7 +14,7 @@ def test_stdio_discovery():
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = {tool.name: tool for tool in (await session.list_tools()).tools}
-                assert len(tools) == 23
+                assert len(tools) == 24
                 assert tools["health_check"].annotations.readOnlyHint
                 normalize = tools["normalize_media"]
                 assert not normalize.annotations.readOnlyHint
@@ -86,6 +86,15 @@ def test_stdio_discovery():
                 assert variant["properties"].keys() == {"name", "parameters", "controls"}
                 assert variant["additionalProperties"] is False
                 assert compare.outputSchema["type"] == "object"
+                resume = tools["resume_render"]
+                assert not resume.annotations.readOnlyHint
+                assert not resume.annotations.destructiveHint
+                assert resume.inputSchema["required"] == ["from_job_id"]
+                assert resume.inputSchema["properties"].keys() == {
+                    "from_job_id",
+                    "job_id",
+                    "priority",
+                }
                 result = await session.call_tool(
                     "submit_swap", {"media_path": "x", "mappings": [{}]}
                 )
