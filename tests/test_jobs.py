@@ -290,7 +290,8 @@ def test_render_progress_reports_throughput_and_eta(tmp_path, monkeypatch):
     monkeypatch.setattr(engine.subprocess, "Popen", lambda *a, **kw: encoder)
     request = {"media_path": "video.mp4", "start_frame": 7}
     with pytest.raises(RuntimeError, match="encoding failed"):
-        engine.render_video(None, request, tmp_path, SimpleNamespace(swap_count=1))
+        worker = SimpleNamespace(swap_count=1, telemetry=engine.Telemetry({}))
+        engine.render_video(None, request, tmp_path, worker)
     assert [p["frames"] for p in progress] == [1, 2, 3]
     assert progress[-1]["eta_seconds"] == 0
     assert all(p["frames_per_second"] > 0 for p in progress)
@@ -337,7 +338,12 @@ def test_render_worker_consumes_fusion_sequential_detections(monkeypatch):
         module = ModuleType(name)
         module.__dict__.update(attributes)
         monkeypatch.setitem(sys.modules, name, module)
-    window = SimpleNamespace(control={"Detector": 1}, parameters={"0": {}})
+    window = SimpleNamespace(
+        control={"Detector": 1},
+        parameters={"0": {}},
+        target_faces={},
+        function_worker=SimpleNamespace(run_detect=None),
+    )
     frame = type("Frame", (), {"__getitem__": lambda self, key: "flipped"})()
 
     single = engine.make_worker(window)

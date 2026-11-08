@@ -88,6 +88,11 @@ def sequential(path, distinct=True):
     return frames
 
 
+def worker():
+    """A pass-through worker that reports one swap; its telemetry sees one mapping."""
+    return SimpleNamespace(swap_count=1, telemetry=engine.Telemetry({"0": 60.0}))
+
+
 def run_job(directory, monkeypatch, request):
     """Run engine.run with Fusion replaced by recorders; returns the frames seen and the result."""
     seen = []
@@ -106,9 +111,7 @@ def run_job(directory, monkeypatch, request):
     detect = lambda window, image, max_faces=None: seen.append(image) or (None, [], [])  # noqa: E731
     monkeypatch.setattr(engine, "detect", detect)
     monkeypatch.setattr(engine, "configure_faces", lambda window, mappings: None)
-    monkeypatch.setattr(
-        engine, "make_worker", lambda window, sequential: SimpleNamespace(swap_count=1)
-    )
+    monkeypatch.setattr(engine, "make_worker", lambda window, sequential: worker())
     monkeypatch.setattr(engine, "process", lambda worker, bgr, index: seen.append(bgr) or bgr)
     monkeypatch.setattr(engine, "save_image", lambda path, image: None)
     (directory / "artifacts").mkdir()
@@ -129,7 +132,8 @@ def render(source, directory, monkeypatch, start, count):
     monkeypatch.setattr(engine, "save_image", lambda path, image: None)
     (directory / "artifacts").mkdir(parents=True)
     request = {"media_path": str(source), "start_frame": start, "max_frames": count}
-    result = engine.render_video(None, request, directory, SimpleNamespace(swap_count=1))
+    request.update(kind="render", mappings=[{"target_face": "face.png", "source_faces": []}])
+    result = engine.render_video(None, request, directory, worker())
     return processed, result
 
 

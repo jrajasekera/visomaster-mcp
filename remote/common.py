@@ -43,6 +43,9 @@ PARAMETERS = {
 # Demuxers that read only the file they are given (mov is MP4/MOV, matroska is MKV/WebM).
 DEMUXERS = "mov,matroska,avi,mpegts,png_pipe,jpeg_pipe,webp_pipe,bmp_pipe"
 MAX_DETECT_FRAMES = 64
+REPORT_KEYS = {"review_images", "expected_visible", "min_coverage"}
+MAX_REVIEW_IMAGES = 24
+MAX_EXPECTED_RANGES = 100
 NORMALIZE_KEYS = {"kind", "media_path", "fps"}
 ANALYZE_KEYS = {"kind", "references", "reference_sha256", "swap_model", "thresholds", "controls"}
 # Reference analysis thresholds: (type, minimum, maximum). The engine documents their defaults.
@@ -593,6 +596,10 @@ def validate_fusion_request(request):
             reference_path(source, digest)
         validate_weights(mapping.get("source_weights"), len(sources))
         validate_settings(mapping.get("parameters", {}), parameters, PARAMETERS)
+    if "report" in request:
+        if request["kind"] != "render":
+            raise ValueError("report options apply only to renders")
+        validate_report(request["report"], request, len(mappings))
     return request
 
 
@@ -628,3 +635,41 @@ def validate_analysis(request):
     if request.get("swap_model") is not None:
         validate_settings({"SwapModelSelection": request["swap_model"]}, parameters, PARAMETERS)
     return request
+
+
+def validate_report(options, request, mappings):
+    """Swap report options of a render. Expected-visible ranges are half-open source-frame
+    ranges [start_frame, end_frame) inside the requested range; the worker also checks that
+    they end within the video."""
+    if not isinstance(options, dict):
+        raise ValueError("report must be an object")
+    unknown = sorted(set(options) - REPORT_KEYS)
+    if unknown:
+        raise ValueError(f"Unknown report options {', '.join(unknown)}")
+    images = options.get("review_images", 0)
+    if type(images) is not int or not 0 <= images <= MAX_REVIEW_IMAGES:
+        raise ValueError(f"review_images must be an integer from 0 to {MAX_REVIEW_IMAGES}")
+    minimum = options.get("min_coverage")
+    if minimum is not None and (
+        type(minimum) not in (int, float) or not math.isfinite(minimum) or not 0 < minimum <= 1
+    ):
+        raise ValueError("min_coverage must be a number greater than 0 and at most 1")
+    ranges = options.get("expected_visible", [])
+    if not isinstance(ranges, list) or len(ranges) > MAX_EXPECTED_RANGES:
+        raise ValueError(f"expected_visible must list at most {MAX_EXPECTED_RANGES} ranges")
+    first = request.get("start_frame", 0)
+    count = request.get("max_frames")
+    for item in ranges:
+        if not isinstance(item, dict) or set(item) != {"mapping", "start_frame", "end_frame"}:
+            raise ValueError("Each expected_visible range needs mapping, start_frame and end_frame")
+        if any(type(value) is not int for value in item.values()):
+            raise ValueError("expected_visible mapping and frames must be integers")
+        if not 0 <= item["mapping"] < mappings:
+            raise ValueError(f"expected_visible mapping {item['mapping']} does not exist")
+        if not first <= item["start_frame"] < item["end_frame"] or (
+            count is not None and item["end_frame"] > first + count
+        ):
+            raise ValueError(
+                "expected_visible ranges must satisfy start_frame < end_frame (exclusive) "
+                "within the requested frames"
+            )

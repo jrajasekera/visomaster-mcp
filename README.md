@@ -167,7 +167,7 @@ The supervisor starts each GPU job as `<runner...> <release>/engine.py <job dire
 | `inspect_media` | FFprobe metadata for a workstation file |
 | `detect_faces` | Queue detection at a selected frame and produce reference crops, or sample up to 64 frames (`sample_frames` or `frames`) and group faces into identities (optional `similarity_threshold`) with one reference crop each; only verified crops get a `reference_path` |
 | `analyze_references` | Queue a GPU check of up to 20 candidate source images: face count, size, sharpness, duplicates and embedding consistency, with a crop per usable image and a labelled `contact.jpg` |
-| `submit_swap` | Queue a frame/image preview or a video render with explicit face mappings, optional per-source weights and expected fingerprints |
+| `submit_swap` | Queue a frame/image preview or a video render with explicit face mappings, optional per-source weights and expected fingerprints; results include a per-mapping `swap_report` summary and the `swap-report.json` artifact, and renders write labelled review images (optional `report`: `review_images`, `expected_visible`, `min_coverage`) |
 | `normalize_media` | Queue a CPU-only FFmpeg conversion to a render-ready video (CFR, zero start, even dimensions, rotation and flips applied); does not wait for the GPU |
 | `job_status` | State, frame progress and result manifest; `wait_seconds` (≤ 50) long-polls for the next change; log tail on request or failure |
 | `list_jobs` | Recent job summaries shared across clients (kind, media, frame selection or sampling, timing, status, progress), filterable by `status` and `kind`, `limit` up to 200 |
@@ -206,7 +206,7 @@ A `FaceMapping` may add `source_weights`, one finite, nonnegative number per `so
 3. Call `detect_faces` on a representative frame, or with `sample_frames` (for example 16) to find everyone who appears across a video. Call `job_status` with `wait_seconds: 50` until `completed`, then inspect the returned crops with `view_artifact`; `contact.jpg` shows them all in one labelled grid.
 4. Use the selected crop's or identity's `reference_path` as `target_face` (it is null for unverified crops). Supply one or more reference images of the replacement identity as `source_faces`. Each reference image must contain exactly one detected face. With several, run `analyze_references` on them, view its `contact.jpg`, and pass its `sha256` values as `source_sha256`, plus `source_weights` to exclude (0) or down-weight images it flags.
 5. Submit a `preview`, inspect its image, then submit a short `render`. After reviewing that clip, submit the full frame range.
-6. Follow the job with `job_status` and `wait_seconds`, then download `result.mp4` or `result.png` after completion.
+6. Follow the job with `job_status` and `wait_seconds`, then download `result.mp4` or `result.png` after completion. Check the result's `swap_report` for warnings, such as a mapping that never swapped, and view the `review-NN.jpg` images it lists.
 
 Renders reject variable frame rate video, video whose timestamps do not start at zero, odd frame dimensions and rotated or mirrored display metadata. When a render fails for one of these reasons, call `normalize_media` with the same `media_path` (optionally `fps`, such as `25` or `"30000/1001"`), wait for the job, and use its result's `media_path` (the job's `normalized.mp4` artifact) for detection, preview and rendering. Frame indices then refer to the normalized timeline.
 
@@ -236,6 +236,36 @@ Example `submit_swap` arguments:
 For video, use `mode="render"`, `start_frame` and `max_frames`. A null `max_frames` processes through the end. Frame indices start at zero. Give each intended job a stable `job_id` (1–64 letters, digits, underscores or hyphens, starting with a letter or digit) so a retried submission returns the same job, even after its inputs have been moved or pruned. Reusing an ID with changed settings is rejected, and an empty ID is an error; only an omitted or null ID is generated. Submit a new ID to retry a failed or cancelled job.
 
 Each mapping swaps only its single best-matching face per frame, because the adapter turns on Fusion's `SwapOnlyBestMatchEnableToggle` by default. Without it, any face that clears the mapping's `SimilarityThresholdSlider` is swapped, which on two-person footage swapped the other person intermittently. Pass `"controls": {"SwapOnlyBestMatchEnableToggle": false}` only when one identity appears several times in a frame and every instance should change. Best match cannot help in frames where the target is absent and another face clears the threshold; if a preview or short render shows that, raise `SimilarityThresholdSlider` (75 removed it on the qualified clip).
+
+### Swap reports
+
+Every successful preview and render writes `swap-report.json` (version 1) and returns its compact `swap_report` summary in the result. Each requested mapping is reported by its zero-based index in `mappings`, so a mapping that never swaps cannot hide in the aggregate `swapped_faces`. For every processed frame, the report records why each mapping was or was not swapped, using only what Fusion's own matching observed:
+
+| Reason | Meaning |
+| --- | --- |
+| `swapped` | Fusion's swap step completed for a face of this mapping. This says nothing about how the result looks |
+| `no_faces` | The detector found no face. This shows absence, not a failure |
+| `unscored` | No scored face cleared the threshold, but some detected faces never reached matching: too small or without valid landmarks, or (with tracking on) filtered out by Fusion's SequentialDetector. Their scores are unknown |
+| `below_threshold` | Every detected face was scored, and none reached this mapping's `SimilarityThresholdSlider` |
+| `claimed_by_other` | A face cleared this mapping's threshold but matched another mapping better |
+| `not_swapped` | A face matched this mapping best, but Fusion swapped no face for it |
+
+Coverage is given against explicit denominators: all requested frames, frames with detected faces, and frames inside `expected_visible` ranges. Scores are Fusion's similarity (50 + 50 × cosine similarity) for faces that reached matching, never invented for others. A frame is ambiguous for a mapping when two or more faces matched it best, or when a face clearing its threshold also clears another mapping's.
+
+Suspicious intervals are zero-based source-frame ranges `[start_frame, end_frame)`: `end_frame` is the first frame after the interval. Times are seconds computed from the exact frame rate: `start_time` and `end_time` on the source clock (`frame / fps`), and `output_start_time` in `result.mp4`, so ranges stay correct when `start_frame` is above zero. The kinds are `expected_missing` (unswapped frames inside an `expected_visible` range, whatever the reason), `dropout` (unswapped frames, at least one with faces, between two swapped frames), `claimed_by_other`, `not_swapped` and `ambiguous`. Frames without faces are reported but never flagged on their own, because they do not prove that the person should have been visible. Each mapping lists at most 100 intervals; `intervals_omitted` counts the rest.
+
+Renders write up to `review_images` (default 6, at most 24) JPEGs named `review-01.jpg` and so on in the job's artifacts. Each image shows the decoded source frame beside the same frame of the published output, under a label with the mapping, source frame, time and reason. They come first from the best-scoring frame of each mapping that never swapped, then from the middle frames of suspicious intervals, by kind and length.
+
+Warnings (`never_swapped`, `expected_missing`, `suspicious_intervals`) are advisory, and a job with warnings still completes. A render still fails when no face swaps at all, and it fails when Fusion reports a per-face error, which names the source frame and, when it can be attributed, the mapping. A render passed `min_coverage` fails when any mapping's swapped share falls below it. The share is computed over that mapping's `expected_visible` frames when it has ranges, and over all requested frames otherwise. Failed and cancelled jobs publish no report.
+
+Pass these options to a render as `report`, for example:
+
+```json
+{"review_images": 4, "min_coverage": 0.9,
+ "expected_visible": [{"mapping": 1, "start_frame": 120, "end_frame": 240}]}
+```
+
+`expected_visible` lists at most 100 ranges inside the requested frames; a range that ends past the video's last frame fails the render before processing. Previews accept no `report` options and have no times or review images.
 
 ## Storage
 

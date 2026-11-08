@@ -37,6 +37,11 @@ def test_stdio_discovery():
                 mapping = tools["submit_swap"].inputSchema["$defs"]["FaceMapping"]["properties"]
                 assert {"source_weights", "source_sha256"} <= mapping.keys()
                 assert "mappings" in tools["submit_swap"].inputSchema["required"]
+                swap = tools["submit_swap"].inputSchema
+                assert "report" in swap["properties"] and "report" not in swap["required"]
+                options = swap["$defs"]["SwapReportOptions"]["properties"]
+                assert {"review_images", "expected_visible", "min_coverage"} == options.keys()
+                assert options["review_images"]["maximum"] == 24
                 result = await session.call_tool(
                     "submit_swap", {"media_path": "x", "mappings": [{}]}
                 )

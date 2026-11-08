@@ -94,6 +94,33 @@ class ReferenceThresholds(BaseModel):
     )
 
 
+class VisibleRange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mapping: int = Field(ge=0, le=19, description="Zero-based index into mappings")
+    start_frame: int = Field(ge=0, description="First zero-based source frame")
+    end_frame: int = Field(ge=1, description="First source frame after the range (exclusive)")
+
+
+class SwapReportOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    review_images: int = Field(
+        default=6, ge=0, le=24, description="Most labelled before/after review images to write"
+    )
+    expected_visible: list[VisibleRange] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Ranges where a mapping's person is known to be visible; unswapped frames "
+        "there are reported, and with min_coverage they are the coverage denominator",
+    )
+    min_coverage: float | None = Field(
+        default=None,
+        gt=0,
+        le=1,
+        description="Strict: fail the render if any mapping's swapped share of its expected-"
+        "visible frames (or, without ranges, of all rendered frames) is below this",
+    )
+
+
 async def ssh(arguments, data=None, timeout=45, stdin=None, stdout=asyncio.subprocess.PIPE):
     # Settings are validated per call, so discovery works before the client is configured.
     settings = transport()
@@ -217,6 +244,7 @@ async def submit_swap(
     start_frame: int = 0,
     max_frames: int | None = None,
     controls: dict | None = None,
+    report: SwapReportOptions | None = None,
     job_id: JobId = None,
 ) -> dict[str, Any]:
     """Queue an image/frame preview or CFR video render using explicit identity mappings.
@@ -236,6 +264,13 @@ async def submit_swap(
     and the result's `references` lists, per mapping, each source's SHA-256, weight and share.
     Every reference's bytes are fingerprinted at submission; a file changed before the worker
     reads it fails the job instead of being used.
+
+    Results carry `swap_report`, a per-mapping summary (mapping = index into mappings) of
+    swapped frames, coverage, ambiguous frames, suspicious intervals and warnings such as a
+    mapping that never swapped; warnings never fail the job. The full report is the
+    swap-report.json artifact, with half-open [start_frame, end_frame) source-frame intervals
+    and times. Renders also write up to `report.review_images` labelled before/after images
+    (review-NN.jpg). `report` applies to renders only; omit it for the defaults.
     """
     return await command(
         "submit",
@@ -248,6 +283,8 @@ async def submit_swap(
         start_frame=start_frame,
         max_frames=max_frames,
         controls=controls or {},
+        # Omitted when unset so earlier requests keep their idempotent form.
+        **({} if report is None else {"report": report.model_dump(exclude_none=True)}),
     )
 
 

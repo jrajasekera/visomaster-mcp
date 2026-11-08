@@ -302,13 +302,18 @@ def load_frame(path, frame_number=0, timing=None):
             raise ValueError(
                 f"Frame {frame_number} is out of range; the video has {len(times)} frames"
             )
-    decoded = decode(path, stream, frame_number, 1, times)
+    return read_frame(path, stream, frame_number, times)
+
+
+def read_frame(path, stream, number, times=None):
+    """Decode the single frame `number`; see decode."""
+    decoded = decode(path, stream, number, 1, times)
     try:
         frame = next(decoded, None)
     finally:
         decoded.close()
     if frame is None:
-        raise ValueError(f"Cannot read frame {frame_number} from {path}")
+        raise ValueError(f"Cannot read frame {number} from {path}")
     return frame
 
 
@@ -964,15 +969,65 @@ def make_worker(window, sequential=False):
     from app.processors.workers.frame_worker import FrameWorker
 
     class CheckedWorker(FrameWorker):
+        """Records what Fusion's own matching and swapping decide, without extra inference."""
+
         swap_count = 0
 
+        def _find_best_target_match(self, embedding, control, *args, **kwargs):
+            match = super()._find_best_target_match(embedding, control, *args, **kwargs)
+            # Fusion asks once per target for each face when swapping only best matches.
+            if embedding is not None and not self.telemetry.scored(embedding):
+                model = control["RecognitionModelSelection"]
+                scores = {
+                    face_id: float(
+                        self.function_worker.findCosineDistance(
+                            embedding, target.get_embedding(model)
+                        )
+                    )
+                    for face_id, target in self.main_window.target_faces.items()
+                }
+                self.telemetry.match(embedding, match[0] and str(match[0].face_id), scores)
+            return match
+
         def swap_core(self, *args, **kwargs):
-            result = super().swap_core(*args, **kwargs)
+            # The target embedding Fusion passes is the mapping's own array.
+            embedding = kwargs.get("t_e")
+            face_id = next(
+                (
+                    face_id
+                    for face_id, target in self.main_window.target_faces.items()
+                    if any(value is embedding for value in target.embeddings.values())
+                ),
+                None,
+            )
+            try:
+                result = super().swap_core(*args, **kwargs)
+            except Exception:
+                self.telemetry.swap(face_id, failed=True)
+                raise
             self.swap_count += 1
+            self.telemetry.swap(face_id)
             return result
 
     worker = CheckedWorker(window, is_single_frame=not sequential)
     worker.parameters = window.parameters
+    worker.telemetry = Telemetry(
+        {
+            face_id: float(window.parameters[face_id]["SimilarityThresholdSlider"])
+            for face_id in window.target_faces
+        },
+        sequential,
+    )
+    # Both paths detect through the window's FunctionWorker: the frame worker per frame, or
+    # the SequentialDetector before identity filtering.
+    function_worker, run_detect = window.function_worker, window.function_worker.run_detect
+
+    def counted_detect(*args, **kwargs):
+        result = run_detect(*args, **kwargs)
+        worker.telemetry.detected(0 if result[0] is None else len(result[0]))
+        return result
+
+    function_worker.run_detect = counted_detect
     worker.detector = None
     if sequential:
         worker.detector = SequentialDetector(window)
@@ -986,6 +1041,7 @@ def process(worker, bgr, index):
     worker.frame = np.ascontiguousarray(bgr[..., ::-1])
     worker.frame_number = index
     control = worker.main_window.control
+    worker.telemetry.begin(index)
     # Fusion catches some per-face exceptions. Turn its logged errors into job failures.
     captured = io.StringIO()
     try:
@@ -1004,8 +1060,456 @@ def process(worker, bgr, index):
         output = captured.getvalue()
         print(output, end="", flush=True)
     if "[ERROR]" in output or "Traceback (most recent call last)" in output:
-        raise RuntimeError("Fusion reported a per-face processing error; see worker.log")
+        failed = ", ".join(worker.telemetry.failed())
+        raise RuntimeError(
+            f"Fusion reported a per-face processing error at source frame {index}"
+            + (f" (mapping {failed})" if failed else "")
+            + "; see worker.log"
+        )
+    worker.telemetry.end()
     return np.ascontiguousarray(result)
+
+
+# Why a mapping was or was not swapped in a frame. Faces that reach Fusion's matching are scored
+# against every mapping; others (detected but too small or without valid landmarks, or filtered
+# out by the SequentialDetector) are unscored, and their scores are unknown.
+REASONS = (
+    "swapped",  # Fusion's swap step completed for at least one face of this mapping.
+    "no_faces",  # The detector found no face: absence, not a failure.
+    "unscored",  # No scored face cleared the threshold, but some detected faces were unscored.
+    "below_threshold",  # Every detected face was scored, and none cleared the threshold.
+    "claimed_by_other",  # A face cleared this threshold but matched another mapping better.
+    "not_swapped",  # A face matched this mapping best, yet Fusion swapped none.
+    "error",  # Fusion's swap step raised; the job fails.
+    "not_requested",  # The mapping does not apply to this frame; excluded from coverage.
+)
+# Suspicious interval kinds, in review-image priority after never-swapped mappings.
+INTERVALS = ("expected_missing", "dropout", "claimed_by_other", "not_swapped", "ambiguous")
+REPORT_VERSION = 1
+MAX_INTERVALS = 100  # Per mapping; counts stay exact, further intervals are only counted.
+REVIEW_IMAGES = 6
+
+
+class MappingTelemetry:
+    """One mapping's per-frame outcomes as counters and suspicious intervals.
+
+    Intervals are half-open source-frame ranges [start, end) of consecutive processed frames:
+    `expected_missing` (unswapped inside an expected-visible range), `dropout` (unswapped
+    frames, at least one with faces, between two swapped frames), `claimed_by_other`,
+    `not_swapped` and `ambiguous`. Frames must arrive consecutively.
+    """
+
+    def __init__(self, threshold):
+        self.threshold = threshold
+        self.frames = dict.fromkeys(REASONS, 0)
+        self.swaps = self.ambiguous = self.expected = self.expected_swapped = 0
+        self.scores = []  # Count, sum, minimum and maximum of swapped faces' scores.
+        self.near = None  # (score, frame) of the best-scoring unswapped frame.
+        self.ranges, self.intervals, self.omitted, self.open = [], [], 0, {}
+        self.after_swap = False
+
+    def add(self, frame, reason, score, ambiguous, swaps):
+        self.frames[reason] += 1
+        self.swaps += swaps
+        requested, swapped = reason != "not_requested", reason == "swapped"
+        expected = requested and any(start <= frame < end for start, end in self.ranges)
+        self.expected += expected
+        self.expected_swapped += expected and swapped
+        ambiguous = requested and ambiguous
+        self.ambiguous += ambiguous
+        if score is not None and swapped:
+            count, total, low, high = self.scores or (0, 0.0, score, score)
+            self.scores = (count + 1, total + score, min(low, score), max(high, score))
+        elif score is not None and requested and (self.near is None or score > self.near[0]):
+            self.near = (score, frame)
+        for kind, active in (
+            ("expected_missing", expected and not swapped),
+            ("claimed_by_other", reason == "claimed_by_other"),
+            ("not_swapped", reason == "not_swapped"),
+            ("ambiguous", ambiguous),
+        ):
+            if active:
+                self.extend(kind, frame, reason)
+            elif kind in self.open:
+                self.close(kind, frame)
+        if swapped:
+            if any(r != "no_faces" for r in self.open.get("dropout", {}).get("reasons", {})):
+                self.close("dropout", frame)
+            self.open.pop("dropout", None)
+            self.after_swap = True
+        elif not requested:
+            self.open.pop("dropout", None)
+            self.after_swap = False
+        elif self.after_swap:
+            self.extend("dropout", frame, reason)
+
+    def extend(self, kind, frame, reason):
+        run = self.open.setdefault(kind, {"start": frame, "reasons": {}})
+        run["reasons"][reason] = run["reasons"].get(reason, 0) + 1
+
+    def close(self, kind, end):
+        run = self.open.pop(kind)
+        if len(self.intervals) == MAX_INTERVALS:
+            self.omitted += 1
+            return
+        self.intervals.append(
+            {"kind": kind, "start_frame": run["start"], "end_frame": end, "reasons": run["reasons"]}
+        )
+
+    def finish(self, end):
+        """Close runs at `end`, one past the last frame; a dropout needs a swap after it."""
+        self.open.pop("dropout", None)
+        for kind in list(self.open):
+            self.close(kind, end)
+
+
+class Telemetry:
+    """Fusion's matching and swapping observed per processed frame, attributed to mappings.
+
+    Mapping IDs are Fusion face IDs, the request's mapping index as a string. Scores are what
+    Fusion's FunctionWorker.findCosineDistance gives each face that reaches matching; the best
+    match is Fusion's own choice. Nothing is inferred again.
+    """
+
+    def __init__(self, thresholds, sequential=False):
+        self.thresholds, self.sequential = thresholds, sequential
+        self.mappings = {face_id: MappingTelemetry(t) for face_id, t in thresholds.items()}
+        self.processed = self.with_faces = self.detections = self.scored_faces = 0
+        self.frame = None
+
+    def expect(self, ranges):
+        """Expected-visible [start, end) source-frame ranges by mapping ID."""
+        for face_id, values in ranges.items():
+            self.mappings[face_id].ranges = values
+
+    def begin(self, frame, requested=None):
+        """Start a frame; mappings outside `requested` (default all) are not_requested."""
+        self.frame, self.requested = frame, set(self.mappings if requested is None else requested)
+        self.detections_now, self.faces, self.swaps, self.errors = None, {}, {}, {}
+
+    def detected(self, count):
+        if self.frame is not None:
+            self.detections_now = count
+
+    def scored(self, embedding):
+        return id(embedding) in self.faces
+
+    def match(self, embedding, best, scores):
+        # The embedding is kept so its id cannot be reused within the frame.
+        if self.frame is not None:
+            self.faces[id(embedding)] = (embedding, best, scores)
+
+    def swap(self, face_id, failed=False):
+        if self.frame is not None:
+            counts = self.errors if failed else self.swaps
+            counts[face_id] = counts.get(face_id, 0) + 1
+
+    def failed(self):
+        return [face_id for face_id in self.errors if face_id is not None]
+
+    def classify(self, face_id, detected):
+        """(reason, score, ambiguous) for one mapping in the current frame."""
+        threshold = self.thresholds[face_id]
+        faces = [(best, scores) for _, best, scores in self.faces.values()]
+        assigned = [scores[face_id] for best, scores in faces if best == face_id]
+        eligible = [scores for _, scores in faces if scores.get(face_id, -1) >= threshold]
+        # Observed-score ambiguity: several faces matched this mapping best, or a face clearing
+        # this threshold also clears another mapping's.
+        ambiguous = len(assigned) > 1 or any(
+            score >= self.thresholds.get(other, math.inf)
+            for scores in eligible
+            for other, score in scores.items()
+            if other != face_id
+        )
+        observed = [scores[face_id] for _, scores in faces if face_id in scores]
+        score = max(assigned or observed, default=None)
+        if face_id not in self.requested:
+            reason = "not_requested"
+        elif self.errors.get(face_id):
+            reason = "error"
+        elif self.swaps.get(face_id):
+            reason = "swapped"
+        elif not detected:
+            reason = "no_faces"
+        elif assigned:
+            reason = "not_swapped"
+        elif eligible:
+            reason = "claimed_by_other"
+        elif detected > len(faces):
+            reason = "unscored"
+        else:
+            reason = "below_threshold"
+        return reason, score, ambiguous
+
+    def end(self):
+        detected = max(self.detections_now or 0, len(self.faces))
+        self.processed += 1
+        self.with_faces += detected > 0
+        self.detections += detected
+        self.scored_faces += len(self.faces)
+        for face_id, mapping in self.mappings.items():
+            reason, score, ambiguous = self.classify(face_id, detected)
+            mapping.add(self.frame, reason, score, ambiguous, self.swaps.get(face_id, 0))
+        self.frame = None
+
+    def finish(self, end):
+        for mapping in self.mappings.values():
+            mapping.finish(end)
+
+
+CONVENTIONS = (
+    "Frames are zero-based source frame indices. Intervals are half-open: start_frame is the "
+    "first frame and end_frame the first frame after it. Times are seconds, frame / fps on the "
+    "source video's clock (start_time, end_time) or (frame - render start_frame) / fps in the "
+    "output (output_start_time); previews have none."
+)
+EVIDENCE = {
+    "per_frame": (
+        "Fusion detects every frame. Faces below its minimum size or without valid landmarks "
+        "are not recognized, so they are unscored."
+    ),
+    "sequential": (
+        "The SequentialDetector detects every frame and passes on only faces that clear a "
+        "mapping's threshold or continue a tracked face; the others are unscored."
+    ),
+}
+SCORES = (
+    "Scores are Fusion's similarity (100 - 50 x cosine distance) of each scored face against "
+    "each mapping's target; swapped means Fusion's swap step completed, not that the result "
+    "looks right. Unscored faces have unknown scores."
+)
+
+
+def rounded(value, digits=2):
+    return None if value is None else round(value, digits)
+
+
+def ratio(part, whole):
+    return round(part / whole, 4) if whole else None
+
+
+def frame_times(frame, fps, start):
+    """Source-clock and output seconds of zero-based source frame `frame`, from the exact rate."""
+    if fps is None:
+        return None, None
+    return round(float(frame / fps), 6), round(float((frame - start) / fps), 6)
+
+
+def mapping_report(index, mapping, stats, fps, start):
+    frames = dict(stats.frames)
+    requested = sum(frames.values()) - frames["not_requested"]
+    with_faces = requested - frames["no_faces"]
+    count, total, low, high = stats.scores or (0, 0.0, None, None)
+    near_score, near_frame = stats.near or (None, None)
+    intervals = []
+    for interval in sorted(stats.intervals, key=lambda i: (i["start_frame"], i["kind"])):
+        first, end = interval["start_frame"], interval["end_frame"]
+        start_time, output_time = frame_times(first, fps, start)
+        intervals.append(
+            {
+                **interval,
+                "frames": end - first,
+                "start_time": start_time,
+                "end_time": frame_times(end, fps, start)[0],
+                "output_start_time": output_time,
+            }
+        )
+    suspicious = {kind: 0 for kind in INTERVALS}
+    for interval in intervals:
+        suspicious[interval["kind"]] += 1
+    return {
+        "mapping": index,
+        "target_face": mapping["target_face"],
+        "threshold": stats.threshold,
+        "expected_visible": [list(r) for r in stats.ranges],
+        "frames": {
+            "requested": requested,
+            "with_faces": with_faces,
+            "expected_visible": stats.expected,
+            "expected_visible_swapped": stats.expected_swapped,
+            **frames,
+        },
+        "swaps": stats.swaps,
+        "ambiguous_frames": stats.ambiguous,
+        "coverage": {
+            "requested": ratio(frames["swapped"], requested),
+            "with_faces": ratio(frames["swapped"], with_faces),
+            "expected_visible": ratio(stats.expected_swapped, stats.expected),
+        },
+        "scores": {
+            "swapped_min": rounded(low),
+            "swapped_mean": rounded(total / count) if count else None,
+            "swapped_max": rounded(high),
+            "best_unswapped": rounded(near_score),
+            "best_unswapped_frame": near_frame,
+        },
+        "suspicious": suspicious,
+        "intervals": intervals,
+        "intervals_omitted": stats.omitted,
+    }
+
+
+def report_warnings(mappings):
+    """Advisory per-mapping warnings; they never change the job's terminal state."""
+    found = []
+    for m in mappings:
+        index, frames = m["mapping"], m["frames"]
+        if frames["requested"] and not frames["swapped"]:
+            best = m["scores"]["best_unswapped"]
+            detail = (
+                f"best observed score {best:g} against threshold {m['threshold']:g}"
+                if best is not None
+                else "no face reached matching"
+            )
+            message = (
+                f"Mapping {index} was never swapped in {frames['requested']} frames "
+                f"({frames['with_faces']} with faces); {detail}"
+            )
+            found.append({"mapping": index, "code": "never_swapped", "message": message})
+            continue
+        missing = frames["expected_visible"] - frames["expected_visible_swapped"]
+        if missing:
+            message = (
+                f"Mapping {index} was not swapped in {missing} of its "
+                f"{frames['expected_visible']} expected-visible frames"
+            )
+            found.append({"mapping": index, "code": "expected_missing", "message": message})
+        kinds = {k: v for k, v in m["suspicious"].items() if v and k != "expected_missing"}
+        if kinds or m["intervals_omitted"]:
+            listed = ", ".join(f"{v} {k}" for k, v in kinds.items())
+            omitted = m["intervals_omitted"]
+            message = f"Mapping {index} has suspicious intervals ({listed}" + (
+                f", {omitted} more" if omitted else ""
+            )
+            found.append(
+                {"mapping": index, "code": "suspicious_intervals", "message": message + ")"}
+            )
+    return found
+
+
+def swap_report(request, telemetry, fps, start):
+    """The versioned swap report of a successful preview or render (review images added later)."""
+    options = request.get("report") or {}
+    mappings = [
+        mapping_report(index, mapping, telemetry.mappings[str(index)], fps, start)
+        for index, mapping in enumerate(request["mappings"])
+    ]
+    path = "sequential" if telemetry.sequential else "per_frame"
+    return {
+        "version": REPORT_VERSION,
+        "complete": True,
+        "kind": request["kind"],
+        "media_path": request["media_path"],
+        "fps": None if fps is None else str(fps),
+        "start_frame": start,
+        "end_frame": start + telemetry.processed,
+        "conventions": CONVENTIONS,
+        "detection_path": path,
+        "evidence": {"detection": EVIDENCE[path], "scores": SCORES},
+        "frames": {
+            "processed": telemetry.processed,
+            "with_faces": telemetry.with_faces,
+            "faces_detected": telemetry.detections,
+            "faces_scored": telemetry.scored_faces,
+        },
+        "options": {
+            "review_images": options.get("review_images", REVIEW_IMAGES),
+            "expected_visible": options.get("expected_visible", []),
+            "min_coverage": options.get("min_coverage"),
+        },
+        "mappings": mappings,
+        "warnings": report_warnings(mappings),
+        "review_images": [],
+    }
+
+
+def coverage_shortfalls(report):
+    """Mappings below min_coverage: of expected-visible frames when the mapping has ranges,
+    else of requested frames. A mapping with no such frames has nothing to cover."""
+    minimum = report["options"]["min_coverage"]
+    found = []
+    for m in report["mappings"] if minimum is not None else ():
+        basis = "expected_visible" if m["expected_visible"] else "requested"
+        value, frames = m["coverage"][basis], m["frames"]
+        if value is not None and value < minimum:
+            swapped = frames["swapped" if basis == "requested" else "expected_visible_swapped"]
+            name = basis.replace("_", "-")
+            found.append(f"mapping {m['mapping']} {swapped} of {frames[basis]} {name} frames")
+    return found
+
+
+def review_frames(report, limit):
+    """Up to `limit` (mapping, frame, reason): each never-swapped mapping's best-scoring frame,
+    then the middle frame of suspicious intervals by kind priority, longest first."""
+    candidates = []
+    for m in report["mappings"]:
+        frame = m["scores"]["best_unswapped_frame"]
+        if m["frames"]["requested"] and not m["frames"]["swapped"] and frame is not None:
+            candidates.append((0, 0, m["mapping"], frame, "never_swapped"))
+        for interval in m["intervals"]:
+            middle = interval["start_frame"] + (interval["frames"] - 1) // 2
+            priority = 1 + INTERVALS.index(interval["kind"])
+            candidates.append(
+                (priority, -interval["frames"], m["mapping"], middle, interval["kind"])
+            )
+    chosen, seen = [], set()
+    for *_, mapping, frame, reason in sorted(candidates):
+        if len(chosen) < limit and (mapping, frame) not in seen:
+            seen.add((mapping, frame))
+            chosen.append((mapping, frame, reason))
+    return chosen
+
+
+def review_image(path, before, after, label):
+    """Write the source and output frames side by side under a label bar."""
+    import cv2
+    import numpy as np
+
+    pair = np.hstack([before, after])
+    scale = min(1.0, 1920 / pair.shape[1])
+    if scale < 1:
+        size = (round(pair.shape[1] * scale), round(pair.shape[0] * scale))
+        pair = cv2.resize(pair, size, interpolation=cv2.INTER_AREA)
+    bar = np.full((40, pair.shape[1], 3), 32, np.uint8)
+    cv2.putText(bar, label, (8, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    save_image(path, np.vstack([bar, pair]))
+
+
+def report_summary(report):
+    """The compact part of a report that job_status returns."""
+    mappings = []
+    for m in report["mappings"]:
+        entry = {
+            "mapping": m["mapping"],
+            "swapped_frames": m["frames"]["swapped"],
+            "requested_frames": m["frames"]["requested"],
+            "coverage": m["coverage"]["requested"],
+            "ambiguous_frames": m["ambiguous_frames"],
+            "suspicious_intervals": len(m["intervals"]) + m["intervals_omitted"],
+        }
+        if m["expected_visible"]:
+            entry["expected_visible_coverage"] = m["coverage"]["expected_visible"]
+        mappings.append(entry)
+    return {
+        "artifact": "swap-report.json",
+        "version": report["version"],
+        "mappings": mappings,
+        "warnings": [w["message"] for w in report["warnings"]],
+        "review_images": [r["artifact"] for r in report["review_images"]],
+    }
+
+
+def expected_ranges(options, end):
+    """Expected-visible ranges by mapping ID; each must end by `end`, one past the last frame."""
+    ranges = {}
+    for item in options.get("expected_visible", []):
+        if item["end_frame"] > end:
+            raise ValueError(
+                f"expected_visible range {item['start_frame']}-{item['end_frame']} for mapping "
+                f"{item['mapping']} ends after the rendered range, which ends at frame {end}"
+            )
+        ranges.setdefault(str(item["mapping"]), []).append((item["start_frame"], item["end_frame"]))
+    return {face_id: sorted(values) for face_id, values in ranges.items()}
 
 
 def save_image(path, image):
@@ -1175,6 +1679,9 @@ def render_video(window, request, directory, worker):
     expected = min(limit or total, total - start)
     if expected <= 0:
         raise ValueError("Requested frame range is empty")
+    options = request.get("report") or {}
+    telemetry = worker.telemetry
+    telemetry.expect(expected_ranges(options, start + expected))
     video_only = directory / "video-only.mp4"
     artifacts = directory / "artifacts"
     encoder = None
@@ -1225,6 +1732,14 @@ def render_video(window, request, directory, worker):
             encoder.wait()
     if worker.swap_count == 0:
         raise RuntimeError("No faces matched the target references in the requested range")
+    telemetry.finish(start + processed)
+    report = swap_report(request, telemetry, fps, start)
+    shortfalls = coverage_shortfalls(report)
+    if shortfalls:
+        raise RuntimeError(
+            f"Swap coverage is below min_coverage {report['options']['min_coverage']:g}: "
+            + "; ".join(shortfalls)
+        )
     output = artifacts / "result.mp4"
     duration = float(Fraction(processed, 1) / fps)
     offset = float(Fraction(start, 1) / fps)
@@ -1240,13 +1755,34 @@ def render_video(window, request, directory, worker):
         raise RuntimeError("Encoded pixel aspect ratio differs from the source")
     emitted = output_audio(verified, audio, duration, "Audio missing from output")
     video_only.unlink()
+    # Review pairs come from the source and the published output, decoded at the same frame.
+    limit = report["options"]["review_images"]
+    for number, (mapping, frame, reason) in enumerate(review_frames(report, limit), 1):
+        name = f"review-{number:02d}.jpg"
+        seconds, output_seconds = frame_times(frame, fps, start)
+        label = f"mapping {mapping} | frame {frame} | {seconds:.3f} s | {reason} | before, after"
+        before = read_frame(source, stream, frame)
+        review_image(artifacts / name, before, read_frame(output, video, frame - start), label)
+        report["review_images"].append(
+            {
+                "artifact": name,
+                "mapping": mapping,
+                "frame": frame,
+                "time": seconds,
+                "output_time": output_seconds,
+                "reason": reason,
+            }
+        )
+    atomic_json(artifacts / "swap-report.json", report)
+    names = [r["artifact"] for r in report["review_images"]]
     return {
         "frames": processed,
         "fps": str(fps),
         "duration": duration,
         "swapped_faces": worker.swap_count,
         "audio": "AAC" if emitted else "none",
-        "artifacts": ["result.mp4", "preview.jpg", "before.jpg"],
+        "swap_report": report_summary(report),
+        "artifacts": ["result.mp4", "preview.jpg", "before.jpg", "swap-report.json", *names],
     }
 
 
@@ -1455,16 +1991,21 @@ def run(directory):
         )
         worker = make_worker(window, sequential=request["kind"] == "render" and tracking)
         if request["kind"] == "preview":
-            frame = load_frame(input_path(request["media_path"]), request.get("frame", 0))
-            swapped = process(worker, frame, request.get("frame", 0))
+            number = request.get("frame", 0)
+            frame = load_frame(input_path(request["media_path"]), number)
+            swapped = process(worker, frame, number)
             if worker.swap_count == 0:
                 raise RuntimeError("No faces matched the target references")
             save_image(artifacts / "before.jpg", frame)
             save_image(artifacts / "preview.jpg", swapped)
             save_image(artifacts / "result.png", swapped)
+            worker.telemetry.finish(number + 1)
+            report = swap_report(request, worker.telemetry, None, number)
+            atomic_json(artifacts / "swap-report.json", report)
             result = {
                 "swapped_faces": worker.swap_count,
-                "artifacts": ["result.png", "before.jpg", "preview.jpg"],
+                "swap_report": report_summary(report),
+                "artifacts": ["result.png", "before.jpg", "preview.jpg", "swap-report.json"],
             }
         else:
             result = render_video(window, request, directory, worker)

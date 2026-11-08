@@ -128,8 +128,10 @@ def render(media, source, directory, monkeypatch):
     run = SimpleNamespace(Popen=Encoder, PIPE=subprocess.PIPE, run=subprocess.run)
     monkeypatch.setattr(engine, "subprocess", run)
     (directory / "artifacts").mkdir()
-    request = {"media_path": str(source)}
-    return engine.render_video(None, request, directory, SimpleNamespace(swap_count=1))
+    request = {"media_path": str(source), "kind": "render"}
+    request["mappings"] = [{"target_face": "face.png", "source_faces": []}]
+    worker = SimpleNamespace(swap_count=1, telemetry=engine.Telemetry({"0": 60.0}))
+    return engine.render_video(None, request, directory, worker)
 
 
 @pytest.mark.parametrize("name", ATTACKS)

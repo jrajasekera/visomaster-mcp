@@ -582,7 +582,9 @@ def test_engine_runs_analysis_and_reports_used_references(tmp_path, monkeypatch)
     monkeypatch.setattr(
         engine,
         "make_worker",
-        lambda window, sequential=False: SimpleNamespace(swap_count=1, main_window=window),
+        lambda window, sequential=False: SimpleNamespace(
+            swap_count=1, main_window=window, telemetry=engine.Telemetry({"0": 60.0})
+        ),
     )
     monkeypatch.setattr(engine, "load_frame", lambda path, number=0: "frame")
     monkeypatch.setattr(engine, "process", lambda worker, frame, index: frame)
