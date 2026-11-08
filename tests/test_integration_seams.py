@@ -145,3 +145,31 @@ def test_worker_reuses_the_supervisors_media_hash_and_sees_a_change(worker):
     with pytest.raises(ValueError, match="changed after submission"):
         engine.run(worker.job)
     assert worker.loaded == [1]
+
+
+# Segment plans past the end of the video (finding 2)
+
+
+def test_preflight_blocks_segments_past_the_end_of_the_video(site):
+    late = [{"id": "late", "start_frame": 40, "end_frame": 50, "passthrough": True}]
+    report = preflight(swap(site, segments=late))
+    checks = by_name(report)
+    assert checks["request"]["status"] == "passed"  # Validation cannot know the length.
+    assert checks["media"]["status"] == "blocked"
+    assert checks["media"]["code"] == "segment_outside_range"
+    assert report["readiness"] == "blocked"
+    # Within the 25-frame clip the same plan is ready, and so is one clipped at its end.
+    near = [{"id": "near", "start_frame": 20, "end_frame": 50, "passthrough": True}]
+    assert by_name(preflight(swap(site, segments=near)))["media"]["status"] == "passed"
+    every = [{"id": "all", "start_frame": 0, "end_frame": 50, "passthrough": True}]
+    assert by_name(preflight(swap(site, segments=every)))["media"]["code"] == "all_passthrough"
+
+
+def test_worker_refuses_segments_past_the_end_before_models_load(worker, library):
+    worker.clip.write_bytes((library / "clip.mp4").read_bytes())
+    late = [{"id": "late", "start_frame": 40, "end_frame": 50, "passthrough": True}]
+    request = {**worker.request, "kind": "render", "max_frames": 60, "segments": late}
+    common.atomic_json(worker.job / "resolved.json", control.fingerprint(request))
+    with pytest.raises(ValueError, match="outside the rendered frames"):
+        engine.run(worker.job)
+    assert worker.loaded == []

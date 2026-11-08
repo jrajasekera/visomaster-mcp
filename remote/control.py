@@ -48,6 +48,7 @@ from common import (  # noqa: E402
     STATE,
     TERMINAL,
     ConfigError,
+    Refusal,
     atomic_json,
     canonical,
     code_identity,
@@ -73,6 +74,7 @@ from common import (  # noqa: E402
     reference_path,
     required_models,
     resume_problems,
+    segment_plan,
     setting_variants,
     validate_request,
     validate_settings,
@@ -1454,6 +1456,17 @@ def differences(record, mode, choice, mappings, hardware):
     return found
 
 
+def check_plan(request, start, end):
+    """Refuse a render whose segments miss its frames, as the worker does; malformed segments
+    are the request check's to report."""
+    try:
+        segment_plan(request["segments"], start, end, len(request["mappings"]))
+    except Refusal:
+        raise
+    except (KeyError, TypeError, AttributeError, ValueError):
+        pass
+
+
 def media_check(request, source):
     """The worker's own render or preview media checks (engine.clip_range, preview_source);
     timestamps are read only through the requested frames. Returns the check and its evidence."""
@@ -1462,6 +1475,9 @@ def media_check(request, source):
     try:
         if request["kind"] == "render":
             metadata, stream, fps, start, frames = engine.clip_range(source, request)
+            if request.get("segments"):
+                # Validation knew the requested range only, not the video's length.
+                check_plan(request, start, start + frames)
             width, height = int(stream["width"]), int(stream["height"])
             # Bytes per output frame from the source's bit rate or the resolution, whichever is
             # more; the checkpoint's chunks and the joined result coexist until completion.

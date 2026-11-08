@@ -2859,6 +2859,11 @@ def run(directory):
             f"Media {request['media_path']} changed after submission (expected SHA-256 "
             f"{expected}); verify the recipe again and resubmit"
         )
+    if request["kind"] == "render" and request.get("segments"):
+        # Validation knew only the requested range; refuse segments the video lacks before
+        # models load, as preflight does.
+        _, _, _, start, count = clip_range(input_path(request["media_path"]), request)
+        segment_plan(request["segments"], start, start + count, len(request["mappings"]))
     atomic_json(directory / "progress.json", {"stage": "loading_models"})
     window = initialize(request.get("controls", {}))
     artifacts = directory / "artifacts"

@@ -996,9 +996,10 @@ def segment_plan(segments, start, end, count):
     for segment in segments:
         low, high = max(segment["start_frame"], start), min(segment["end_frame"], end)
         if low >= high:
-            raise ValueError(
+            raise Refusal(
+                "segment_outside_range",
                 f"Segment {segment['id']} [{segment['start_frame']}, {segment['end_frame']}) lies "
-                f"outside the rendered frames [{start}, {end})"
+                f"outside the rendered frames [{start}, {end})",
             )
         if low > cursor:
             runs.append(run(None, cursor, low))
@@ -1007,9 +1008,10 @@ def segment_plan(segments, start, end, count):
     if cursor < end:
         runs.append(run(None, cursor, end))
     if all(entry["passthrough"] for entry in runs):
-        raise ValueError(
+        raise Refusal(
+            "all_passthrough",
             f"Every rendered frame [{start}, {end}) is passthrough, so there is nothing to swap; "
-            "use the source media, or render frames outside the passthrough segments"
+            "use the source media, or render frames outside the passthrough segments",
         )
     return runs
 
