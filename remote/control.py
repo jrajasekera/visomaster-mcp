@@ -9,6 +9,8 @@ import json
 import os
 import platform
 import re
+import secrets
+import select
 import shutil
 import signal
 import stat
@@ -59,7 +61,7 @@ MAX_WAIT = 50
 GRACE = 10  # Seconds a cancelled worker gets to exit on SIGTERM before its group is killed.
 # Leads the job's process group so the group ID stays reserved until the supervisor reaps it. It
 # ignores the cancellation SIGTERM and kills the whole group when the supervisor's pipe closes,
-# which also covers a supervisor that dies.
+# which also covers a supervisor that dies. A supervisor that sees the guard die stops the job.
 GUARD = """import os, signal
 for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
     signal.signal(number, signal.SIG_IGN)
@@ -81,7 +83,14 @@ def current(directory):
                 pass
             else:
                 state = read_json(directory / "state.json")
-                if state["status"] not in TERMINAL and time.time() - state["created_at"] > 15:
+                # The supervisor records its group after taking the lease, so it has died rather
+                # than not started yet, and so may the guard that would stop the group.
+                group = directory / "group.json"
+                if state["status"] not in TERMINAL and (
+                    group.exists() or time.time() - state["created_at"] > 15
+                ):
+                    if group.exists():
+                        stop_survivors(read_json(group))
                     state.update(
                         status="failed",
                         error="Supervisor exited or host restarted",
@@ -337,6 +346,73 @@ def stop(guard, worker):
         time.sleep(0.02)
 
 
+def owned(pid, group, token):
+    """Whether live process `pid` is in process group `group` and carries the job's token."""
+    proc = Path("/proc", str(pid))
+    try:
+        stat = (proc / "stat").read_bytes()
+        fields = stat[stat.rindex(b")") + 2 :].split()
+        return (
+            fields[0] not in (b"Z", b"X")
+            and int(fields[2]) == group
+            and f"VM_JOB_TOKEN={token}".encode() in (proc / "environ").read_bytes().split(b"\0")
+        )
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def pidfd(number, *arguments):
+    """Linux pidfd system call `number` (the same on every architecture) through libc.
+
+    Some Python builds lack os.pidfd_open and signal.pidfd_send_signal, so call the kernel directly.
+    """
+    import ctypes
+
+    result = ctypes.CDLL(None, use_errno=True).syscall(number, *arguments)
+    if result < 0:
+        raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+    return result
+
+
+PIDFD_OPEN, PIDFD_SEND_SIGNAL = 434, 424
+
+
+def stop_survivors(record, timeout=5):
+    """SIGKILL what remains of a dead supervisor's job group and wait for it to exit.
+
+    The group ID alone may name a reused group, so only members whose environment carries the
+    job's token count, and each is checked and signalled through a pidfd, which cannot follow a
+    reused process ID. Linux only; elsewhere the guard is the only thing that stops the group.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    group, token = record["pgid"], record["token"]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        handles = []
+        for pid in (int(name) for name in os.listdir("/proc") if name.isdigit()):
+            if not owned(pid, group, token):
+                continue
+            try:
+                handle = pidfd(PIDFD_OPEN, pid, 0)
+            except OSError:
+                continue
+            try:
+                # Rechecked now that the handle pins the process the signal will reach.
+                if owned(pid, group, token):
+                    pidfd(PIDFD_SEND_SIGNAL, handle, signal.SIGKILL, None, 0)
+                    handles.append(handle)
+                    continue
+            except OSError:
+                pass
+            os.close(handle)
+        if not handles:
+            return
+        for handle in handles:
+            select.select([handle], [], [], max(0, deadline - time.monotonic()))
+            os.close(handle)
+
+
 def supervise(job_directory, identity):
     directory = Path(job_directory)
     if not valid_job_directory(directory):
@@ -380,6 +456,7 @@ def supervise(job_directory, identity):
                     VM_CONFIG_SHA256=identity,
                     PYTHONUNBUFFERED="1",
                     OMP_NUM_THREADS="2",
+                    VM_JOB_TOKEN=secrets.token_hex(16),
                 )
                 arguments = [
                     *settings.runner,
@@ -394,6 +471,12 @@ def supervise(job_directory, identity):
                 )
                 if guard.stdout.read(1) != b"+":
                     raise RuntimeError("Cannot start the process group guard")
+                # Lets status reconciliation find the group's survivors should the guard and then
+                # the supervisor die.
+                atomic_json(
+                    directory / "group.json",
+                    {"pgid": guard.pid, "token": environment["VM_JOB_TOKEN"]},
+                )
                 # Inherit the GPU lease so a supervisor crash cannot release it while rendering.
                 try:
                     child = spawn(
@@ -406,6 +489,7 @@ def supervise(job_directory, identity):
                     raise RuntimeError(
                         f"Cannot start the configured runner {settings.runner[0]}: {error}"
                     ) from None
+                guard_lost = False
                 while child.poll() is None:
                     if (directory / "cancel").exists():
                         signal_group(guard.pid, signal.SIGTERM)
@@ -414,7 +498,12 @@ def supervise(job_directory, identity):
                         except subprocess.TimeoutExpired:
                             pass
                         break
-                    time.sleep(0.2)
+                    # The guard's output closes only when it exits. Without it a supervisor death
+                    # would strand the group, so stop the job while the unreaped guard still
+                    # reserves the group ID.
+                    if select.select([guard.stdout], [], [], 0.2)[0]:
+                        guard_lost = True
+                        break
                 # Helpers left in the group, whatever the worker's exit, die before any result.
                 stop(guard, child)
                 # A cancel arriving after the worker finished must not discard its result.
@@ -422,6 +511,12 @@ def supervise(job_directory, identity):
                     state["status"] = "completed"
                 elif (directory / "cancel").exists():
                     state["status"] = "cancelled"
+                elif guard_lost:
+                    state.update(
+                        status="failed",
+                        error=f"Process group guard exited unexpectedly (code {guard.returncode});"
+                        " the job's processes were stopped",
+                    )
                 else:
                     error = f"Worker exited with code {child.returncode}"
                     try:
