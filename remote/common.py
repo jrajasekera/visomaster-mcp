@@ -21,7 +21,7 @@ LAYOUT_NAMES = ("settings", "common", "swapper", "face_editor", "denoiser")
 LEGACY = {"VM_BASE": "base", "VM_APP": "app", "VM_STATE": "state", "VM_GPU": "gpu"}
 JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 TERMINAL = {"completed", "failed", "cancelled"}
-# GPU admission class of each job kind (DESIGN.md, GPU scheduling); a request's `priority`
+# GPU admission class of each job kind (docs/explanation/gpu-scheduling.md); a request's `priority`
 # overrides it. A GPU kind missing here is scheduled as DEFAULT_PRIORITY. Normalization never
 # waits for the GPU and has no class.
 PRIORITIES = {
@@ -77,7 +77,8 @@ THRESHOLDS = {
     "outlier_similarity": (float, 0, 100),
 }
 MAX_REFERENCES = 20
-# Variant comparisons (DESIGN.md, Variant comparisons): bounded so a request cannot schedule a sweep.
+# Variant comparisons (docs/explanation/video-processing.md, Variant comparisons): bounded so a
+# request cannot schedule a sweep.
 COMPARE_KEYS = {
     "kind",
     "media_path",
@@ -180,8 +181,8 @@ QUALIFICATIONS = (
         "max_sources": 1,
     },
 )
-# Render segments (DESIGN.md, Segments). Selections that load models or choose the detection path
-# hold for the whole render, so a segment cannot set them.
+# Render segments (docs/explanation/video-processing.md, Segments). Selections that load models or
+# choose the detection path hold for the whole render, so a segment cannot set them.
 MAX_SEGMENTS = 100
 SEGMENT_CHANGES = ("mappings", "parameters", "controls")
 SEGMENT_KEYS = {"id", "start_frame", "end_frame", "passthrough", *SEGMENT_CHANGES}
@@ -267,7 +268,7 @@ def load_config(path=None):
     except FileNotFoundError:
         raise ConfigError(
             f"Remote configuration not found at {path}; create it from "
-            "config/remote-config.example.json (see README, Remote configuration)"
+            "config/remote-config.example.json (see docs/reference/configuration.md)"
         ) from None
     except (OSError, ValueError) as error:
         raise ConfigError(f"{path}: cannot read JSON ({error})") from None
@@ -307,7 +308,7 @@ def load_config(path=None):
     if not isinstance(runner, list) or not runner or not all(isinstance(a, str) for a in runner):
         raise ConfigError(
             f"{path}: runner is required: a path, or a list of arguments whose first element "
-            "is an absolute executable (see README, Runner)"
+            "is an absolute executable (see docs/reference/configuration.md, Runner)"
         )
     program = Path(runner[0])
     if not program.is_absolute() or not program.is_file() or not os.access(program, os.X_OK):
@@ -446,7 +447,8 @@ def input_path(value):
 
 
 # Digests a job's supervisor took before GPU admission, keyed by the file's identity and times,
-# so its worker reuses them for unchanged files (DESIGN.md, Checkpoints). None elsewhere.
+# so its worker reuses them for unchanged files (docs/explanation/video-processing.md,
+# Checkpoints). None elsewhere.
 DIGESTS = None
 
 
@@ -1437,8 +1439,9 @@ def provenance_changes(recorded, current):
     return found
 
 
-# Render checkpoints (DESIGN.md, Checkpoints): validated chunks committed by a versioned
-# manifest, which records the provenance a resumed attempt must match before it reuses them.
+# Render checkpoints (docs/explanation/video-processing.md, Checkpoints): validated chunks
+# committed by a versioned manifest, which records the provenance a resumed attempt must match
+# before it reuses them.
 CHECKPOINT_FORMAT, CHECKPOINT_VERSION = "visomaster-checkpoint", 1
 CHECKPOINT_KEYS = {
     "format",

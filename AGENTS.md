@@ -3,7 +3,8 @@
 ## Orientation
 
 This project exposes the existing VisoMaster Fusion installation through MCP for
-Claude and Codex. Read `README.md` for setup, `DESIGN.md` for architecture, and
+Claude and Codex. Read `README.md` for an overview and the map of `docs/`,
+`docs/how-to/install.md` for setup, `docs/explanation/` for architecture, and
 `VERIFICATION.md` for dated evidence and coverage gaps. Check `git status` before
 editing and preserve unrelated work. Treat the current code and runtime as the
 source of truth when documentation or earlier test results differ.
@@ -27,6 +28,7 @@ source of truth when documentation or earlier test results differ.
 | `tests/test_protocol.py` | Actual stdio initialization, tool schemas and discovery |
 | `tests/test_server.py` | Stdio tool calls through a local SSH shim: transfers, artifacts, remote errors |
 | `config/` | Client, remote configuration and runner examples (placeholders only) |
+| `README.md`, `docs/` | User documentation, organised as tutorials, how-to guides, reference and explanation |
 
 The client package uses Python 3.11 or newer and the official MCP Python SDK 1.x.
 Use `uv` and the committed `uv.lock`. Keep GPU dependencies inside the
@@ -51,7 +53,8 @@ intended hardware.
 
 - Never commit identifying values: usernames, home or checkout paths, host
   aliases and addresses, workstation mount layouts, hardware model names,
-  serials, job IDs or release names. Use the placeholders in `README.md`.
+  serials, job IDs or release names. Use the placeholders listed in
+  `docs/how-to/install.md`.
 - Run `uv run --locked python scripts/privacy_audit.py` before committing. Keep
   local patterns in `$(git rev-parse --git-common-dir)/info/privacy-patterns`.
 - Record verification evidence with descriptive run labels and hardware class
@@ -67,7 +70,8 @@ intended hardware.
   with `shlex.join`, and send structured control payloads through stdin.
 - Preserve tool names, schemas, structured responses and inline image results
   used by both clients. When the tool set changes, update discovery assertions
-  in `tests/test_protocol.py` and the tool list in `README.md`.
+  in `tests/test_protocol.py` and the tool reference in `docs/reference/tools.md`
+  (and the tool count in `README.md`).
 - Validate settings against the explicit allowlists and installed metadata.
   Resolve media and artifact paths within their configured roots, including
   symlink checks. Stream large transfers and publish complete files atomically.
@@ -132,7 +136,8 @@ After deployment, confirm `health_check` reports `code_matches: true` and run th
 checks appropriate to the changed behavior.
 
 Read the actual client configuration before changing registration. Preserve
-existing server entries and use the setup commands or examples in `README.md`.
+existing server entries and use the setup commands or examples in
+`docs/how-to/register-a-client.md`.
 Treat its historical registration notes as dated evidence and verify current
 configuration when troubleshooting a connection.
 

@@ -228,8 +228,8 @@ def list_jobs(only_status=None, only_kind=None, limit=50):
     return jobs
 
 
-# GPU scheduling (DESIGN.md, GPU scheduling). Each GPU's queue lives beside its lock in the lock
-# directory, so every deployment sharing that directory shares one queue and one decision.
+# GPU scheduling (docs/explanation/gpu-scheduling.md). Each GPU's queue lives beside its lock in
+# the lock directory, so every deployment sharing that directory shares one queue and one decision.
 MAX_STREAK = 3  # Interactive admissions in a row ahead of waiting normal work before it is due.
 AGE_LIMIT = 300  # Seconds after the first of them at which waiting normal work is due anyway.
 ENTRY = {
@@ -528,7 +528,7 @@ def submit(request):
     return status(job_id)
 
 
-# Resumed renders (DESIGN.md, Checkpoints).
+# Resumed renders (docs/explanation/video-processing.md, Checkpoints).
 RESUME_KEYS = {"job_id", "from_job_id", "priority"}
 CHUNK_NAME = re.compile(r"[0-9]{5}\.(mp4|json)")
 
@@ -637,7 +637,8 @@ def resume_render(request):
 def hashed_inputs(request):
     """Whether a job's worker hashes large files before Fusion loads: a render its provenance
     (media, references, models, adapter code) and any inherited chunks, a recipe job its media.
-    Its supervisor hashes them before the job joins the GPU queue (DESIGN.md, Checkpoints)."""
+    Its supervisor hashes them before the job joins the GPU queue
+    (docs/explanation/video-processing.md, Checkpoints)."""
     try:
         if request.get("kind") == "render":
             return bool(recorded_inputs(request))
@@ -1366,9 +1367,10 @@ def health():
     }
 
 
-# Preflight (DESIGN.md, Preflight). Cheap checks read files and run FFprobe, git and nvidia-smi
-# only: no Fusion import, model loading, GPU lock or job. The optional GPU stage queues ordinary
-# reference-analysis jobs. A preflight reserves nothing; submission revalidates everything.
+# Preflight (docs/explanation/reproducibility.md, Preflight). Cheap checks read files and run
+# FFprobe, git and nvidia-smi only: no Fusion import, model loading, GPU lock or job. The optional
+# GPU stage queues ordinary reference-analysis jobs. A preflight reserves nothing; submission
+# revalidates everything.
 SEVERITY = {
     "passed": "info",
     "not_checked": "info",
@@ -1810,7 +1812,10 @@ def well_formed(request):
 
 
 def preflight(payload):
-    """Request-specific readiness of a submit_swap request without starting it (README)."""
+    """Request-specific readiness of a submit_swap request without starting it.
+
+    See docs/reference/preflight-checks.md.
+    """
     request = payload.get("request")
     if not isinstance(request, dict) or request.get("kind") not in ("preview", "render"):
         raise ValueError("preflight checks a submit_swap request: kind preview or render")
@@ -1841,7 +1846,7 @@ def preflight(payload):
     if reason:
         action = act(
             "Return the Fusion checkout to the supported revision without tracked changes, or "
-            "qualify the adapter for the new one (README, Fusion revision guard)"
+            "qualify the adapter for the new one (docs/how-to/test-and-qualify.md)"
         )
         checks.append(
             finding("fusion_revision", "blocked", "fusion_incompatible", reason, evidence, [action])
@@ -2133,7 +2138,8 @@ def upload(upload_id, suffix, expected_size):
     return {"path": str(destination), "bytes": size, "sha256": digest.hexdigest(), "reused": False}
 
 
-# Recipes (DESIGN.md, Recipes): immutable revisions in <state>/recipes/<name>/<revision>.json.
+# Recipes (docs/explanation/reproducibility.md, Recipes): immutable revisions in
+# <state>/recipes/<name>/<revision>.json.
 RECIPE_FORMAT, RECIPE_VERSION = "visomaster-recipe", 1
 RECIPE_KEYS = {
     "format",

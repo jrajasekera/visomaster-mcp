@@ -1731,7 +1731,7 @@ BOUNDARIES = (
 
 
 class Segments:
-    """A render's segment plan applied frame by frame (DESIGN.md, Segments).
+    """A render's segment plan applied frame by frame (docs/explanation/video-processing.md).
 
     A frame's run follows from its index alone. Entering a run other than passthrough binds its
     mappings with their parameters and the segment's overrides, sets its controls and the
@@ -1926,7 +1926,7 @@ class Encoder:
         self.path.unlink()
 
 
-# Render checkpoints (DESIGN.md, Checkpoints).
+# Render checkpoints (docs/explanation/video-processing.md, Checkpoints).
 CHUNK_FRAMES = 250  # Source frames per chunk; libx264's default keyframe interval.
 CHUNKING = (
     "Chunk n holds source frames [start_frame + n * chunk_frames, start_frame + (n + 1) * "
@@ -1955,7 +1955,9 @@ CODEC_KEYS = (
 
 
 class Checkpoint:
-    """A render's validated chunks and the manifest that commits them (DESIGN.md, Checkpoints).
+    """A render's validated chunks and the manifest that commits them.
+
+    See docs/explanation/video-processing.md, Checkpoints.
 
     Each chunk is published after its frame count, timing and codec parameters are checked,
     with the render's accounting after its last frame. A resumed attempt starts from a copy of
@@ -2366,7 +2368,7 @@ def encode_range(request, directory, worker, name, observe=None, progress=None, 
     )
 
 
-# Variant comparisons (DESIGN.md, Variant comparisons).
+# Variant comparisons (docs/explanation/video-processing.md, Variant comparisons).
 COMPARE_VERSION = 1
 COMPARE_TILE = 480  # Grid cells fit a display-aspect thumbnail in this square.
 COMPARE_COLUMNS = 4
@@ -2824,14 +2826,14 @@ def run(directory):
             raise RuntimeError("Supervisor disappeared before worker startup") from None
         raise RuntimeError(
             "The configured runner must exec the Fusion Python interpreter so the worker is "
-            "the supervisor's direct child (see README, Runner)"
+            "the supervisor's direct child (see docs/reference/configuration.md, Runner)"
         )
     if CONFIG_ERROR:
         raise RuntimeError(CONFIG_ERROR)
     if SETTINGS.sha256 != os.environ.get("VM_CONFIG_SHA256"):
         raise RuntimeError("Remote configuration changed after submission; resubmit the job")
     # Hashes the supervisor took before admission stand for files whose identity and times are
-    # unchanged; any other file is hashed here (DESIGN.md, Checkpoints).
+    # unchanged; any other file is hashed here (docs/explanation/video-processing.md, Checkpoints).
     if (directory / "digests.json").exists():
         common.DIGESTS = read_json(directory / "digests.json")
     # Inputs resolved at submission, which retention protects; older jobs keep the raw request.
@@ -2845,7 +2847,8 @@ def run(directory):
     expected, checkpoint, digest = request.get("media_sha256"), None, None
     if request["kind"] == "render":
         # A render records its provenance with its chunks before Fusion loads, and a resumed
-        # attempt must match the earlier attempt's (DESIGN.md, Checkpoints).
+        # attempt must match the earlier attempt's (docs/explanation/video-processing.md,
+        # Checkpoints).
         atomic_json(directory / "progress.json", {"stage": "fingerprinting"})
         record = provenance(request)
         digest = record["inputs"]["media_path"]["sha256"]
