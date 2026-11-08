@@ -14,6 +14,7 @@ import test_jobs
 import test_preflight
 import test_recipes
 from test_cancel import until, wait_for
+from test_retention import OLD, completed_job
 from test_scheduling import gpu_held
 
 library, site, worker = test_preflight.library, test_preflight.site, test_recipes.worker
@@ -173,3 +174,44 @@ def test_worker_refuses_segments_past_the_end_before_models_load(worker, library
     with pytest.raises(ValueError, match="outside the rendered frames"):
         engine.run(worker.job)
     assert worker.loaded == []
+
+
+# Retention of resumable renders and hard-linked chunks (findings 3 and 4)
+
+
+def stopped_render(job_id, media, status="failed", checkpoint=True):
+    job = common.job_path(job_id)
+    (job / "artifacts").mkdir(parents=True)
+    request = {"kind": "render", "media_path": str(media)}
+    for name in ("request.json", "resolved.json"):
+        common.atomic_json(job / name, request)
+    state = {"job_id": job_id, "status": status, "created_at": 0, "finished_at": OLD}
+    common.atomic_json(job / "state.json", state)
+    if checkpoint:
+        (job / "checkpoint/chunks").mkdir(parents=True)
+        common.atomic_json(job / "checkpoint/manifest.json", {})
+    return job
+
+
+def test_inputs_of_resumable_renders_are_kept(jobs_backend):
+    media = completed_job("producer", OLD)
+    upload = common.STATE / "uploads" / ("a" * 64 + ".mp4")
+    upload.parent.mkdir(parents=True)
+    upload.write_bytes(b"u")
+    os.utime(upload, (OLD, OLD))
+    stopped_render("failed", media)
+    stopped_render("cancelled", upload, status="cancelled")
+    stopped_render("plain", completed_job("unprotected", OLD), checkpoint=False)
+    with pytest.raises(ValueError, match="resumable failed or cancelled render"):
+        control.delete_job("producer")
+    preview = control.prune(0, dry_run=True)
+    assert "producer" not in [entry["job_id"] for entry in preview["jobs"]]
+    assert str(upload) not in [entry["path"] for entry in preview["uploads"]]
+    # The renders themselves stay prunable, and a render without a checkpoint protects nothing.
+    assert {"failed", "cancelled", "plain", "unprotected"} <= {
+        entry["job_id"] for entry in preview["jobs"]
+    }
+    control.delete_job("failed")
+    control.delete_job("cancelled")
+    assert control.delete_job("producer")["deleted"]
+    assert str(upload) in [entry["path"] for entry in control.prune(0, dry_run=True)["uploads"]]

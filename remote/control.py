@@ -1061,7 +1061,8 @@ def request_paths(request):
 
 
 def active_references():
-    """Inputs of queued/running jobs as resolved at submission; callers hold the retention lock.
+    """Inputs of queued/running jobs as resolved at submission, and of failed or cancelled
+    renders that keep a checkpoint, which resume_render repeats; callers hold the retention lock.
 
     None means unknown: an active job without resolved.json (submitted by an earlier release)
     may have resolved an alias differently, so nothing that could be an input is removable.
@@ -1071,10 +1072,15 @@ def active_references():
         if not (directory / "request.json").exists():
             continue  # Not a job, or deleted.
         try:
-            if current(directory)["status"] in TERMINAL:
-                continue
+            status = current(directory)["status"]
         except (OSError, ValueError, KeyError, TypeError):
-            pass  # Unreadable state counts as active.
+            status = None  # Unreadable state counts as active.
+        if status in TERMINAL:
+            if status != "completed" and (directory / "checkpoint" / "manifest.json").is_file():
+                # Resumable while it is kept; without a readable request it cannot be resumed.
+                with contextlib.suppress(OSError, ValueError, AttributeError):
+                    referenced |= request_paths(read_json(directory / "resolved.json"))
+            continue
         try:
             referenced |= request_paths(read_json(directory / "resolved.json"))
         except (OSError, ValueError, AttributeError):
@@ -1133,7 +1139,8 @@ def claim_job(directory, referenced, cutoff=None, remove=False):
         # Artifacts such as normalized media or face crops can be another job's input.
         if protected(directory, referenced):
             raise ValueError(
-                "A queued or running job or a saved recipe uses this job's artifacts as input"
+                "A queued or running job, a resumable failed or cancelled render or a saved "
+                "recipe uses this job's artifacts as input"
             )
         entry = {
             "job_id": directory.name,
