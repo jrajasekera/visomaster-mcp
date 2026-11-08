@@ -57,6 +57,10 @@ The full validation rules are in [Segments](../reference/tools.md#segments). Pre
   `swapped_frames`.
 - The `plan.json` artifact records each segment as given, the frames it `applied` to, whether
   it was `clipped`, and the effective settings of every run.
+- In the swap report, each mapping's `threshold` stays its base value. Its
+  `segment_thresholds` lists the runs that matched it with another `SimilarityThresholdSlider`,
+  so `below_threshold` frames inside a stricter segment can be read against that segment's
+  threshold.
 - A segment that requested swaps and swapped none gives the warning `segment_never_swapped`.
 - The render fails if no face swaps in any frame outside passthrough segments.
 

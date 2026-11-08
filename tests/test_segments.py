@@ -236,6 +236,49 @@ def test_settings_apply_to_exactly_their_frames(fusion):
     assert worker.telemetry.thresholds == {"0": 60.0, "1": 60.0}
 
 
+def apply_segments(fusion, segments, start, end):
+    """Process frames [start, end) of near-A and B faces through a plan; return the report."""
+    worker = engine.make_worker(fusion.window)
+    plan = engine.Segments(worker, common.segment_plan(segments, start, end, 2))
+    for frame in range(start, end):
+        fusion.scenes[frame] = [person([1.0, 1.0, 0.0]), person(B)]  # 85.36 against A.
+        number = plan.at(frame)
+        swaps = worker.swap_count
+        engine.process(worker, Image(), frame)
+        plan.count(number, worker.swap_count - swaps)
+    worker.telemetry.finish(end)
+    return engine.swap_report(swap_request(), worker.telemetry, None, start, plan)
+
+
+def test_report_gives_each_mappings_segment_thresholds(fusion):
+    strict = {"SimilarityThresholdSlider": 90}
+    segments = [
+        segment("strict", 2, 4, parameters=strict),
+        segment("only-b", 4, 6, mappings=[1], parameters={"SimilarityThresholdSlider": 70}),
+        segment("same", 6, 7, parameters={"SimilarityThresholdSlider": 60}),
+    ]
+    first, second = apply_segments(fusion, segments, 1, 8)["mappings"]
+    # The base threshold stays; runs that applied another one are listed, gaps are not.
+    assert first["threshold"] == second["threshold"] == 60.0
+    assert first["frames"]["below_threshold"] == 2  # Frames 2 and 3, under strict's 90.
+    assert first["segment_thresholds"] == [
+        {"segment": "strict", "start_frame": 2, "end_frame": 4, "threshold": 90.0}
+    ]
+    assert second["segment_thresholds"] == [
+        {"segment": "strict", "start_frame": 2, "end_frame": 4, "threshold": 90.0},
+        {"segment": "only-b", "start_frame": 4, "end_frame": 6, "threshold": 70.0},
+    ]
+
+
+def test_never_swapped_warning_cites_the_threshold_applied_at_the_best_frame(fusion):
+    strict = {"SimilarityThresholdSlider": 90}
+    report = apply_segments(fusion, [segment("strict", 3, 8, parameters=strict)], 3, 8)
+    first = report["mappings"][0]
+    assert first["frames"]["below_threshold"] == 5 and first["frames"]["swapped"] == 0
+    assert [(w["mapping"], w["code"]) for w in report["warnings"]] == [(0, "never_swapped")]
+    assert "best observed score 85.36 against threshold 90" in report["warnings"][0]["message"]
+
+
 def swap_request():
     return {
         "kind": "render",
@@ -400,6 +443,8 @@ def test_multi_shot_render_keeps_the_timeline_and_passthrough_pixels(media, tmp_
     assert first["frames"]["not_requested"] == 7 and first["frames"]["requested"] == 15
     assert second["frames"]["not_requested"] == 4 and second["coverage"]["requested"] == 1.0
     assert first["intervals"] == [] and second["intervals"] == []
+    intro = {"segment": "intro", "start_frame": 3, "end_frame": 6, "threshold": 75.0}
+    assert first["segment_thresholds"] == second["segment_thresholds"] == [intro]
 
 
 def test_a_render_ending_inside_a_segment_has_no_missing_or_extra_frames(
@@ -488,3 +533,16 @@ def test_submit_swap_sends_segments_only_when_given(monkeypatch):
         )
     )
     assert sent[-1]["segments"][1]["passthrough"] is True
+
+
+def test_never_swapped_warning_without_scores_ignores_segment_thresholds():
+    telemetry = engine.Telemetry({"0": 60.0})
+    for frame in range(3):
+        feed(telemetry, frame, 1)  # A face that never reached matching.
+    telemetry.finish(3)
+    run = {"segment": "strict", "start_frame": 0, "end_frame": 3, "threshold": 90.0}
+    plan = SimpleNamespace(overrides=lambda: {"0": [run]})
+    request = {**swap_request(), "mappings": swap_request()["mappings"][:1]}
+    report = engine.swap_report(request, telemetry, None, 0, plan)
+    assert report["mappings"][0]["segment_thresholds"] == [run]
+    assert "no face reached matching" in report["warnings"][0]["message"]

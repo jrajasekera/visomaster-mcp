@@ -94,6 +94,20 @@ matching observed:
 | `not_swapped` | A face matched this mapping best, but Fusion swapped no face for it |
 | `not_requested` | The mapping was not requested in this frame (passthrough segments, or segments that leave it out). Excluded from every denominator |
 
+Each mapping's `threshold` is its base `SimilarityThresholdSlider`, the one used outside
+segments. Every frame is classified with the threshold applied in that frame. In a render with
+segments, `segment_thresholds` lists each run that matched the mapping with a different
+threshold, as `segment`, `start_frame`, `end_frame` (half-open) and `threshold`. The list is
+empty when no segment changed the mapping's threshold, and in previews. The `never_swapped`
+warning compares the best unswapped score with the threshold applied in that frame.
+
+```json
+"threshold": 60.0,
+"segment_thresholds": [
+  {"segment": "profile", "start_frame": 120, "end_frame": 180, "threshold": 75.0}
+]
+```
+
 ### Coverage and scores
 
 - Coverage is given against explicit denominators: all requested frames, frames with detected
@@ -147,6 +161,9 @@ For a render with `segments`:
   parameters it used.
 - The result and the swap report carry `plan.runs`: each run with its `frames`, `swaps` and
   `swapped_frames`.
+- Each swap-report mapping lists in `segment_thresholds` the runs whose
+  `SimilarityThresholdSlider` differed from its base `threshold` (see
+  [Swap reports](#swap-reports)).
 - Progress records name the current `segment`.
 
 ## Checkpoints

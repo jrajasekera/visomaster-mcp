@@ -1339,7 +1339,7 @@ def frame_times(frame, fps, start):
     return round(float(frame / fps), 6), round(float((frame - start) / fps), 6)
 
 
-def mapping_report(index, mapping, stats, fps, start):
+def mapping_report(index, mapping, stats, fps, start, segment_thresholds=()):
     frames = dict(stats.frames)
     requested = sum(frames.values()) - frames["not_requested"]
     with_faces = requested - frames["no_faces"]
@@ -1365,6 +1365,7 @@ def mapping_report(index, mapping, stats, fps, start):
         "mapping": index,
         "target_face": mapping["target_face"],
         "threshold": stats.threshold,
+        "segment_thresholds": list(segment_thresholds),
         "expected_visible": [list(r) for r in stats.ranges],
         "frames": {
             "requested": requested,
@@ -1393,15 +1394,22 @@ def mapping_report(index, mapping, stats, fps, start):
     }
 
 
+def threshold_at(m, frame):
+    """The threshold a mapping report's mapping was matched with at source frame `frame`."""
+    runs = m["segment_thresholds"]
+    found = (run["threshold"] for run in runs if run["start_frame"] <= frame < run["end_frame"])
+    return next(found, m["threshold"])
+
+
 def report_warnings(mappings):
     """Advisory per-mapping warnings; they never change the job's terminal state."""
     found = []
     for m in mappings:
         index, frames = m["mapping"], m["frames"]
         if frames["requested"] and not frames["swapped"]:
-            best = m["scores"]["best_unswapped"]
+            best, frame = m["scores"]["best_unswapped"], m["scores"]["best_unswapped_frame"]
             detail = (
-                f"best observed score {best:g} against threshold {m['threshold']:g}"
+                f"best observed score {best:g} against threshold {threshold_at(m, frame):g}"
                 if best is not None
                 else "no face reached matching"
             )
@@ -1431,13 +1439,15 @@ def report_warnings(mappings):
     return found
 
 
-def swap_report(request, telemetry, fps, start):
-    """The versioned swap report of a successful preview or render (review images added later)."""
+def swap_report(request, telemetry, fps, start, plan=None):
+    """The versioned swap report of a successful preview or render (review images added later).
+    A render's segment plan gives the runs that matched a mapping with another threshold."""
     options = request.get("report") or {}
-    mappings = [
-        mapping_report(index, mapping, telemetry.mappings[str(index)], fps, start)
-        for index, mapping in enumerate(request["mappings"])
-    ]
+    overrides = plan.overrides() if plan else {}
+    mappings = []
+    for index, mapping in enumerate(request["mappings"]):
+        stats, runs = telemetry.mappings[str(index)], overrides.get(str(index), ())
+        mappings.append(mapping_report(index, mapping, stats, fps, start, runs))
     path = "sequential" if telemetry.sequential else "per_frame"
     return {
         "version": REPORT_VERSION,
@@ -1782,6 +1792,19 @@ class Segments:
             thresholds[face_id] = float(values["SimilarityThresholdSlider"])
         if self.worker.detector is not None:
             self.worker.detector.reset_state()
+
+    def overrides(self):
+        """{mapping ID: [runs that matched it with a threshold other than its base one]}.
+        Passthrough runs bind no mapping, so they never appear."""
+        found = {}
+        for run in self.runs:
+            for face_id, values in self.settings(run)[1].items():
+                threshold = float(values["SimilarityThresholdSlider"])
+                if threshold != self.thresholds[face_id]:
+                    keys = ("segment", "start_frame", "end_frame")
+                    entry = {**{key: run[key] for key in keys}, "threshold": threshold}
+                    found.setdefault(face_id, []).append(entry)
+        return found
 
     def count(self, number, swaps):
         stats = self.stats[number]
@@ -2321,7 +2344,7 @@ def encode_range(request, directory, worker, name, observe=None, progress=None, 
             + (" outside passthrough segments" if plan else "")
         )
     telemetry.finish(end)
-    report = swap_report(request, telemetry, fps, start)
+    report = swap_report(request, telemetry, fps, start, plan)
     if plan:
         report["plan"] = {"artifact": "plan.json", "runs": plan.summary()}
         report["warnings"] += plan.warnings()
