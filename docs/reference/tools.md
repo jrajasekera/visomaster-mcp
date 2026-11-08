@@ -192,7 +192,7 @@ groups faces into `identities`. Both write `contact.jpg` when any face is found.
 | --- | --- | --- | --- |
 | `references` | list of strings | | 1–20 image paths |
 | `swap_model` | string | Fusion's default swap model | The `SwapModelSelection` whose ArcFace embedding is compared |
-| `thresholds` | object | | Optional `min_face_pixels` (1–4096, default 112), `min_sharpness` (0–1,000,000, default 40), `duplicate_similarity` (50–100, default 95), `outlier_similarity` (0–100, default 60) |
+| `thresholds` | object | | Optional `min_face_pixels` (1–4096, default 112), `min_sharpness` (0–1,000,000, default 40), `duplicate_similarity` (50–100, default 95), `outlier_similarity` (0–100, default 70, or 85 when the swap model uses the CSCS recognizer) |
 | `controls` | object | | The same detector controls as `submit_swap` |
 | `job_id` | string | generated | |
 | `priority` | string | `interactive` | |

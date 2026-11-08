@@ -165,6 +165,9 @@ scale, so it combines blur and small size. It is computed in plain Python on tha
 - embedding similarity at or above `duplicate_similarity` marks near duplicates;
 - a leave-one-out score against the normalized mean of the others marks outliers.
 
+The outlier default is set per recognizer: the recognizers place the same and different people
+on different parts of the similarity scale, so Fusion's matching default does not fit them.
+
 With fewer than three distinct usable references no outlier is named, because a disagreement
 between two cannot be attributed to either.
 

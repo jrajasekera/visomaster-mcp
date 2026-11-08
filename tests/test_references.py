@@ -30,11 +30,18 @@ NEAR_A = [0.95, 0.31, 0.0, 0.0]  # Scores 97.5 against A: nearly the same image.
 OTHER_VIEW = [0.8, 0.0, 0.6, 0.0]  # Scores 90 against A: the same person, another photo.
 SOFT = [0.6, 0.6, 0.5, 0.0]
 STRANGER = [0.0, 0.0, 0.0, 1.0]  # Scores 50 against every other reference.
+# Another person who scores 64.2 against the mean of A and OTHER_VIEW: like the unrelated
+# synthetic faces (62-64) that Fusion's matching default of 60 let through.
+LOOKALIKE = [0.3, 0.0, 0.0, math.sqrt(1 - 0.3**2)]
 SPECS = {
     "SimilarityThresholdSlider": {"default": 60, "min_value": "1", "max_value": "100"},
     "SwapModelSelection": {"default": "Inswapper128", "options": ["Inswapper128", "SimSwap512"]},
 }
-MODELS = {"Inswapper128": "Inswapper128ArcFace", "SimSwap512": "SimSwapArcFace"}
+MODELS = {
+    "Inswapper128": "Inswapper128ArcFace",
+    "SimSwap512": "SimSwapArcFace",
+    "CSCS": "CSCSArcFace",
+}
 
 
 class Vector(list):
@@ -196,7 +203,7 @@ def test_collection_reports_every_reference_without_removing_any(fusion):
         "min_face_pixels": 112,
         "min_sharpness": 40.0,
         "duplicate_similarity": 95.0,
-        "outlier_similarity": 60,
+        "outlier_similarity": 70.0,
     }
     assert {"face_pixels", "sharpness", "similarity"} <= result["metrics"].keys()
     assert "squared luma levels" in result["metrics"]["sharpness"]
@@ -288,6 +295,33 @@ def test_thresholds_are_configurable_and_reported(fusion):
     scores = [e["consistency_score"] for e in result["references"]]
     assert scores[2] < 92 <= min(scores[:2])
     assert [codes(e) for e in result["references"]] == [[], [], ["outlier"]]
+
+
+def test_default_outlier_threshold_flags_a_lookalike_and_follows_the_recognizer(fusion):
+    paths = [
+        fusion.add("a.png", Image(face(A))),
+        fusion.add("other-view.png", Image(face(OTHER_VIEW))),
+        fusion.add("lookalike.png", Image(face(LOOKALIKE))),
+    ]
+    result = analyze(fusion, paths)
+    # The calibrated default sits above different-person scores, so the lookalike that the
+    # former default of 60 missed is flagged, and the two photos of one person are not.
+    assert [e["consistency_score"] for e in result["references"]] == [84.9, 82.2, 64.2]
+    assert [codes(e) for e in result["references"]] == [[], [], ["outlier"]]
+    assert result["thresholds"]["outlier_similarity"] == 70.0
+    # Each recognizer scores on its own scale: CSCS rates different people far higher.
+    defaults = {
+        swap_model: analyze(fusion, paths, swap_model=swap_model)["thresholds"]
+        for swap_model in MODELS
+    }
+    assert {name: t["outlier_similarity"] for name, t in defaults.items()} == {
+        "Inswapper128": 70.0,
+        "SimSwap512": 70.0,
+        "CSCS": 85.0,
+    }
+    # A request's own value still wins.
+    custom = analyze(fusion, paths, swap_model="CSCS", thresholds={"outlier_similarity": 60})
+    assert [codes(e) for e in custom["references"]] == [[], [], []]
 
 
 def test_laplacian_variance_measures_sharpness():

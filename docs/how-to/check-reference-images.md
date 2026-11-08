@@ -41,9 +41,8 @@ Analysis never removes, edits or reorders images. Deciding what to drop is up to
 
 ## Tune the thresholds
 
-The default thresholds come from a small sample of face crops. Sharp crops measured about
-90–850 and the same crops blurred about 10–90. If the findings do not match what you see on the
-contact sheet, pass `thresholds` with your own values:
+If the findings do not match what you see on the contact sheet, pass `thresholds` with your own
+values. `result.thresholds` reports the values applied.
 
 ```json
 {"thresholds": {"min_face_pixels": 96, "min_sharpness": 25}}
@@ -54,7 +53,47 @@ contact sheet, pass `thresholds` with your own values:
 | `min_face_pixels` | 112 | `small_face` |
 | `min_sharpness` | 40 | `blurry` |
 | `duplicate_similarity` | 95 | `near_duplicate` |
-| `outlier_similarity` | 60 | `outlier`, `inconsistent_pair` |
+| `outlier_similarity` | 70; 85 for the `CSCSArcFace` recognizer (swap model `CSCS`) | `outlier`, `inconsistent_pair` |
+
+The defaults were calibrated on synthetic people: studio photos, face crops from generated
+video, and blurred, resized and relit copies. Expect real photos to differ somewhat.
+
+### Outlier scores
+
+With `Inswapper128ArcFace`, the recognizer of Fusion's default swap model:
+
+- Clear photos of one person scored 85–95 against the mean of the others. Video crops of one
+  person scored 68–93; the lowest were faces of about 100 pixels and children.
+- A different adult scored at most 66 against another person's references, and usually 50–61.
+  Photos of other people scored 55–66 against a person's photos, so the former default of 60
+  missed two in three of them.
+- Children are not separated: a child scored up to 77 against crops of another child, while
+  crops of one child scored as low as 68. Compare children's crops by eye.
+
+The `SimSwapArcFace` and `GhostArcFace` recognizers scored on the same scale. `CSCSArcFace`
+scores everyone higher: different people scored 64–83 against one person's photos, the same
+person 86–98, so its default is 85.
+
+In a small collection an intruder also pulls the others' scores down, because their mean
+includes it. When several references are flagged, the lowest score is the likeliest intruder;
+it was the lowest in over 99% of the measured sets. Adding more clear photos of the person makes
+the mean, and the scores, steadier.
+
+### Sharpness
+
+Sharpness measures the detail left at the 112-pixel scale the recognizer works at. Unaltered
+photos measured 329–555 and unaltered video crops (75–282 pixel faces) 74–382.
+
+Blur that is visible at full size can leave the recognizer's view intact. A 576-pixel face
+blurred with a Gaussian sigma of 6 measured 63 and still scored 96.5 against the original,
+like a re-saved copy. Copies kept a score of 95 or more against the original down to a
+sharpness of about 16 (sigma 12 at that size); at about 5 they scored 90, the score of another
+photo of the same person. The default of 40 lies below every unaltered face measured and flags
+faces that have lost detail at recognition scale.
+
+No threshold separates a softly blurred large photo from a clear small face: the sigma-6 photo
+(63) scored lower than a clear 95-pixel video crop (74). To flag visibly soft full-size photos
+too, raise `min_sharpness` to about 70 and expect small faces near it to be flagged as well.
 
 ## Use the results in the swap
 

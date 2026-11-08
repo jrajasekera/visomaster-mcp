@@ -254,3 +254,85 @@ Before the first deployment, the previous release rendered and previewed fixed r
 - Swap-report frames with no faces or dropouts were not exercised on the GPU; every frame of the two-person clip had a face.
 - The swap report shows each mapping's base threshold even where a segment overrides it, and a resumed render's progress briefly reports a low rate because reused frames count in its total. A resumed render whose source changed before it started advises re-analysis instead of a fresh render.
 - Native Claude and Codex UI sessions were not opened.
+
+# Reference-analysis calibration on 2026-11-08
+
+Calibrates the `analyze_references` defaults for `outlier_similarity` and `min_sharpness` (`vmcp-d84`), after the feature qualification above found that the outlier default of 60 missed unrelated faces at 62.0 and 64.0 and that a blurred copy at sharpness 57.9 was not flagged. Same hardware class (Maxwell, compute capability 5.2, 24 GB VRAM class), Fusion commit and detector (`Yolov8`, default controls) as above. Every measurement ran as an `analyze_references` job on the deployed release that preceded this change, through a stdio MCP client started from the checkout. The change alters only defaults, so the measured scores carry over.
+
+## Method
+
+All material was synthetic:
+
+- **Photos**: eight photos of one generated person (angles, expressions, lighting) and single photos of three other generated people, 1024 × 1024 with faces of 497–576 pixels.
+- **Video crops**: 42 face crops of 14 people (three frames each) cut with FFmpeg from boxes found by multi-frame `detect_faces` in seven generated 4K scenes and the two-person clip. Faces were 75–282 pixels; four of the people were children.
+- **Altered copies**: 46 copies with Gaussian blur (sigma 1–32 on full-size photos, 1–8 on video crops), downscales to 1/2–1/8, downscale then blur, downscale then re-enlarge, darkening, gamma, halved contrast and JPEG quality 31.
+
+Pairwise similarities came from analyses with `duplicate_similarity` 50: each reference then reports the first earlier reference scoring at least 50, which yields the first reference's row of the similarity matrix. 106 analyses of the 53 photos and crops in a circulant order covered all 1,378 pairs. 157 pairs scored below 50 and were clamped to 50; all were different people (photos against video crops), and clamping can only raise an intruder's score. Leave-one-out scores for every collection below were computed from the matrix with the engine's formula; on 112 reported scores that involve no clamped pair, the reconstruction matched within 0.08. Copies were scored against the eight photos or against their own person's other crops. Generated "same character" crops from different scenes scored only 59–72 against each other, so the generator does not keep identity across scenes. Those pairs, and two girls who may be one person, were left out of both classes.
+
+## Outlier scores (`Inswapper128ArcFace`)
+
+| Class | Count | Min | Median | 95th percentile | Max |
+| --- | --- | --- | --- | --- | --- |
+| Clean collections of 3–6 photos of one person, each reference | 896 | 84.6 | 92.5 | 94.4 | 95.1 |
+| Clean collections of 3 video crops of one person, each reference | 42 | 68.1 | 85.3 | 92.3 | 93.4 |
+| Different adult or photo added to 2–5 references of one person | 4,672 | 50.0 | 53.7 | 61.2 | 66.2 |
+| The same, photos added to the person's photos | 144 | 54.6 | 62.5 | 64.8 | 66.0 |
+| A child added to 2–3 crops of another child | 120 | 55.4 | 68.1 | 74.7 | 76.6 |
+| Pairs: same person, photos / video crops | 28 / 42 | 82.0 / 61.5 | 89.2 / 81.6 | 91.8 / 91.6 | 92.6 / 92.8 |
+| Pairs: different people, except child with child | 1,043 | 50.0 | 54.3 | 60.9 | 65.9 |
+
+Three of the person's photos with one other person's photo added reproduced the earlier observation: medians 55.9, 62.3 and 63.8 for the three other people (ranges 54.9–65.8). The video crops of one person below 70 were a 102–115 pixel face (68.8) and a child turning away (68.1). An intruder also lowers the other references' scores, because their mean includes it; with two references of one adult plus an intruder, 14% of those references also fell below 70. The intruder was the lowest-scoring reference in 99.4% of collections with two references and in 99.5–100% with three to five.
+
+| Default | Adult and photo intruders flagged | Clean references flagged (photos / video crops) |
+| --- | --- | --- |
+| 60 (former) | 93.4% (photos among photos: 33%) | 0 / 0 |
+| 65 | 99.8% | 0 / 0 |
+| 70 (new) | 100% | 0 / 2 of 42 |
+| 75 | 100% | 0 / 6 of 42 |
+
+## Other recognizers
+
+20 of the references (five of the person's photos, the three other photos and 12 video crops) were analyzed with `SimSwap512`, `GhostFace-v1` and `CSCS`, 20 analyses each, covering all 190 pairs.
+
+| Recognizer | Clean 3 photos, each | Photo intruder vs 3 photos | Video intruder vs 3 photos | Same-person pairs | Different-person pairs (max) |
+| --- | --- | --- | --- | --- | --- |
+| `SimSwapArcFace` | 87.3–96.6 | 57.7–64.5 | 50.0–60.3 | 67.0–94.7 | 63.8 |
+| `GhostArcFace` | 87.3–95.5 | 55.2–65.4 | 50.0–57.3 | 78.0–93.8 | 65.3 |
+| `CSCSArcFace` | 92.7–97.9 | 75.0–82.8 | 64.2–75.1 | 85.8–96.9 | 91.4 (children) |
+
+Pairs of generated "same character" crops from different scenes are excluded here too. SimSwap and Ghost recognizers share Inswapper's scale. CSCS scores everything higher, so 70 would flag no one.
+
+## Sharpness
+
+Unaltered references measured 328.9–554.5 (photos) and 73.8–381.8 (video crops); the lowest was a 95-pixel crop enlarged to the 112-pixel grid.
+
+| Copy (face size) | Sharpness | Score against the original | Leave-one-out against the other photos |
+| --- | --- | --- | --- |
+| Sigma 1 / 4 / 6 / 8 (576 px) | 389.8 / 123.2 / 63.4 / 37.1 | 97.0 / 96.9 / 96.5 / 95.9 | 94.8 / 94.1 / 93.5 / 93.1 |
+| Sigma 12 / 16 / 24 / 32 (576 px) | 16.3 / 9.0 / 4.5 / 3.3 | 95.2 / 94.0 / 90.3 / 84.7 | 92.4 / 91.6 / 88.5 / 83.9 |
+| Sigma 6 / 8 / 12 / 24 (another photo, 490 px) | 40.7 / 23.9 / 10.7 / 3.2 | 96.3 / 96.0 / 95.3 / 88.6 | 94.4 / 94.1 / 93.4 / 87.4 |
+| 1/4 scale, then sigma 1 / 2 / 3 / 6 (144 px) | 110.3 / 37.1 / 16.7 / 5.0 | 97.1 / 96.0 / 95.2 / 90.1 | 94.2 / 93.1 / 92.5 / 88.3 |
+| Video crops, sigma 1–6 (178–286 px) | 7.1–192.5 | 91.8–99.5 | |
+| 1/2, 1/4, 1/6, 1/8 scale (288, 143, 96, 71 px) | 430.2, 328.5, 360.3, 215.6 | 97.0–98.3 | 94.5–94.8 |
+| Darker, gamma 0.5 / 1.8, half contrast, JPEG q31 | 251.6, 264.2 / 381.2, 122.3, 391.6 | 93.5–98.3 | 92.2–94.5 |
+| The original photo | 468.0 | | 94.5 |
+
+The recognizer's embedding barely moves until little detail is left at its 112-pixel input: copies scored at least 95 against their original down to a sharpness of about 16, and about 90, the score of two different photos of the person, near 5. Visible full-size blur such as sigma 6 on a 576-pixel face keeps the identity. Sharpness separates blurred from clear faces only at recognition scale: the sigma-6 photo (63.4) measured lower than the softest unaltered video crop (73.8), so no threshold flags it without also flagging clear small faces. Four blurred copies of three video crops were not usable: detection found no face or two.
+
+## Decisions
+
+- `outlier_similarity` defaults per recognizer: 70 for `Inswapper128ArcFace`, `SimSwapArcFace` and `GhostArcFace` (3.8 above the highest adult or photo intruder; flags the 62.0 and 64.0 cases; below every clean photo collection and 40 of 42 clean video crops), and 85 for `CSCSArcFace` (2.2 above its highest intruder, 7.7 below its lowest clean photo). Fusion's matching default of 60 no longer applies.
+- `min_sharpness` stays 40: below every unaltered reference, and above the point where the embedding starts to drift. The how-to now explains that `blurry` measures recognition-scale detail and that 70 would also flag visibly soft full-size photos, together with clear small faces.
+- The sharpness metric is unchanged: it is already normalized to the recognition input, which is what the swap uses. Measuring at source resolution would flag blur the embedding ignores.
+
+## Automated checks
+
+macOS (FFmpeg 8.1): `uv run --locked pytest -q` gave 775 passed, 2 skipped (two Linux-only guard tests). Ruff check, Ruff format, `git diff --check` and the privacy audit were clean. A new test fails on the former default: a reference scoring 64.2 against two references of another person is flagged at the default, and the defaults follow the recognizer.
+
+## Remaining limits
+
+- All people were synthetic; real photos, other ethnicities and ages may score differently. Different generated people scored fairly high against each other (photos 55–66); if unrelated real people score lower, as is commonly reported for ArcFace models, the margins on real material are wider.
+- Children are not separated by any default: a child scored up to 76.6 against another child's crops, above clean crops of one child (68.1).
+- The other recognizers rest on 20 references, and CSCS on few video pairs. CSCS also rated three of ten pairs of distinct photos of one person at 95 or more, so its default `duplicate_similarity` of 95 can mark distinct photos `near_duplicate`.
+- Halving contrast lowered sharpness from 468 to 122; Laplacian variance scales with contrast, so a very flat, sharp face can measure low.
+- The new defaults were not yet run on the GPU after deployment.

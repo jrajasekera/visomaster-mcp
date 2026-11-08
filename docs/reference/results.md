@@ -225,12 +225,14 @@ Detection uses the same detector, with its 20-face limit, that `submit_swap` use
 | `blurry` | warning | `sharpness` below `min_sharpness` (default 40) |
 | `exact_duplicate` | warning | Same bytes as an earlier reference |
 | `near_duplicate` | warning | Scores at least `duplicate_similarity` (default 95) against an earlier reference |
-| `outlier` | warning | Scores below `outlier_similarity` (default 60) against the normalized mean of the other usable references, excluding byte-identical copies |
+| `outlier` | warning | Scores below `outlier_similarity` (default 70; 85 for the `CSCSArcFace` recognizer) against the normalized mean of the other usable references, excluding byte-identical copies |
 | `inconsistent_pair` | warning | Exactly two usable references whose `pair_similarity` is below `outlier_similarity`; both are flagged |
 
 Outliers need three distinct usable references. With one, consistency is unavailable. A low
 score suggests another person, an unusual view or unusual lighting; it does not establish
-identity. `contact.jpg` shows every image labelled with its ID and first finding (`+` when there
+identity. The default `outlier_similarity` depends on `model`, because the recognizers score on
+different scales; the measured separation behind the defaults is in
+[Check and weight source images](../how-to/check-reference-images.md#tune-the-thresholds). `contact.jpg` shows every image labelled with its ID and first finding (`+` when there
 are more), unusable ones framed in red. `analysis.json` holds the result with the Fusion
 revision. Raw embeddings are not returned.
 

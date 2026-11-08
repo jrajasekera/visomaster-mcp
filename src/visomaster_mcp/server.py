@@ -142,7 +142,7 @@ class ReferenceThresholds(BaseModel):
         ge=0,
         le=100,
         description="Leave-one-out similarity below which a reference is an outlier; default "
-        "Fusion's SimilarityThresholdSlider default (60)",
+        "70 (85 for the CSCS recognizer)",
     )
 
 
