@@ -983,20 +983,30 @@ def cancel(job_id):
     return {"job_id": job_id, "cancel_requested": active, "status": state["status"]}
 
 
+def freed_bytes(paths):
+    """Bytes that removing every path (a file, or a tree) together frees, per path. A file is
+    counted once, for the first path holding it, and only when every hard link to it is among
+    them: a resumed render's links to an earlier attempt's chunks keep that data."""
+    files, totals = {}, [0] * len(paths)
+    for index, path in enumerate(paths):
+        found = [path]
+        if path.is_dir() and not path.is_symlink():
+            found = [Path(root) / name for root, _, names in os.walk(path) for name in names]
+        for item in found:
+            try:
+                info = item.lstat()
+            except FileNotFoundError:
+                continue
+            first, links, _, _ = files.get((info.st_dev, info.st_ino), (index, 0, 0, 0))
+            files[info.st_dev, info.st_ino] = (first, links + 1, info.st_nlink, info.st_size)
+    for first, links, count, size in files.values():
+        if links >= count:
+            totals[first] += size
+    return totals
+
+
 def tree_bytes(path):
-    try:
-        if path.is_symlink() or not path.is_dir():
-            return path.lstat().st_size
-        total = 0
-        for root, _, files in os.walk(path):
-            for name in files:
-                try:
-                    total += (Path(root) / name).lstat().st_size
-                except FileNotFoundError:
-                    pass
-        return total
-    except FileNotFoundError:
-        return 0
+    return freed_bytes([path])[0]
 
 
 @contextlib.contextmanager
@@ -1120,7 +1130,8 @@ def claim_job(directory, referenced, cutoff=None, remove=False):
     """Retention eligibility shared by delete, prune and its preview; the caller holds the lock.
 
     Returns None for a job newer than cutoff, raises ValueError for an ineligible one, and
-    otherwise returns its report entry and, when removing, the trash path it was renamed to.
+    otherwise returns its report entry (without bytes) and, when removing, the trash path it
+    was renamed to.
     The checks and the rename see one generation: replacing a job needs the retention lock,
     and the lease shows that no supervisor is still publishing its state.
     """
@@ -1142,12 +1153,7 @@ def claim_job(directory, referenced, cutoff=None, remove=False):
                 "A queued or running job, a resumable failed or cancelled render or a saved "
                 "recipe uses this job's artifacts as input"
             )
-        entry = {
-            "job_id": directory.name,
-            "status": state["status"],
-            "bytes": tree_bytes(directory),
-            "finished_at": finished,
-        }
+        entry = {"job_id": directory.name, "status": state["status"], "finished_at": finished}
         trash = None
         if remove:
             # Rename first so the job disappears atomically; callers remove it outside the lock.
@@ -1160,8 +1166,9 @@ def delete_job(job_id):
     directory = job_path(job_id)
     with retention_lock():
         entry, trash = claim_job(directory, protected_inputs(), remove=True)
+    size = tree_bytes(trash)
     shutil.rmtree(trash, ignore_errors=True)
-    return {"job_id": job_id, "status": entry["status"], "deleted": True, "bytes": entry["bytes"]}
+    return {"job_id": job_id, "status": entry["status"], "deleted": True, "bytes": size}
 
 
 def prune(older_than_days, dry_run=True):
@@ -1172,7 +1179,7 @@ def prune(older_than_days, dry_run=True):
     now = time.time()
     cutoff = now - older_than_days * 86400
     result = {"dry_run": dry_run, "jobs": [], "uploads": [], "stale": []}
-    trash = []
+    trash, removals = [], []
     # Previews run the same checks as removal under the same lock, so both report alike.
     with retention_lock():
         referenced = protected_inputs()
@@ -1187,6 +1194,7 @@ def prune(older_than_days, dry_run=True):
                     entry["deleted"] = True
                     trash.append(removed)
                 result["jobs"].append(entry)
+                removals.append((entry, removed or directory))
         candidates = []
         for path in listing(STATE / "uploads"):
             try:
@@ -1205,12 +1213,16 @@ def prune(older_than_days, dry_run=True):
                 ("stale", path) for path in sorted(STATE.glob(pattern)) if path not in trash
             ]
         for category, path in candidates:
-            result[category].append({"path": str(path), "bytes": tree_bytes(path)})
-            if not dry_run:
-                if path.is_dir() and not path.is_symlink():
-                    shutil.rmtree(path, ignore_errors=True)
-                else:
-                    path.unlink(missing_ok=True)
+            result[category].append({"path": str(path)})
+            removals.append((result[category][-1], path))
+        # One count for the whole report, so files hard-linked between removed jobs count once.
+        for (entry, _), size in zip(removals, freed_bytes([path for _, path in removals])):
+            entry["bytes"] = size
+        for _, path in [] if dry_run else candidates:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
     for path in trash:
         shutil.rmtree(path, ignore_errors=True)
     result["total_bytes"] = sum(

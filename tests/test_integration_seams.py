@@ -215,3 +215,27 @@ def test_inputs_of_resumable_renders_are_kept(jobs_backend):
     control.delete_job("cancelled")
     assert control.delete_job("producer")["deleted"]
     assert str(upload) in [entry["path"] for entry in control.prune(0, dry_run=True)["uploads"]]
+
+
+def json_bytes(job):
+    return sum(path.stat().st_size for path in job.rglob("*.json"))
+
+
+def test_hard_linked_chunks_count_once_and_only_when_freed(jobs_backend):
+    first, second = (stopped_render(name, common.BASE / "clip.mp4") for name in ("a", "b"))
+    chunk = first / "checkpoint/chunks/00000.mp4"
+    chunk.write_bytes(b"c" * 1000)
+    os.link(chunk, second / "checkpoint/chunks/00000.mp4")  # As resume_render links it.
+    os.link(chunk, first / "artifacts/copy.mp4")  # A second link inside the same job.
+    own = {"a": json_bytes(first), "b": json_bytes(second)}
+    # The other job's link keeps the chunk, so removing one job alone frees none of it.
+    assert control.tree_bytes(first) == own["a"] and control.tree_bytes(second) == own["b"]
+    preview = control.prune(0, dry_run=True)
+    # Removed together they free it, counted once, for the first job listed.
+    assert {entry["job_id"]: entry["bytes"] for entry in preview["jobs"]} == {
+        "a": own["a"] + 1000,
+        "b": own["b"],
+    }
+    assert preview["total_bytes"] == own["a"] + own["b"] + 1000
+    assert control.delete_job("a")["bytes"] == own["a"]
+    assert control.delete_job("b")["bytes"] == own["b"] + 1000  # Now its last link.

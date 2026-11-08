@@ -176,7 +176,7 @@ The supervisor starts each GPU job as `<runner...> <release>/engine.py <job dire
 | `cancel_job` | Request cancellation, then poll for terminal state |
 | `resume_render` | Queue a new render (its own `job_id`, linked by `resume_from`) that repeats a failed or cancelled render's request and reuses its verified checkpoint chunks after checking inputs, settings, models and versions; refuses renders with tracking or smoothing |
 | `delete_job` | Permanently remove a terminal job's directory, logs and artifacts |
-| `prune_storage` | Report (dry run, default) or delete old terminal jobs, unused uploads and crash leftovers |
+| `prune_storage` | Report (dry run, default) or delete old terminal jobs, unused uploads and crash leftovers, with the bytes each removal frees |
 | `view_artifact` | Return a completed job's PNG/JPEG as an inline MCP image, such as a detection's `contact.jpg` grid of labelled crops |
 | `download_artifact` | Stream a completed artifact to the client |
 | `save_recipe` | Save a new immutable revision of a named recipe from a completed preview or render job, or from an explicit request: pinned settings, mappings, weights, segments, input fingerprints and code/model provenance |
