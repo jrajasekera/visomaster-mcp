@@ -135,7 +135,11 @@ class ReferenceThresholds(BaseModel):
         None, ge=0, le=1_000_000, description="Laplacian variance at 112x112; default 40"
     )
     duplicate_similarity: float | None = Field(
-        None, ge=50, le=100, description="Fusion similarity marking near duplicates; default 95"
+        None,
+        ge=50,
+        le=100,
+        description="Fusion similarity marking near duplicates; default 95 (96 for SimSwap, 95.5 "
+        "for Ghost and 98 for CSCS recognizers)",
     )
     outlier_similarity: float | None = Field(
         None,

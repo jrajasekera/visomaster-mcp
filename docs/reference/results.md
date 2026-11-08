@@ -224,7 +224,7 @@ Detection uses the same detector, with its 20-face limit, that `submit_swap` use
 | `small_face` | warning | `face_pixels` below `min_face_pixels` (default 112) |
 | `blurry` | warning | `sharpness` below `min_sharpness` (default 40) |
 | `exact_duplicate` | warning | Same bytes as an earlier reference |
-| `near_duplicate` | warning | Scores at least `duplicate_similarity` (default 95) against an earlier reference |
+| `near_duplicate` | warning | Scores at least `duplicate_similarity` (default 95; 96 for the `SimSwapArcFace`, 95.5 for the `GhostArcFace` and 98 for the `CSCSArcFace` recognizer) against an earlier reference |
 | `outlier` | warning | Scores below `outlier_similarity` (default 70; 85 for the `CSCSArcFace` recognizer) against the normalized mean of the other usable references, excluding byte-identical copies |
 | `inconsistent_pair` | warning | Exactly two usable references whose `pair_similarity` is below `outlier_similarity`; both are flagged |
 

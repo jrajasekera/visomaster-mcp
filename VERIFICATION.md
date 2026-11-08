@@ -333,6 +333,66 @@ macOS (FFmpeg 8.1): `uv run --locked pytest -q` gave 775 passed, 2 skipped (two 
 
 - All people were synthetic; real photos, other ethnicities and ages may score differently. Different generated people scored fairly high against each other (photos 55–66); if unrelated real people score lower, as is commonly reported for ArcFace models, the margins on real material are wider.
 - Children are not separated by any default: a child scored up to 76.6 against another child's crops, above clean crops of one child (68.1).
-- The other recognizers rest on 20 references, and CSCS on few video pairs. CSCS also rated three of ten pairs of distinct photos of one person at 95 or more, so its default `duplicate_similarity` of 95 can mark distinct photos `near_duplicate`.
+- The other recognizers rest on 20 references, and CSCS on few video pairs. CSCS also rated three of ten pairs of distinct photos of one person at 95 or more, so its default `duplicate_similarity` of 95 can mark distinct photos `near_duplicate`. The duplicate calibration below addresses this.
 - Halving contrast lowered sharpness from 468 to 122; Laplacian variance scales with contrast, so a very flat, sharp face can measure low.
+- The new defaults were not yet run on the GPU after deployment.
+
+# Duplicate-threshold calibration on 2026-11-08
+
+Calibrates `duplicate_similarity` per recognizer (`vmcp-vai`). The outlier calibration above found that `CSCSArcFace` rates distinct photos of one person at 95 or more, so its former default of 95 marked them `near_duplicate`. Same hardware class (Maxwell, compute capability 5.2, 24 GB VRAM class), Fusion commit and detector controls as above. All measurements ran as `analyze_references` jobs on the deployed release that preceded this change, through a stdio MCP client started from the checkout, with `duplicate_similarity` 50 in the request so that every later reference reports its score against the first. The change alters only defaults, so the measured scores carry over.
+
+## Method
+
+All material was synthetic. Each class was measured with all four recognizers, chosen through the swap models `Inswapper128`, `SimSwap512`, `GhostFace-v1` and `CSCS` (102 analyses):
+
+- **Near-exact copies** of six originals: two of the person's photos, two other people's photos (JPEG) and two video crops (94- and 203-pixel faces). Per original: a lossless re-save or PNG conversion (identical pixels, different bytes), JPEG at quality 95, 85, 75, 60 and 40 (also PNG to JPEG), resizes to 90%, 75% and 50%, brightness 110% and 90%, contrast 115%, saturation 125% (together 12 "re-encoded, resized or re-lit" copies), crops cutting 3% from the top-left or bottom-right or 6% from every side, a 2° rotation, a 75% resize with a 3% crop at JPEG quality 75 (together 5 "crop, shift or rotate" copies) and a mirror image. Each was scored against its original.
+- **Adjacent video frames**: crops of the same box one and two frames from three video faces (the two above and an 88-pixel face of a second person in the first clip).
+- **Distinct photos of one person**: all 45 pairs of the ten photos of the generated person (angles, expressions, lighting), and the ten pairs with the photo they were edited from, which shares the frontal photo's pose and expression. Frames 64 apart (2–3 s) of three video faces gave nine more pairs.
+
+Byte-identical copies are `exact_duplicate` by hash and are not scored.
+
+## Scores against the original or the other photo (min / median / max)
+
+| Class | Count | `Inswapper128ArcFace` | `SimSwapArcFace` | `GhostArcFace` | `CSCSArcFace` |
+| --- | --- | --- | --- | --- | --- |
+| Identical pixels, different bytes | 6 | 100 / 100 / 100 | 100 / 100 / 100 | 100 / 100 / 100 | 100 / 100 / 100 |
+| Re-encoded, resized or re-lit | 72 | 95.9 / 99.7 / 100 | 95.7 / 99.7 / 100 | 95.4 / 99.6 / 100 | 67.2 / 99.7 / 100 |
+| Crop, shift or rotate | 30 | 92.5 / 98.0 / 99.6 | 91.0 / 98.1 / 99.4 | 91.9 / 98.2 / 99.5 | 67.5 / 98.7 / 100 |
+| Mirror image | 6 | 94.8 / 95.7 / 97.4 | 90.0 / 95.8 / 96.1 | 94.8 / 95.3 / 96.5 | 86.8 / 97.0 / 98.3 |
+| Adjacent video frames | 6 | 97.2 / 99.5 / 99.9 | 97.0 / 99.0 / 99.6 | 97.5 / 99.3 / 99.9 | 98.0 / 100 / 100 |
+| Distinct photos of one person | 45 | 82.0 / 89.6 / 94.4 | 84.1 / 90.7 / 95.5 | 83.5 / 90.9 / 94.9 | 91.2 / 94.9 / 97.2 |
+| Photos against the photo they were edited from | 10 | 84.2 / 92.3 / 95.4 | 87.1 / 94.1 / 96.3 | 85.4 / 93.0 / 95.9 | 92.0 / 96.3 / 97.5 |
+| Video frames 64 apart | 9 | 76.3 / 86.1 / 90.2 | 67.8 / 74.1 / 88.3 | 75.4 / 83.1 / 88.1 | 85.8 / 99.4 / 100 |
+
+The lowest re-encoded copies with the first three recognizers were JPEG quality 40 (of the 94-pixel crop and of a photo); the margin between them and the highest distinct pair was 1.5, 0.2 and 0.5. Crops and shifts change the detected landmarks and so the alignment: a 6% tighter crop of one photo scored 91.0–92.5, as low as distinct photos. The three photos from the issue scored 96.2, 94.4 and 96.9 with `CSCSArcFace`, reproducing it, and 89.4–94.7 with the others.
+
+`CSCSArcFace` behaved differently on video crops. Its re-encoded and re-lit copies scored 98.8–100, but copies of the 203-pixel face resized to 90%, 75% and 50% scored 86.6, 67.7 and 67.2 against it, its tighter and combined crops 85.1 and 67.5, and its mirror image 86.8. On faces of about 90 pixels it scored every frame of one person 99.1–100 and two different people 98.9 (`Inswapper128ArcFace` 65.9). With the face photos alone, its copies other than mirror images scored at least 96.0 (the 6% crop) and its re-encoded copies at least 99.2, against 97.2 for the highest distinct pair.
+
+## Flagged at each default
+
+Copies flagged (re-encoded / crop / mirror / adjacent frames) and distinct pairs flagged (photos / edited-from / video frames):
+
+| Recognizer | Default | Copies flagged | Distinct pairs flagged |
+| --- | --- | --- | --- |
+| `Inswapper128ArcFace` | 95 (unchanged) | 72/72, 28/30, 5/6, 6/6 | 0/45, 3/10, 0/9 |
+| `SimSwapArcFace` | 96 (was 95: 2 of 45 photo pairs flagged) | 71/72, 28/30, 2/6, 6/6 | 0/45, 2/10, 0/9 |
+| `GhostArcFace` | 95.5 (was 95) | 71/72, 28/30, 2/6, 6/6 | 0/45, 1/10, 0/9 |
+| `CSCSArcFace` | 98 (was 95: 22/45, 9/10, 6/9 flagged) | 69/72, 25/30, 1/6, 6/6 | 0/45, 0/10, 6/9 |
+
+## Decisions
+
+- Each default is the lowest half-point value at least 0.5 above the highest pair of distinct photos of the person: 95 for `Inswapper128ArcFace` (0.6 above 94.4), 96 for `SimSwapArcFace` (0.5 above 95.5), 95.5 for `GhostArcFace` (0.6 above 94.9) and 98 for `CSCSArcFace` (0.8 above 97.2). Every re-encoded, resized or re-lit copy and every adjacent frame scored at or above it, except one JPEG quality 40 copy of the 94-pixel crop (SimSwap and Ghost) and the resized copies of the CSCS video crop. Ghost's former 95 flagged no distinct pair, but with a margin of 0.1.
+- Pairs with the photo the person's photos were edited from are partly flagged at the defaults (up to 3 of 10). They share one source photo and the frontal ones its pose, which is the boundary the threshold describes.
+- No `duplicate_similarity` separates distinct small faces under `CSCSArcFace`. The how-to guide advises comparing small CSCS references by eye or analyzing them with another swap model.
+- Requests' own `thresholds` still override the defaults; `result.thresholds` reports the value applied.
+
+## Automated checks
+
+macOS (FFmpeg 8.1): `uv run --locked pytest -q` gave 780 passed, 2 skipped (two Linux-only guard tests). Ruff check, Ruff format, `git diff --check` and the privacy audit were clean. A new test fails on the former default: with the CSCS recognizer, another photo of the person scoring 96.2 is not flagged while a copy scoring 99.4 is, and each recognizer has its own default.
+
+## Remaining limits
+
+- All people and edits were synthetic; the ten photos of the person were generated from one source photo and may be more alike than real photos, which would widen the margins. Copies were made with Pillow; other encoders and resamplers may score slightly differently.
+- Six originals and one person's photos are a small sample; the SimSwap margin is 0.2 between its lowest re-encoded copy and its highest distinct pair.
+- `CSCSArcFace` embeddings collapse on faces of about 90 pixels and shift with face size; analysis uses the swap model's first recognizer only (`CSCSArcFace`, not `CSCSIDArcFace`).
 - The new defaults were not yet run on the GPU after deployment.

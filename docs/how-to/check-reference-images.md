@@ -52,7 +52,7 @@ values. `result.thresholds` reports the values applied.
 | --- | --- | --- |
 | `min_face_pixels` | 112 | `small_face` |
 | `min_sharpness` | 40 | `blurry` |
-| `duplicate_similarity` | 95 | `near_duplicate` |
+| `duplicate_similarity` | 95; 96 for `SimSwapArcFace`, 95.5 for `GhostArcFace`, 98 for `CSCSArcFace` | `near_duplicate` |
 | `outlier_similarity` | 70; 85 for the `CSCSArcFace` recognizer (swap model `CSCS`) | `outlier`, `inconsistent_pair` |
 
 The defaults were calibrated on synthetic people: studio photos, face crops from generated
@@ -78,6 +78,36 @@ In a small collection an intruder also pulls the others' scores down, because th
 includes it. When several references are flagged, the lowest score is the likeliest intruder;
 it was the lowest in over 99% of the measured sets. Adding more clear photos of the person makes
 the mean, and the scores, steadier.
+
+### Duplicate scores
+
+A near duplicate is a copy of an earlier reference that adds weight but no new view. Re-encoded,
+resized or re-lit copies scored above distinct photos of one person, so each recognizer's default
+sits just above the highest distinct photo it saw:
+
+| Recognizer (swap model) | Distinct photos of one person | Re-encoded, resized or re-lit copies | Default |
+| --- | --- | --- | --- |
+| `Inswapper128ArcFace` (`Inswapper128`) | 82.0–94.4 | 95.9–100 | 95 |
+| `SimSwapArcFace` (`SimSwap512`) | 84.1–95.5 | 95.7–100 | 96 |
+| `GhostArcFace` (`GhostFace-v*`) | 83.5–94.9 | 95.4–100 | 95.5 |
+| `CSCSArcFace` (`CSCS`) | 91.2–97.2 | 98.8–100, except resized small faces | 98 |
+
+The lowest copies were JPEG quality 40; only that copy of a 94-pixel video face fell below
+the SimSwap and Ghost defaults. Photos edited from one source photo that keep its pose and expression
+scored up to 95.4–97.5 against it, so some of those are flagged. Copies that shift, tighten or
+rotate the crop move the face alignment and scored lower, down to 91, so a few are not flagged.
+Mirror images scored 87–98, like distinct photos of a similar view; 10 of 24 were flagged.
+Video frames a few frames apart scored 97–100 and are flagged. With the first three
+recognizers, frames seconds apart scored 68–90.
+
+`CSCSArcFace` is unreliable on small faces. Two different people with faces of about 90 pixels
+scored 98.9, so frames of one small face are flagged whatever they show, and copies of a
+203-pixel face resized to 102–181 pixels scored only 67–87 against it. Compare small CSCS
+references by eye, or analyze them with another swap model.
+
+To flag only nearly untouched copies, raise `duplicate_similarity` to about 99. To catch more
+cropped copies, lower it towards the distinct-photo maximum and expect similar views of the
+person to be flagged too.
 
 ### Sharpness
 

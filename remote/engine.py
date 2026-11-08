@@ -613,10 +613,17 @@ def detect_identities(window, request, directory):
 # Reference analysis measures faces as submit_swap reads them: the same detector and limit, and
 # the swap model's ArcFace embedding, which the source merge averages.
 RECOGNITION_SIDE = 112  # Fusion's ArcFace input size; sharpness is measured at this scale.
-ANALYSIS_DEFAULTS = {"min_face_pixels": 112, "min_sharpness": 40.0, "duplicate_similarity": 95.0}
-# Outlier defaults per recognizer, calibrated on same- and different-person reference sets
-# (VERIFICATION.md, reference-analysis calibration). Recognizers score on different scales:
-# CSCS rates different people as high as the others rate the same person.
+ANALYSIS_DEFAULTS = {"min_face_pixels": 112, "min_sharpness": 40.0}
+# Duplicate and outlier defaults per recognizer, calibrated on same- and different-person
+# reference sets and on altered copies (VERIFICATION.md, reference-analysis calibration).
+# Recognizers score on different scales: CSCS rates different people as high as the others rate
+# the same person, and distinct photos of one person as high as the others rate a re-saved copy.
+DUPLICATE_SIMILARITY = {
+    "Inswapper128ArcFace": 95.0,
+    "SimSwapArcFace": 96.0,
+    "GhostArcFace": 95.5,
+    "CSCSArcFace": 98.0,
+}
 OUTLIER_SIMILARITY = {
     "Inswapper128ArcFace": 70.0,
     "SimSwapArcFace": 70.0,
@@ -812,6 +819,9 @@ def analyze_references(window, request, directory):
     model = window.function_worker.get_arcface_model(swap_model)
     thresholds = {
         **ANALYSIS_DEFAULTS,
+        "duplicate_similarity": DUPLICATE_SIMILARITY.get(
+            model, DUPLICATE_SIMILARITY["Inswapper128ArcFace"]
+        ),
         "outlier_similarity": OUTLIER_SIMILARITY.get(
             model, OUTLIER_SIMILARITY["Inswapper128ArcFace"]
         ),

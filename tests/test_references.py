@@ -33,6 +33,10 @@ STRANGER = [0.0, 0.0, 0.0, 1.0]  # Scores 50 against every other reference.
 # Another person who scores 64.2 against the mean of A and OTHER_VIEW: like the unrelated
 # synthetic faces (62-64) that Fusion's matching default of 60 let through.
 LOOKALIKE = [0.3, 0.0, 0.0, math.sqrt(1 - 0.3**2)]
+# CSCS scores: another photo of A at 96.2, like distinct photos of one synthetic person, and a
+# re-encoded copy of A at 99.4, which scores 92.7 against that other photo.
+CSCS_OTHER_PHOTO = [0.924, math.sqrt(1 - 0.924**2), 0.0, 0.0]
+CSCS_COPY = [0.988, -math.sqrt(1 - 0.988**2), 0.0, 0.0]
 SPECS = {
     "SimilarityThresholdSlider": {"default": 60, "min_value": "1", "max_value": "100"},
     "SwapModelSelection": {"default": "Inswapper128", "options": ["Inswapper128", "SimSwap512"]},
@@ -40,6 +44,7 @@ SPECS = {
 MODELS = {
     "Inswapper128": "Inswapper128ArcFace",
     "SimSwap512": "SimSwapArcFace",
+    "GhostFace-v1": "GhostArcFace",
     "CSCS": "CSCSArcFace",
 }
 
@@ -317,11 +322,41 @@ def test_default_outlier_threshold_flags_a_lookalike_and_follows_the_recognizer(
     assert {name: t["outlier_similarity"] for name, t in defaults.items()} == {
         "Inswapper128": 70.0,
         "SimSwap512": 70.0,
+        "GhostFace-v1": 70.0,
         "CSCS": 85.0,
     }
     # A request's own value still wins.
     custom = analyze(fusion, paths, swap_model="CSCS", thresholds={"outlier_similarity": 60})
     assert [codes(e) for e in custom["references"]] == [[], [], []]
+
+
+def test_default_duplicate_threshold_follows_the_recognizer(fusion):
+    paths = [
+        fusion.add("a.png", Image(face(A))),
+        fusion.add("other-photo.png", Image(face(CSCS_OTHER_PHOTO))),
+        fusion.add("copy.jpg", Image(face(CSCS_COPY))),
+    ]
+    # CSCS rates distinct photos of one person up to about 97.5, above the other recognizers'
+    # default of 95, so only the re-encoded copy is a near duplicate.
+    result = analyze(fusion, paths, swap_model="CSCS")
+    assert result["thresholds"]["duplicate_similarity"] == 98.0
+    assert [codes(e) for e in result["references"]] == [[], [], ["near_duplicate"]]
+    assert result["duplicates"] == [
+        {"reference": "r2", "duplicate_of": "r0", "kind": "near_identical", "similarity": 99.4}
+    ]
+    defaults = {
+        swap_model: analyze(fusion, paths, swap_model=swap_model)["thresholds"]
+        for swap_model in MODELS
+    }
+    assert {name: t["duplicate_similarity"] for name, t in defaults.items()} == {
+        "Inswapper128": 95.0,
+        "SimSwap512": 96.0,
+        "GhostFace-v1": 95.5,
+        "CSCS": 98.0,
+    }
+    # A request's own value still wins.
+    custom = analyze(fusion, paths, swap_model="CSCS", thresholds={"duplicate_similarity": 95})
+    assert [codes(e) for e in custom["references"]] == [[], ["near_duplicate"], ["near_duplicate"]]
 
 
 def test_laplacian_variance_measures_sharpness():
