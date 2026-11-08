@@ -133,7 +133,7 @@ def test_unconfigured_server_still_lists_tools_and_explains(tmp_path):
         ("health_check", {}),
         ("upload_media", {"local_path": str(ROOT / "README.md")}),
     )
-    assert len(tools) == 15
+    assert len(tools) == 21
     assert (
         health.isError and "VISOMASTER_HOST and VISOMASTER_REMOTE not set" in health.content[0].text
     )

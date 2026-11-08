@@ -124,7 +124,7 @@ Set these in the MCP client registration. They are validated on the first tool c
 | `VISOMASTER_REMOTE` | yes | none | Absolute workstation deployment directory; letters, digits and `_./-`, no `..` |
 | `VISOMASTER_REMOTE_PYTHON` | no | `python3` | Workstation interpreter for control commands: a command name or an absolute path |
 | `VISOMASTER_SSH` | no | `ssh` | Client SSH program |
-| `VISOMASTER_DOWNLOADS` | no | `~/Downloads/visomaster-mcp` | Local directory for `download_artifact`; absolute or starting with `~`, relative paths are rejected |
+| `VISOMASTER_DOWNLOADS` | no | `~/Downloads/visomaster-mcp` | Local directory for `download_artifact` and `export_recipe`; absolute or starting with `~`, relative paths are rejected |
 
 SSH calls use `BatchMode=yes` and share one multiplexed connection through `~/.ssh/visomaster-%C`, which persists for 120 seconds after the last call. Nothing relies on SSH environment forwarding or remote shell profiles.
 
@@ -176,6 +176,12 @@ The supervisor starts each GPU job as `<runner...> <release>/engine.py <job dire
 | `prune_storage` | Report (dry run, default) or delete old terminal jobs, unused uploads and crash leftovers |
 | `view_artifact` | Return a completed job's PNG/JPEG as an inline MCP image, such as a detection's `contact.jpg` grid of labelled crops |
 | `download_artifact` | Stream a completed artifact to the client |
+| `save_recipe` | Save a new immutable revision of a named recipe from a completed preview or render job, or from an explicit request: pinned settings, mappings, weights, input fingerprints and code/model provenance |
+| `get_recipe` | List recipes, or return one revision's document and input retention; `verify` hashes inputs and models now and lists what changed |
+| `run_recipe` | Queue a preview or render from a recipe revision, with explicit, recorded media, target, range, mode, report and priority substitutions; refuses changed inputs, defaults, models or versions unless `accept_changes` |
+| `export_recipe` | Write a recipe revision as portable JSON (configuration and provenance, no media or weights) to the local downloads directory |
+| `import_recipe` | Store an exported recipe file as a new revision after checking its format version, integrity, input paths and bytes, and settings |
+| `delete_recipe` | Delete one revision or all revisions of a recipe; its inputs are left to retention |
 
 Multi-frame detection embeds every detected face with the configured recognition model and groups faces greedily, largest first, into identities. A face joins the identity whose mean embedding scores highest on Fusion's similarity scale (50 + 50 × cosine similarity, the scale `SimilarityThresholdSlider` uses) if that score reaches `similarity_threshold`, by default the slider's default of 60. Two faces from the same frame never share an identity. A profile view can score below 50 against the same person's frontal views, about as low as a different person, so it can form its own identity; lowering `similarity_threshold` merges it but can also merge different people who never share a frame, so check the contact sheet. Each identity reports its appearances, frames, up to five sample boxes and a representative crop from the largest of its five largest faces whose crop is verified.
 
@@ -267,9 +273,25 @@ Pass these options to a render as `report`, for example:
 
 `expected_visible` lists at most 100 ranges inside the requested frames; a range that ends past the video's last frame fails the render before processing. Previews accept no `report` options and have no times or review images.
 
+### Recipes
+
+A recipe is a named, reusable swap configuration. `save_recipe` takes either a completed preview or render `job_id` or an explicit request in `submit_swap`'s form, and stores a new revision `<state_dir>/recipes/<name>/<revision>.json` (format `visomaster-recipe`, version 1). A revision holds:
+
+- `request`: the explicit swap request a new job runs: resolved media path and its `media_sha256`, the range (`frame`, or `start_frame` and `max_frames`), every adjustable control and per-mapping parameter at its effective value, mappings with their `target_sha256`, `source_sha256` and any `source_weights`, and `report` and `priority` when given;
+- `provenance`: the full effective settings (Fusion and adapter defaults included), the Fusion revision, the adapter release and the SHA-256 of its three files, the configuration identity, and per model its path, the SHA-256 Fusion declares and the SHA-256 of its file. Models are those the settings select (detector, recognizer, swapper and its ArcFace) plus, for a recipe saved from a job, those the job had loaded;
+- `frame_convention`, `origin` (`request`, `job` or `import`), `note`, `retained`, `created_at`, and `sha256`, the digest of everything else.
+
+Revisions are immutable: saving again under a name adds the next revision, and a deleted revision's number is never reused. Face references are copied into the content-addressed upload store (`uploads/<sha256><suffix>`, PNG, JPEG or WebP) and the request points at the copies, so deleting the detection job that produced a crop does not break a recipe. Retention keeps every file a recipe revision names, including a job whose artifact (for example `normalized.mp4`) is the media. Media in `media_root` and references of other types are unretained: `get_recipe` reports them as such, and `missing` when they are gone. Deleting a recipe deletes no inputs; `prune_storage` may remove them later once no recipe or queued or running job names them.
+
+`run_recipe` hashes every input and model file, compares the result with the recipe and submits a new job. Changed bytes at the same path, changed settings or defaults, changed or missing model files, different adapter code, Fusion revision or configuration make it fail with a readable list, unless `accept_changes` is true; `get_recipe` with `verify` shows the same list without submitting. Unavailable inputs always fail. Substitutions are explicit: `media_path`, `targets` (one `target_face` per mapping), `frame_range`, `mode`, `report` and `priority`. Media with different content is a new clip, which needs explicit `targets` from a detection on that clip and an explicit `frame_range` (and `report` when the recipe has `expected_visible` ranges); a mode change needs a `frame_range`, and a preview drops the recipe's `report`. The job's request and result carry `recipe`: name, revision, the document's `sha256`, the invocation, its substitutions and any accepted changes. The worker hashes the media again before decoding it and fails the job if it changed. A retry with the same `job_id` and arguments returns the existing job.
+
+`export_recipe` writes `<downloads>/recipes/<name>-r<revision>.json`. It contains configuration and provenance, never media or model weights. `import_recipe` refuses other format versions, a `sha256` that does not match the content, unknown or malformed fields, inputs outside the allowed roots, inputs whose bytes differ and settings the installed Fusion rejects. An input missing at its recorded path is found by digest in the upload store, so uploading the same file with `upload_media` first is enough; the relocation is recorded in `origin`.
+
+Saving, verifying and running a recipe hash the media, references and model files in a streamed pass on the workstation, so a long video takes a while (these calls allow 15 minutes); status polls never hash. A recipe reproduces configuration, inputs and versions, not bits: the GPU, its driver and CUDA libraries are not recorded, and outputs are expected to be equivalent rather than bit-identical.
+
 ## Storage
 
-Job state, logs and artifacts live in `<state_dir>/jobs/JOB_ID`. Uploaded media lives in `<state_dir>/uploads`, named by SHA-256 so identical uploads share one file. Terminal jobs remain until `delete_job` or `prune_storage` removes them. `prune_storage` deletes terminal jobs finished more than `older_than_days` ago (default 30) and uploads untouched for that long, unless a queued or running job uses their files as input, as well as staging and trash directories left by crashes and partial uploads idle for over an hour. It reports byte totals and is a dry run unless `dry_run` is false; the dry run applies the same checks. Partial files from cancelled or failed jobs remain for diagnosis, and artifact tools expose only completed jobs. Each downloaded artifact has its own job subdirectory. Repeating the same download atomically replaces that local copy.
+Job state, logs and artifacts live in `<state_dir>/jobs/JOB_ID`, and recipe revisions in `<state_dir>/recipes/NAME`. Uploaded media lives in `<state_dir>/uploads`, named by SHA-256 so identical uploads share one file. Terminal jobs remain until `delete_job` or `prune_storage` removes them. `prune_storage` deletes terminal jobs finished more than `older_than_days` ago (default 30) and uploads untouched for that long, unless a saved recipe or a queued or running job uses their files as input, as well as staging and trash directories left by crashes and partial uploads idle for over an hour. It reports byte totals and is a dry run unless `dry_run` is false; the dry run applies the same checks. Partial files from cancelled or failed jobs remain for diagnosis, and artifact tools expose only completed jobs. Each downloaded artifact has its own job subdirectory. Repeating the same download atomically replaces that local copy.
 
 MCP GPU jobs share a process lock across all client sessions. Fusion's desktop GUI has its own GPU workload, so coordinate large GUI renders with MCP renders.
 

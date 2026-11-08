@@ -31,6 +31,7 @@ from common import (  # noqa: E402
     APP,
     BASE,
     CLASSES,
+    CODE,
     CONFIG_ERROR,
     CONTROLS,
     GPU,
@@ -40,11 +41,15 @@ from common import (  # noqa: E402
     REVISION,
     RUNNER,
     SETTINGS,
+    SHA256,
     STATE,
     TERMINAL,
     ConfigError,
     atomic_json,
+    canonical,
+    code_identity,
     config_path,
+    current_digest,
     file_sha256,
     fusion_compatibility,
     input_path,
@@ -53,12 +58,14 @@ from common import (  # noqa: E402
     layouts,
     load_config,
     probe,
+    provenance,
+    provenance_changes,
     read_json,
+    recorded_inputs,
     validate_request,
 )
 
 RELEASE = Path(os.path.realpath(__file__)).parent
-CODE = ("common.py", "control.py", "engine.py")
 KEEP_RELEASES = 5  # Newest release directories kept, besides any an active job still uses.
 MAX_WAIT = 50
 GRACE = 10  # Seconds a cancelled worker gets to exit on SIGTERM before its group is killed.
@@ -191,10 +198,6 @@ def list_jobs(only_status=None, only_kind=None, limit=50):
         if len(jobs) == limit:
             break
     return jobs
-
-
-def canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 # GPU scheduling (DESIGN.md, GPU scheduling). Each GPU's queue lives beside its lock in the lock
@@ -884,6 +887,26 @@ def active_references():
     return referenced
 
 
+def recipe_references():
+    """Inputs saved recipe revisions reference, which retention keeps; None when a revision is
+    unreadable, so nothing that could be its input is removed. Callers hold the retention lock."""
+    referenced = set()
+    for path in sorted((STATE / "recipes").glob("*/*.json")):
+        try:
+            referenced |= request_paths(read_json(path)["request"])
+        except FileNotFoundError:
+            continue  # Deleted meanwhile.
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None
+    return referenced
+
+
+def protected_inputs():
+    """Inputs of queued or running jobs and of saved recipes, or None when unknown."""
+    active, saved = active_references(), recipe_references()
+    return None if active is None or saved is None else active | saved
+
+
 def protected(path, referenced):
     """Whether removing path (a file, or a tree by component ancestry) removes an input."""
     if referenced is None:
@@ -914,7 +937,9 @@ def claim_job(directory, referenced, cutoff=None, remove=False):
             return None
         # Artifacts such as normalized media or face crops can be another job's input.
         if protected(directory, referenced):
-            raise ValueError("A queued or running job uses this job's artifacts as input")
+            raise ValueError(
+                "A queued or running job or a saved recipe uses this job's artifacts as input"
+            )
         entry = {
             "job_id": directory.name,
             "status": state["status"],
@@ -932,7 +957,7 @@ def claim_job(directory, referenced, cutoff=None, remove=False):
 def delete_job(job_id):
     directory = job_path(job_id)
     with retention_lock():
-        entry, trash = claim_job(directory, active_references(), remove=True)
+        entry, trash = claim_job(directory, protected_inputs(), remove=True)
     shutil.rmtree(trash, ignore_errors=True)
     return {"job_id": job_id, "status": entry["status"], "deleted": True, "bytes": entry["bytes"]}
 
@@ -948,7 +973,7 @@ def prune(older_than_days, dry_run=True):
     trash = []
     # Previews run the same checks as removal under the same lock, so both report alike.
     with retention_lock():
-        referenced = active_references()
+        referenced = protected_inputs()
         for directory in listing(STATE / "jobs"):
             try:
                 claimed = claim_job(directory, referenced, cutoff, remove=not dry_run)
@@ -1165,6 +1190,16 @@ def dispatch(action, request):
         return find_upload(request["sha256"], request["suffix"], request["size"])
     if action == "promote":
         return promote(request.get("force", False))
+    if action == "recipe_save":
+        return save_recipe(request)
+    if action == "recipe_get":
+        return get_recipe(request)
+    if action == "recipe_run":
+        return run_recipe(request)
+    if action == "recipe_import":
+        return import_recipe(request)
+    if action == "recipe_delete":
+        return delete_recipe(request["name"], request.get("revision"))
     raise ValueError(f"Unknown action {action}")
 
 
@@ -1281,6 +1316,609 @@ def upload(upload_id, suffix, expected_size):
     finally:
         temporary.unlink(missing_ok=True)
     return {"path": str(destination), "bytes": size, "sha256": digest.hexdigest(), "reused": False}
+
+
+# Recipes (DESIGN.md, Recipes): immutable revisions in <state>/recipes/<name>/<revision>.json.
+RECIPE_FORMAT, RECIPE_VERSION = "visomaster-recipe", 1
+RECIPE_KEYS = {
+    "format",
+    "version",
+    "name",
+    "revision",
+    "created_at",
+    "note",
+    "origin",
+    "request",
+    "frame_convention",
+    "provenance",
+    "retained",
+    "sha256",
+}
+GENERATED = {"format", "version", "name", "revision", "sha256"}  # Set by publish_recipe.
+PROVENANCE_KEYS = {"settings", "fusion_revision", "adapter", "config_sha256", "models"}
+MAPPING_KEYS = (
+    "target_face",
+    "target_sha256",
+    "source_faces",
+    "source_sha256",
+    "source_weights",
+    "parameters",
+)
+RANGE = {"preview": ("frame",), "render": ("start_frame", "max_frames")}
+# Request fields a recipe carries besides its inputs and range; priority only schedules.
+CARRIED = ("controls", "report", "priority")
+INTENT_KEYS = {"kind", "media_path", "mappings", "frame", "start_frame", "max_frames", *CARRIED}
+RUN_KEYS = {
+    "name",
+    "revision",
+    "job_id",
+    "mode",
+    "media_path",
+    "targets",
+    "range",
+    "report",
+    "priority",
+    "accept_changes",
+}
+FRAME_CONVENTION = (
+    "Zero-based frame indices in decoded order. A preview processes frame; a render processes "
+    "start_frame through start_frame + max_frames - 1, or through the last frame when "
+    "max_frames is null."
+)
+REVISION_FILE = re.compile(r"([1-9][0-9]{0,8})\.(json|deleted)")
+
+
+def recipe_directory(name):
+    if not isinstance(name, str) or not JOB_ID.fullmatch(name):
+        raise ValueError(
+            "Recipe names are 1–64 letters, digits, underscores or hyphens, starting with a "
+            "letter or digit"
+        )
+    return STATE / "recipes" / name
+
+
+def revisions(directory):
+    """Stored revision numbers, and the highest number ever used (deleted ones included)."""
+    stored, used = [], 0
+    for path in listing(directory):
+        match = REVISION_FILE.fullmatch(path.name)
+        if match:
+            used = max(used, int(match[1]))
+            if match[2] == "json":
+                stored.append(int(match[1]))
+    return sorted(stored), used
+
+
+def recipe_digest(document):
+    body = {key: value for key, value in document.items() if key != "sha256"}
+    return hashlib.sha256(canonical(body).encode()).hexdigest()
+
+
+def check_recipe(document, where):
+    """Schema and integrity of a recipe document; raises ValueError saying what to do."""
+    if not isinstance(document, dict) or document.get("format") != RECIPE_FORMAT:
+        raise ValueError(f"{where} is not a VisoMaster recipe (format {RECIPE_FORMAT!r})")
+    if document.get("version") != RECIPE_VERSION:
+        raise ValueError(
+            f"{where} has recipe format version {document.get('version')!r}, but this release "
+            f"reads version {RECIPE_VERSION} only; use a release that reads it, or save the "
+            "recipe again with this one"
+        )
+    if document.get("sha256") != recipe_digest(document):
+        raise ValueError(
+            f"{where} fails its integrity check: its content does not match its sha256, so it "
+            "was edited or damaged after it was written. Export it again from its source"
+        )
+    if set(document) != RECIPE_KEYS:
+        fields = sorted(set(document) ^ RECIPE_KEYS)
+        raise ValueError(f"{where} has unexpected or missing fields: {', '.join(fields)}")
+    recipe_directory(document["name"])
+    request, record = document["request"], document["provenance"]
+    if type(document["revision"]) is not int or document["revision"] < 1:
+        raise ValueError(f"{where} has an invalid revision")
+    if not isinstance(record, dict) or set(record) != PROVENANCE_KEYS:
+        raise ValueError(f"{where} has malformed provenance")
+    try:
+        allowed = {"kind", "media_sha256", "media_path", "mappings", *RANGE[request["kind"]]}
+        inputs = recorded_inputs(request)
+    except (KeyError, TypeError, AttributeError):
+        raise ValueError(f"{where} has a malformed request") from None
+    if set(request) - allowed - set(CARRIED) or not request["mappings"]:
+        raise ValueError(f"{where} has a malformed request")
+    for place, entry in inputs.items():
+        path, digest = entry["path"], entry["sha256"]
+        if not isinstance(path, str) or not os.path.isabs(path):
+            raise ValueError(f"{where}: {place} must be an absolute path")
+        if not isinstance(digest, str) or not SHA256.fullmatch(digest):
+            raise ValueError(f"{where}: {place} has no valid SHA-256")
+    return document
+
+
+def read_recipe(name, revision=None):
+    directory = recipe_directory(name)
+    stored, _ = revisions(directory)
+    if not stored:
+        raise ValueError(f"No recipe named {name}; get_recipe without a name lists them")
+    revision = stored[-1] if revision is None else revision
+    if revision not in stored or type(revision) is not int:
+        raise ValueError(f"Recipe {name} has no revision {revision}; it has {stored}")
+    where = f"Recipe {name} revision {revision}"
+    try:
+        document = read_json(directory / f"{revision}.json")
+    except ValueError:
+        raise ValueError(f"{where} is not valid JSON; delete it with delete_recipe") from None
+    check_recipe(document, where)
+    if (document["name"], document["revision"]) != (name, revision):
+        raise ValueError(f"{where} names another recipe or revision; it was moved or copied")
+    return document, stored
+
+
+def publish_recipe(name, fields):
+    """Write the next revision of `name`. A complete file is hard-linked into place, which fails
+    rather than replace an existing revision, so concurrent writers each get their own."""
+    directory = recipe_directory(name)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    while True:
+        revision = revisions(directory)[1] + 1
+        document = {"format": RECIPE_FORMAT, "version": RECIPE_VERSION, **fields}
+        document.update(name=name, revision=revision)
+        document["sha256"] = recipe_digest(document)
+        fd, temporary = tempfile.mkstemp(dir=directory, prefix=".write-")
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(document, stream, allow_nan=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.link(temporary, directory / f"{revision}.json")
+            return document
+        except FileExistsError:
+            continue
+        finally:
+            os.unlink(temporary)
+
+
+def recipe_request(request):
+    """The explicit swap request a recipe stores: resolved inputs, range and carried fields."""
+    kind = request["kind"]
+    template = {"kind": kind, "media_path": request["media_path"]}
+    if request.get("media_sha256") is not None:
+        template["media_sha256"] = request["media_sha256"]
+    for key in RANGE[kind]:
+        template[key] = request.get(key, None if key == "max_frames" else 0)
+    for key in CARRIED:
+        if request.get(key) is not None:
+            template[key] = copy.deepcopy(request[key])
+    template["mappings"] = [
+        {key: copy.deepcopy(mapping[key]) for key in MAPPING_KEYS if mapping.get(key) is not None}
+        for mapping in request["mappings"]
+    ]
+    return template
+
+
+def apply_digests(request, inputs):
+    """Set the request's input fingerprints to those of `inputs` (see recorded_inputs)."""
+    request["media_sha256"] = inputs["media_path"]["sha256"]
+    for index, mapping in enumerate(request["mappings"]):
+        place = f"mappings[{index}]"
+        mapping["target_sha256"] = inputs[f"{place}.target_face"]["sha256"]
+        mapping["source_sha256"] = [
+            inputs[f"{place}.source_faces[{number}]"]["sha256"]
+            for number in range(len(mapping["source_faces"]))
+        ]
+
+
+def set_input(request, place, path):
+    if place == "media_path":
+        request["media_path"] = path
+        return
+    match = re.fullmatch(r"mappings\[(\d+)\]\.(?:target_face|source_faces\[(\d+)\])", place)
+    mapping = request["mappings"][int(match[1])]
+    if match[2] is None:
+        mapping["target_face"] = path
+    else:
+        mapping["source_faces"][int(match[2])] = path
+
+
+def pin_settings(request, settings):
+    """Pass every adjustable setting explicitly at its effective value, so a later default
+    change cannot alter what the recipe runs with."""
+    controls, parameters = layouts()
+    request["controls"] = {
+        key: settings["controls"][key] for key in sorted(CONTROLS) if key in controls
+    }
+    for mapping, effective in zip(request["mappings"], settings["parameters"]):
+        mapping["parameters"] = {
+            key: effective[key] for key in sorted(PARAMETERS) if key in parameters
+        }
+
+
+def unavailable(inputs):
+    return [
+        f"{place} {entry['path']}" for place, entry in inputs.items() if entry["sha256"] is None
+    ]
+
+
+def retain(request):
+    """Copy the request's face references into the content-addressed upload store, pointing the
+    request at the copies; returns {copy: original} and the staged (temporary, copy) pairs, which
+    publish_retained publishes under the retention lock. References whose type has no upload
+    name stay where they are, unretained."""
+    retained, staged = {}, []
+
+    def keep(path, digest):
+        source = Path(path)
+        try:
+            destination, _ = upload_destination(digest, source.suffix.lower(), 1)
+        except ValueError:
+            return path
+        if source == destination or str(destination) in retained:
+            retained.setdefault(str(destination), path)
+            return str(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = destination.with_name(f"{destination.name}.{os.urandom(4).hex()}.partial")
+        staged.append((temporary, destination))
+        hasher = hashlib.sha256()
+        with source.open("rb") as reader, temporary.open("xb") as writer:
+            while chunk := reader.read(1024 * 1024):
+                hasher.update(chunk)
+                writer.write(chunk)
+        if hasher.hexdigest() != digest:
+            raise ValueError(f"Reference {path} changed while it was copied; save the recipe again")
+        retained[str(destination)] = path
+        return str(destination)
+
+    try:
+        for mapping in request["mappings"]:
+            mapping["target_face"] = keep(mapping["target_face"], mapping["target_sha256"])
+            mapping["source_faces"] = [
+                keep(path, digest)
+                for path, digest in zip(mapping["source_faces"], mapping["source_sha256"])
+            ]
+    except BaseException:
+        discard(staged)
+        raise
+    return retained, staged
+
+
+def publish_retained(staged):
+    """Publish staged copies; the caller holds the retention lock, so prune sees them."""
+    for temporary, destination in staged:
+        if destination.is_file() and not destination.is_symlink():
+            os.utime(destination)  # Identical bytes by name: reuse counts as recent use.
+        else:
+            os.replace(temporary, destination)
+
+
+def discard(staged):
+    for temporary, _ in staged:
+        temporary.unlink(missing_ok=True)
+
+
+def store_recipe(name, request, fields):
+    """Retain the request's references and write the next revision under the retention lock."""
+    retained, staged = retain(request)
+    try:
+        with retention_lock():
+            publish_retained(staged)
+            document = publish_recipe(
+                name,
+                {
+                    "created_at": time.time(),
+                    "frame_convention": FRAME_CONVENTION,
+                    "request": request,
+                    "retained": retained,
+                    **fields,
+                },
+            )
+    finally:
+        discard(staged)
+    return {"recipe": document, "retention": retention_report(document["request"])}
+
+
+def retention_report(request):
+    """Per input: retained (a managed file retention keeps while a recipe names it) or
+    unretained (outside state storage: a change or removal is detected, not prevented), and
+    missing when the path no longer exists."""
+    report = {}
+    for place, entry in recorded_inputs(request).items():
+        path = Path(entry["path"])
+        kept = STATE is not None and path.is_relative_to(STATE)
+        report[place] = ("retained" if kept else "unretained") + (
+            "" if path.is_file() else ", missing"
+        )
+    return report
+
+
+def job_recipe(job_id):
+    """A completed swap job's request, as resolved and fingerprinted at submission, with the
+    release, revision, configuration and models of its execution."""
+    directory = job_path(job_id)
+    resolved = directory / "resolved.json"
+    try:
+        state = read_json(directory / "state.json")
+        request = read_json(resolved if resolved.exists() else directory / "request.json")
+        if state.get("status") != "completed" or request.get("kind") not in RANGE:
+            raise ValueError(
+                f"Job {job_id} is a {state.get('status')} {request.get('kind')} job; recipes "
+                "come from completed preview or render jobs"
+            )
+        result = read_json(directory / "result.json")
+    except (OSError, AttributeError, json.JSONDecodeError):
+        raise ValueError(f"Job {job_id} has no readable state, request and result") from None
+    if not resolved.exists():
+        request = resolve_inputs(request)  # Submitted by an earlier release.
+    release = state.get("release")
+    recorded = {
+        "fusion_revision": result.get("revision"),
+        "adapter": code_identity(release) if release else {"release": None, "code": None},
+        "config_sha256": state.get("config_sha256"),
+    }
+    origin = {"kind": "job", "job_id": job_id, "finished_at": state.get("finished_at")}
+    if isinstance(request.get("recipe"), dict):
+        parent = request["recipe"]
+        origin["recipe"] = {key: parent.get(key) for key in ("name", "revision", "sha256")}
+    return recipe_request(request), recorded, result.get("models") or [], origin
+
+
+def save_recipe(request):
+    """Save a new revision of recipe `name` from a completed job or an explicit request."""
+    name, note = request.get("name"), request.get("note")
+    recipe_directory(name)
+    if note is not None and (not isinstance(note, str) or len(note) > 2000):
+        raise ValueError("note must be text of at most 2000 characters")
+    intent = {key: value for key, value in request.items() if key not in {"name", "note"}}
+    if request.get("job_id") is not None:
+        if set(intent) != {"job_id"}:
+            raise ValueError("Save a recipe from either job_id or an explicit request, not both")
+        template, recorded, models, origin = job_recipe(request["job_id"])
+    else:
+        intent.pop("job_id", None)
+        extra = sorted(set(intent) - INTENT_KEYS)
+        if extra:
+            raise ValueError(f"Recipes do not accept {', '.join(extra)}")
+        if intent.get("kind") not in RANGE:
+            raise ValueError("A recipe is a preview or render request with explicit mappings")
+        validate_request(intent)
+        template, recorded, models = recipe_request(resolve_inputs(intent)), {}, []
+        origin = {"kind": "request"}
+    current = provenance(template, models)
+    missing = unavailable(current["inputs"])
+    if missing:
+        raise ValueError(f"Inputs are unavailable: {'; '.join(missing)}")
+    for place, entry in recorded_inputs(template).items():
+        if entry["sha256"] not in (None, current["inputs"][place]["sha256"]):
+            raise ValueError(
+                f"{place} {entry['path']} no longer has the bytes the job used (SHA-256 "
+                f"{entry['sha256']}); the recipe cannot record them. Save it from an explicit "
+                "request instead, or rerun the job"
+            )
+    if recorded and recorded["fusion_revision"] != current["fusion_revision"]:
+        raise ValueError(
+            f"Job ran Fusion {recorded['fusion_revision']}, but the workstation now has "
+            f"{current['fusion_revision']}, so its effective defaults cannot be reconstructed; "
+            "save the recipe from an explicit request instead"
+        )
+    apply_digests(template, current["inputs"])
+    pin_settings(template, current["settings"])
+    record = {key: current[key] for key in PROVENANCE_KEYS}
+    record.update(recorded)
+    return store_recipe(name, template, {"note": note, "origin": origin, "provenance": record})
+
+
+def get_recipe(request):
+    """List recipes, or read one revision; with verify, hash its inputs and models now."""
+    name = request.get("name")
+    if name is None:
+        return {"recipes": list_recipes()}
+    document, stored = read_recipe(name, request.get("revision"))
+    result = {
+        "recipe": document,
+        "revisions": stored,
+        "retention": retention_report(document["request"]),
+    }
+    if request.get("verify"):
+        template = document["request"]
+        recorded = {**document["provenance"], "inputs": recorded_inputs(template)}
+        current = provenance(template, document["provenance"]["models"])
+        found = provenance_changes(recorded, current)
+        result["verification"] = {"unchanged": not found, "changes": found}
+    return result
+
+
+def list_recipes():
+    entries = []
+    for directory in listing(STATE / "recipes"):
+        if not JOB_ID.fullmatch(directory.name) or not directory.is_dir():
+            continue
+        stored, _ = revisions(directory)
+        if not stored:
+            continue
+        entry = {"name": directory.name, "revisions": stored}
+        try:
+            document, _ = read_recipe(directory.name)
+        except (OSError, ValueError) as error:
+            entry["error"] = str(error)
+        else:
+            entry.update(
+                kind=document["request"]["kind"],
+                media_path=document["request"]["media_path"],
+                created_at=document["created_at"],
+                origin=document["origin"]["kind"],
+                note=document["note"],
+            )
+        entries.append(entry)
+    return entries
+
+
+def delete_recipe(name, revision=None):
+    """Delete one revision, or all; a tombstone keeps its number from being reused. Inputs are
+    never deleted here: retention may remove them once no recipe or active job names them."""
+    directory = recipe_directory(name)
+    with retention_lock():
+        stored, _ = revisions(directory)
+        chosen = stored if revision is None else [revision]
+        if not stored or not set(chosen) <= set(stored):
+            raise ValueError(f"Recipe {name} has no revision {revision}; it has {stored}")
+        for number in chosen:
+            (directory / f"{number}.deleted").touch()
+            (directory / f"{number}.json").unlink()
+    return {"name": name, "deleted": chosen, "remaining": sorted(set(stored) - set(chosen))}
+
+
+def instantiate(template, request):
+    """The recipe's request with the caller's explicit substitutions, and their record."""
+    new, substitutions = copy.deepcopy(template), {}
+    mode = request.get("mode") or template["kind"]
+    if mode not in RANGE:
+        raise ValueError("mode must be preview or render")
+    if mode != template["kind"]:
+        substitutions["mode"] = {"recorded": template["kind"], "used": mode}
+        new["kind"] = mode
+        for key in RANGE[template["kind"]]:
+            new.pop(key)
+        if mode == "preview" and "report" in new:
+            substitutions["report"] = {"recorded": new.pop("report"), "used": None}
+    if request.get("media_path") is not None:
+        path = str(input_path(request["media_path"]))
+        if path != template["media_path"]:
+            new["media_path"] = path
+            substitutions["media_path"] = {"recorded": template["media_path"], "used": path}
+    targets = request.get("targets")
+    if targets is not None:
+        count = len(new["mappings"])
+        if not isinstance(targets, list) or len(targets) != count:
+            raise ValueError(f"targets must list one target_face per recipe mapping ({count})")
+        for index, (mapping, target) in enumerate(zip(new["mappings"], targets)):
+            path = str(input_path(target))
+            if path != mapping["target_face"]:
+                substitutions.setdefault("targets", []).append(
+                    {"mapping": index, "recorded": mapping["target_face"], "used": path}
+                )
+                mapping["target_face"] = path
+    frames = request.get("range")
+    if frames is not None:
+        if not isinstance(frames, dict) or set(frames) != set(RANGE[mode]):
+            raise ValueError(f"range for a {mode} gives exactly {' and '.join(RANGE[mode])}")
+        recorded = {key: template[key] for key in RANGE[template["kind"]]}
+        new.update(frames)
+        if frames != recorded:
+            substitutions["range"] = {"recorded": recorded, "used": frames}
+    elif "mode" in substitutions:
+        raise ValueError(
+            f"A {mode} of a {template['kind']} recipe needs an explicit range "
+            f"({' and '.join(RANGE[mode])})"
+        )
+    if request.get("report") is not None:
+        if new.get("report") != request["report"]:
+            substitutions["report"] = {"recorded": new.get("report"), "used": request["report"]}
+        new["report"] = request["report"]
+    if request.get("priority") is not None:
+        new["priority"] = request["priority"]
+    return new, substitutions
+
+
+def run_recipe(request):
+    """Submit a new swap job from a recipe revision, with explicit, recorded substitutions."""
+    extra = sorted(set(request) - RUN_KEYS)
+    if extra:
+        raise ValueError(f"run_recipe does not accept {', '.join(extra)}")
+    accept = request.get("accept_changes", False)
+    if not isinstance(accept, bool):
+        raise ValueError("accept_changes must be a boolean")
+    job_id = request["job_id"]
+    directory = job_path(job_id)
+    invocation = {key: request.get(key) for key in sorted(RUN_KEYS - {"job_id"})}
+    # A retry returns the job before anything is hashed, so it answers after inputs are pruned.
+    if (directory / "request.json").exists():
+        try:
+            previous = read_json(directory / "request.json")["recipe"]["invocation"]
+        except (OSError, ValueError, KeyError, TypeError):
+            previous = None
+        if previous is None or canonical(previous) != canonical(invocation):
+            raise ValueError("job_id already exists with a different request")
+        return status(job_id)
+    document, _ = read_recipe(request["name"], request.get("revision"))
+    template = document["request"]
+    new, substitutions = instantiate(template, request)
+    current = provenance(new, document["provenance"]["models"])
+    missing = unavailable(current["inputs"])
+    if missing:
+        raise ValueError(
+            f"Recipe inputs are unavailable: {'; '.join(missing)}. Restore or re-upload them "
+            "(upload_media stores identical bytes at uploads/<sha256><suffix>), or substitute "
+            "media_path or targets explicitly"
+        )
+    media = current["inputs"]["media_path"]["sha256"]
+    if "media_path" in substitutions:
+        substitutions["media_path"].update(recorded_sha256=template["media_sha256"], sha256=media)
+        expected = (template.get("report") or {}).get("expected_visible")
+        needed = [key for key in ("targets", "range") if request.get(key) is None]
+        needed += ["report"] if expected and request.get("report") is None else []
+        if media != template["media_sha256"] and needed:
+            raise ValueError(
+                "media_path has different content from the recipe's clip, so applying the "
+                f"recipe to it needs explicit {', '.join(needed)}: targets lists one "
+                "target_face per mapping from a detection on the new clip, range the frames to "
+                "process, and report replaces expected_visible ranges of the recipe's clip. A "
+                "target from another clip is not assumed to be valid"
+            )
+    recorded = {**document["provenance"], "inputs": recorded_inputs(template)}
+    found = provenance_changes(recorded, current)
+    if found and not accept:
+        raise ValueError(
+            "Recipe "
+            f"{document['name']} revision {document['revision']} no longer matches the "
+            "workstation:\n- "
+            + "\n- ".join(change["message"] for change in found)
+            + "\nReview the changes (get_recipe with verify), then rerun with "
+            "accept_changes=true to run with the current inputs, models and code, or save a "
+            "new revision"
+        )
+    apply_digests(new, current["inputs"])
+    new["recipe"] = {
+        "name": document["name"],
+        "revision": document["revision"],
+        "sha256": document["sha256"],
+        "invocation": invocation,
+        "substitutions": substitutions,
+        "accepted_changes": found,
+    }
+    return submit({"job_id": job_id, **new})
+
+
+def import_recipe(request):
+    """Store an exported recipe as a new revision here, after checking its schema, integrity,
+    inputs (allowed paths with their recorded bytes) and settings."""
+    document = request.get("document")
+    check_recipe(document, "The imported recipe")
+    name = request.get("name") or document["name"]
+    recipe_directory(name)
+    template = copy.deepcopy(document["request"])
+    relocated, missing = [], []
+    for place, entry in recorded_inputs(template).items():
+        if current_digest(entry["path"]) == entry["sha256"]:
+            continue
+        # Uploads are named by content, so identical bytes uploaded here are found by digest.
+        upload = STATE / "uploads" / (entry["sha256"] + Path(entry["path"]).suffix.lower())
+        if current_digest(upload) == entry["sha256"]:
+            set_input(template, place, str(upload))
+            relocated.append({"input": place, "recorded": entry["path"], "used": str(upload)})
+        else:
+            missing.append(f"{place} {entry['path']} (SHA-256 {entry['sha256']})")
+    if missing:
+        raise ValueError(
+            "Cannot import: these inputs are not available here with their recorded bytes: "
+            + "; ".join(missing)
+            + ". Upload each file with upload_media (identical bytes are stored as "
+            "uploads/<sha256><suffix>, which import finds) or place it at its recorded path, "
+            "then import again"
+        )
+    validate_request(template)  # Allowed paths, reference bytes and installed settings.
+    source = {key: document[key] for key in ("name", "revision", "sha256", "created_at")}
+    origin = {"kind": "import", "source": source, "source_origin": document["origin"]}
+    origin["relocated"] = relocated
+    fields = {key: document[key] for key in ("note", "provenance")}
+    return store_recipe(name, template, {**fields, "origin": origin})
 
 
 def rerun(release, payload):

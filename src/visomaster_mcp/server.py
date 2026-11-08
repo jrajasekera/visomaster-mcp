@@ -442,10 +442,257 @@ async def prune_storage(
     """Report or delete old terminal jobs, unused uploads and files left by crashed transfers.
 
     Removes terminal jobs finished more than `older_than_days` ago and uploads untouched for
-    that long, except files a queued/running job uses as input. Dry run by default and with
+    that long, except files a saved recipe or a queued/running job uses as input. Dry run by default and with
     the same checks; returns the paths, jobs and byte totals that were (or would be) deleted.
     """
     return await command("prune", older_than_days=older_than_days, dry_run=dry_run)
+
+
+RecipeName = Annotated[
+    str,
+    Field(
+        description="Recipe name: 1–64 letters, digits, underscores or hyphens, starting with a "
+        "letter or digit"
+    ),
+]
+RecipeRevision = Annotated[
+    int | None, Field(ge=1, description="Revision number; default the latest")
+]
+HASHING_TIMEOUT = 900  # Recipe calls hash media and model files on the workstation.
+RECIPE_LIMIT = 4 * 1024**2
+
+
+class RecipeRange(BaseModel):
+    """Frames to process: `frame` for a preview; `start_frame` and `max_frames` (null: through
+    the end) for a render. Zero-based, in decoded order."""
+
+    model_config = ConfigDict(extra="forbid")
+    frame: int | None = Field(None, ge=0)
+    start_frame: int | None = Field(None, ge=0)
+    max_frames: int | None = Field(None, ge=1)
+
+
+@mcp.tool(annotations=WRITE)
+async def save_recipe(
+    name: RecipeName,
+    job_id: Annotated[
+        str | None, Field(description="A completed preview or render job to save")
+    ] = None,
+    media_path: str | None = None,
+    mappings: list[FaceMapping] | None = None,
+    mode: Literal["preview", "render"] = "preview",
+    frame: int = 0,
+    start_frame: int = 0,
+    max_frames: int | None = None,
+    controls: dict | None = None,
+    report: SwapReportOptions | None = None,
+    priority: Priority = None,
+    note: Annotated[str | None, Field(max_length=2000)] = None,
+) -> dict[str, Any]:
+    """Save a new immutable revision of a named, reusable swap configuration (a recipe).
+
+    Give either `job_id` (a completed preview or render, recorded with the release, Fusion
+    revision and models it ran with) or an explicit request (media_path, mappings, mode and its
+    range, controls) as submit_swap takes it. The recipe stores the resolved request with every
+    adjustable setting pinned at its effective value, the full effective settings, the SHA-256
+    of the media and of every target and source image, source weights, the frame convention,
+    the Fusion revision, the adapter release and its code hashes, the configuration identity and
+    the names, paths and SHA-256 of the selected and loaded model files (never their weights).
+    Face references are copied into the content-addressed upload store and kept while a recipe
+    names them; `retention` says which inputs are retained. Media and models are hashed now,
+    so a large video takes a while. Saving again under a name adds a revision; earlier
+    revisions, and jobs that name them, never change.
+    """
+    if job_id is not None:
+        return await command(
+            "recipe_save", timeout=HASHING_TIMEOUT, name=name, job_id=job_id, note=note
+        )
+    if media_path is None or not mappings:
+        raise ValueError("Give job_id, or media_path and mappings")
+    frames = {"frame": frame} if mode == "preview" else {"start_frame": start_frame}
+    if mode == "render":
+        frames["max_frames"] = max_frames
+    optional = (
+        ("report", None if report is None else report.model_dump(exclude_none=True)),
+        ("priority", priority),
+        ("note", note),
+    )
+    return await command(
+        "recipe_save",
+        timeout=HASHING_TIMEOUT,
+        name=name,
+        kind=mode,
+        media_path=media_path,
+        mappings=[m.model_dump(exclude_none=True) for m in mappings],
+        controls=controls or {},
+        **frames,
+        **{key: value for key, value in optional if value is not None},
+    )
+
+
+@mcp.tool(annotations=READ)
+async def get_recipe(
+    name: RecipeName | None = None,
+    revision: RecipeRevision = None,
+    verify: Annotated[
+        bool,
+        Field(
+            description="Hash the recipe's inputs and models now and report what changed since "
+            "it was saved"
+        ),
+    ] = False,
+) -> dict[str, Any]:
+    """Without a name, list recipes and their revisions. With one, return a revision's document.
+
+    The document is what export_recipe writes. `retention` marks each input retained (kept by
+    retention while the recipe names it) or unretained (outside state storage), and missing.
+    With `verify`, `verification.changes` lists, readably, every input whose bytes changed or
+    that is unavailable, changed settings or defaults, a different Fusion revision, adapter
+    code, configuration, and changed or missing model files.
+    """
+    return await command(
+        "recipe_get",
+        timeout=HASHING_TIMEOUT if verify else 45,
+        name=name,
+        revision=revision,
+        verify=verify,
+    )
+
+
+@mcp.tool(annotations=WRITE)
+async def run_recipe(
+    name: RecipeName,
+    revision: RecipeRevision = None,
+    mode: Annotated[
+        Literal["preview", "render"] | None, Field(description="Default: the recipe's mode")
+    ] = None,
+    media_path: Annotated[
+        str | None,
+        Field(description="Substitute media; content that differs needs targets and range"),
+    ] = None,
+    targets: Annotated[
+        list[str] | None,
+        Field(description="Substitute target_face paths, one per recipe mapping, in order"),
+    ] = None,
+    frame_range: Annotated[
+        RecipeRange | None,
+        Field(description="Substitute frames; required with a new clip or a changed mode"),
+    ] = None,
+    report: SwapReportOptions | None = None,
+    priority: Priority = None,
+    accept_changes: Annotated[
+        bool,
+        Field(
+            description="Run even though inputs, defaults, models, adapter code or the Fusion "
+            "revision changed since the recipe was saved; the changes are recorded in the job"
+        ),
+    ] = False,
+    job_id: JobId = None,
+) -> dict[str, Any]:
+    """Queue a new preview or render job from a recipe revision, with explicit substitutions.
+
+    The job runs the recipe's explicit request with its pinned settings, sources and weights.
+    Before submitting, every input and model file is hashed and compared with the recipe; if
+    anything changed (input bytes at the same path, defaults, model files, adapter code, Fusion
+    revision or configuration) the call fails with a readable list of the changes unless
+    `accept_changes` is true. Unavailable inputs always fail with the inputs to restore. Media
+    with different content is a new clip: it needs explicit `targets` from a detection on that
+    clip and an explicit `frame_range` (and `report` if the recipe has expected_visible
+    ranges). The job's request and result record `recipe`: name, revision, the document's
+    sha256, the invocation, substitutions and accepted changes. The worker hashes the media
+    again before decoding it. Outputs are expected to be equivalent, not bit-identical: GPU
+    kernels and drivers are not pinned. A retry with the same job_id and arguments returns the
+    existing job.
+    """
+    values = {
+        "mode": mode,
+        "media_path": media_path,
+        "targets": targets,
+        "range": None if frame_range is None else frame_range.model_dump(exclude_unset=True),
+        "report": None if report is None else report.model_dump(exclude_none=True),
+        "priority": priority,
+    }
+    return await command(
+        "recipe_run",
+        timeout=HASHING_TIMEOUT,
+        job_id=uuid.uuid4().hex if job_id is None else job_id,
+        name=name,
+        revision=revision,
+        accept_changes=accept_changes,
+        **{key: value for key, value in values.items() if value is not None},
+    )
+
+
+@mcp.tool(annotations=WRITE)
+async def export_recipe(name: RecipeName, revision: RecipeRevision = None) -> dict[str, Any]:
+    """Write a recipe revision as portable JSON in the local downloads directory.
+
+    The file holds configuration and provenance (paths, fingerprints, settings, versions and
+    model checksums), never media or model weights, and carries its own sha256, which
+    import_recipe checks. Returns its local path.
+    """
+    document = (await command("recipe_get", name=name, revision=revision))["recipe"]
+    data = json.dumps(document, indent=2, sort_keys=True).encode() + b"\n"
+    downloads = transport().downloads
+    downloads.mkdir(parents=True, exist_ok=True)
+    root = os.open(downloads, os.O_RDONLY | os.O_DIRECTORY)
+    file_name = plain_name(f"{document['name']}-r{document['revision']}.json")
+    temporary = f".recipe-{uuid.uuid4().hex}"
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        with open(os.open(temporary, flags, 0o666, dir_fd=root), "wb") as output:
+            output.write(data)
+        directory = download_directory(root, "recipes")
+        try:
+            os.replace(temporary, file_name, src_dir_fd=root, dst_dir_fd=directory)
+        finally:
+            os.close(directory)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=root)
+        os.close(root)
+    return {
+        "path": str(downloads / "recipes" / file_name),
+        "name": document["name"],
+        "revision": document["revision"],
+        "sha256": document["sha256"],
+    }
+
+
+@mcp.tool(annotations=WRITE)
+async def import_recipe(
+    local_path: str,
+    name: Annotated[
+        RecipeName | None, Field(description="Store under this name; default the recipe's own")
+    ] = None,
+) -> dict[str, Any]:
+    """Import an exported recipe file as a new revision on this workstation.
+
+    Refuses unsupported format versions, documents whose sha256 does not match their content,
+    malformed fields, inputs outside the allowed media and state roots, and settings the
+    installed Fusion does not accept. Every input must exist with its recorded bytes, at its
+    recorded path or as an upload with those bytes (upload_media the file first); otherwise the
+    error lists what to provide. Recorded provenance is kept, so run_recipe reports version
+    differences here.
+    """
+    path = Path(local_path).expanduser().resolve(strict=True)
+    if not path.is_file() or path.stat().st_size > RECIPE_LIMIT:
+        raise ValueError("Expected a recipe JSON file of at most 4 MiB")
+    try:
+        document = json.loads(path.read_bytes())
+    except ValueError as error:
+        raise ValueError(f"{path} is not JSON: {error}") from None
+    return await command("recipe_import", timeout=HASHING_TIMEOUT, document=document, name=name)
+
+
+@mcp.tool(annotations=DESTROY)
+async def delete_recipe(name: RecipeName, revision: RecipeRevision = None) -> dict[str, Any]:
+    """Delete one revision of a recipe, or all of them. Its number is never reused.
+
+    Deletes no media or uploads: inputs another recipe or a queued or running job uses stay
+    protected, and prune_storage may remove the rest once they are old enough.
+    """
+    return await command("recipe_delete", name=name, revision=revision)
 
 
 INLINE_LIMIT = 10_000_000

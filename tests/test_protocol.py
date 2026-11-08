@@ -14,7 +14,7 @@ def test_stdio_discovery():
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = {tool.name: tool for tool in (await session.list_tools()).tools}
-                assert len(tools) == 15
+                assert len(tools) == 21
                 assert tools["health_check"].annotations.readOnlyHint
                 normalize = tools["normalize_media"]
                 assert not normalize.annotations.readOnlyHint
@@ -48,6 +48,19 @@ def test_stdio_discovery():
                 options = swap["$defs"]["SwapReportOptions"]["properties"]
                 assert {"review_images", "expected_visible", "min_coverage"} == options.keys()
                 assert options["review_images"]["maximum"] == 24
+                for name in ("save_recipe", "run_recipe", "export_recipe", "import_recipe"):
+                    assert not tools[name].annotations.readOnlyHint
+                    assert not tools[name].annotations.destructiveHint
+                assert tools["get_recipe"].annotations.readOnlyHint
+                assert tools["delete_recipe"].annotations.destructiveHint
+                run = tools["run_recipe"].inputSchema
+                assert run["required"] == ["name"]
+                assert run["properties"]["accept_changes"]["default"] is False
+                assert {"media_path", "targets", "frame_range", "report", "priority"} <= (
+                    run["properties"].keys()
+                )
+                assert tools["save_recipe"].inputSchema["required"] == ["name"]
+                assert tools["import_recipe"].inputSchema["required"] == ["local_path"]
                 result = await session.call_tool(
                     "submit_swap", {"media_path": "x", "mappings": [{}]}
                 )

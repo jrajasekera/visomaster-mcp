@@ -13,6 +13,7 @@ from fractions import Fraction
 from pathlib import Path
 
 REVISION = "f2d6f5ebe190b631ee5c8972332083cf7f8a3e72"
+CODE = ("common.py", "control.py", "engine.py")
 CONFIG_NAME = "remote-config.json"
 CONFIG_KEYS = {"version", "media_root", "fusion_dir", "state_dir", "gpu", "runner", "lock_dir"}
 LAYOUT_NAMES = ("settings", "common", "swapper", "face_editor", "denoiser")
@@ -601,6 +602,12 @@ def validate_fusion_request(request):
     count = request.get("max_frames")
     if count is not None and (type(count) is not int or count < 1):
         raise ValueError("max_frames must be positive")
+    # Recipe instantiation records these; the worker hashes the media before decoding it.
+    media = request.get("media_sha256")
+    if media is not None and not (isinstance(media, str) and SHA256.fullmatch(media)):
+        raise ValueError("media_sha256 must be a 64-hex-digit SHA-256")
+    if not isinstance(request.get("recipe", {}), dict):
+        raise ValueError("recipe must be an object")
     control, parameters = layouts()
     if threshold is not None:
         # Identities are grouped on SimilarityThresholdSlider's scale, within its limits.
@@ -704,3 +711,256 @@ def validate_report(options, request, mappings):
                 "expected_visible ranges must satisfy start_frame < end_frame (exclusive) "
                 "within the requested frames"
             )
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def initial_controls(specs, requested):
+    """Fusion's control defaults, then the adapter's, then the request's validated controls."""
+    control = {k: v["default"] for k, v in specs.items()}
+    control.update(ADAPTER_CONTROLS, LandmarkDetectToggle=False, ForceSwapToggle=False)
+    control.update(requested)
+    return control
+
+
+def effective_settings(request):
+    """Every control and per-mapping parameter a swap runs with, defaults included."""
+    control, parameters = layouts()
+    defaults = {k: v["default"] for k, v in parameters.items()}
+    return {
+        "controls": initial_controls(control, request.get("controls", {})),
+        "parameters": [{**defaults, **m.get("parameters", {})} for m in request["mappings"]],
+    }
+
+
+def model_text(node):
+    """A models_data string: a literal, or an f-string over models_dir (APP/model_assets)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if not isinstance(node, ast.JoinedStr):
+        return None
+    parts = []
+    for value in node.values:
+        if isinstance(value, ast.Constant):
+            parts.append(value.value)
+        elif (
+            isinstance(value, ast.FormattedValue)
+            and isinstance(value.value, ast.Name)
+            and value.value.id == "models_dir"
+            and value.conversion == -1
+            and value.format_spec is None
+        ):
+            parts.append(str(APP / "model_assets"))
+        else:
+            return None
+    return "".join(parts)
+
+
+def model_catalog():
+    """Fusion's declared models (name: path and declared SHA-256) and its swap-to-ArcFace and
+    detector maps, read from models_data.py without importing Fusion; empty when unreadable."""
+    models, maps = {}, {}
+    try:
+        tree = ast.parse((APP / "app/processors/models_data.py").read_text())
+    except (OSError, SyntaxError):
+        return models, maps
+    for node in tree.body:
+        if not (isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)):
+            continue
+        name = node.targets[0].id
+        if name in ("arcface_mapping_model_dict", "detection_model_mapping"):
+            try:
+                maps[name] = ast.literal_eval(node.value)
+            except ValueError:
+                pass
+        elif name == "models_list" and isinstance(node.value, ast.List):
+            for item in node.value.elts:
+                if isinstance(item, ast.Dict):
+                    fields = {
+                        key.value: model_text(value)
+                        for key, value in zip(item.keys, item.values)
+                        if isinstance(key, ast.Constant)
+                    }
+                    if fields.get("model_name"):
+                        models[fields["model_name"]] = (
+                            fields.get("local_path"),
+                            fields.get("hash"),
+                        )
+    return models, maps
+
+
+def model_names(settings, catalog):
+    """Models a swap's effective settings select: detector, recognizer, swapper and ArcFace.
+
+    A swap selection names its model with punctuation the model list may drop (GhostFace-v1 is
+    GhostFacev1), so names are also matched on letters and digits alone.
+    """
+    models, maps = catalog
+
+    def key(value):
+        return re.sub(r"[^0-9a-z]", "", str(value).lower())
+
+    loose = {key(name): name for name in models}
+    controls = settings["controls"]
+    names = {
+        controls.get("RecognitionModelSelection"),
+        maps.get("detection_model_mapping", {}).get(controls.get("DetectorModelSelection")),
+    }
+    for parameters in settings["parameters"]:
+        swap = parameters.get("SwapModelSelection")
+        names.add(maps.get("arcface_mapping_model_dict", {}).get(swap))
+        names.add(swap if swap in models else loose.get(key(swap), swap))
+    return {name for name in names if isinstance(name, str) and name}
+
+
+def model_identity(names, catalog):
+    """Per model: its file, the SHA-256 Fusion declares and the SHA-256 of the file's bytes."""
+    models, _ = catalog
+    identity = {}
+    for name in sorted(names):
+        path, declared = models.get(name, (None, None))
+        try:
+            digest = file_sha256(path) if path else None
+        except OSError:
+            digest = None
+        identity[name] = {"path": path, "declared_sha256": declared, "sha256": digest}
+    return identity
+
+
+def code_identity(directory=None):
+    """A release directory's name and the SHA-256 of each adapter file (None once removed)."""
+    directory = Path(directory) if directory else Path(__file__).resolve().parent
+    try:
+        files = {name: file_sha256(directory / name) for name in CODE}
+    except OSError:
+        files = None
+    return {"release": directory.name, "code": files}
+
+
+def recorded_inputs(request):
+    """Each input of a swap request keyed by its place, with the SHA-256 the request records."""
+    inputs = {"media_path": {"path": request["media_path"], "sha256": request.get("media_sha256")}}
+    for index, mapping in enumerate(request["mappings"]):
+        place = f"mappings[{index}]"
+        inputs[f"{place}.target_face"] = {
+            "path": mapping["target_face"],
+            "sha256": mapping.get("target_sha256"),
+        }
+        digests = mapping.get("source_sha256") or [None] * len(mapping["source_faces"])
+        for number, (path, digest) in enumerate(zip(mapping["source_faces"], digests)):
+            inputs[f"{place}.source_faces[{number}]"] = {"path": path, "sha256": digest}
+    return inputs
+
+
+def current_digest(path):
+    """SHA-256 of an allowed input's bytes now, or None if it is missing or not an input."""
+    try:
+        return file_sha256(input_path(path))
+    except (OSError, ValueError):
+        return None
+
+
+def provenance(request, models=()):
+    """What a swap request's output depends on, apart from the GPU, its driver and CUDA stack.
+
+    The bytes of every input (at its resolved path) and of the selected and `models` model
+    files, the effective settings, the Fusion revision, the adapter release and its code, and
+    the configuration identity. Each call hashes every file in a streamed pass, so callers use
+    it at deliberate boundaries (recipe creation, verification and instantiation), never per
+    status poll. provenance_changes compares two records, so recorded work can be checked
+    before it is reused.
+    """
+    settings = effective_settings(request)
+    catalog = model_catalog()
+    inputs = recorded_inputs(request)
+    hashes = {}
+    for entry in inputs.values():
+        if entry["path"] not in hashes:
+            hashes[entry["path"]] = current_digest(entry["path"])
+        entry["sha256"] = hashes[entry["path"]]
+    return {
+        "inputs": inputs,
+        "settings": settings,
+        "fusion_revision": fusion_compatibility(APP)[0],
+        "adapter": code_identity(),
+        "config_sha256": SETTINGS.sha256,
+        "models": model_identity(model_names(settings, catalog) | set(models), catalog),
+    }
+
+
+def short(value):
+    return value[:12] + "…" if isinstance(value, str) and SHA256.fullmatch(value) else value
+
+
+def provenance_changes(recorded, current):
+    """Readable differences between two provenance records, as a list of entries.
+
+    An input whose path differs is a substitution, which the caller records, not a change; one
+    that became unavailable is a change whose current SHA-256 is None. Release names alone are
+    not compared: a new release with identical code runs the same adapter.
+    """
+    found = []
+
+    def add(kind, item, before, after, message):
+        found.append(
+            {"kind": kind, "item": item, "recorded": before, "current": after, "message": message}
+        )
+
+    for place, entry in recorded["inputs"].items():
+        now = current["inputs"].get(place)
+        if now is None or now["path"] != entry["path"] or now["sha256"] == entry["sha256"]:
+            continue
+        state = (
+            "is missing or no longer an allowed input"
+            if now["sha256"] is None
+            else f"has different bytes (SHA-256 {short(entry['sha256'])} now {short(now['sha256'])})"
+        )
+        add("input", place, entry["sha256"], now["sha256"], f"{place} {entry['path']} {state}")
+    groups = [("controls", recorded["settings"]["controls"], current["settings"]["controls"])]
+    for index, pair in enumerate(
+        zip(recorded["settings"]["parameters"], current["settings"]["parameters"])
+    ):
+        groups.append((f"mappings[{index}].parameters", *pair))
+    for group, before, after in groups:
+        for key in sorted(set(before) | set(after)):
+            was, now = before.get(key, "(absent)"), after.get(key, "(absent)")
+            if canonical(was) != canonical(now):
+                add("setting", f"{group}.{key}", was, now, f"{group}.{key} {was!r} now {now!r}")
+    was, now = recorded["fusion_revision"], current["fusion_revision"]
+    if was != now:
+        add("fusion", "revision", was, now, f"Fusion revision {was} now {now}")
+    before, after = recorded["adapter"], current["adapter"]
+    for name in CODE:
+        was = (before["code"] or {}).get(name)
+        now = (after["code"] or {}).get(name)
+        if was is None or was != now:
+            add(
+                "adapter",
+                name,
+                was,
+                now,
+                f"Adapter {name} of release {before['release']} "
+                + ("is unknown (release removed)" if was is None else f"was {short(was)}")
+                + f"; release {after['release']} has {short(now)}",
+            )
+    if recorded["config_sha256"] != current["config_sha256"]:
+        add(
+            "config",
+            "config_sha256",
+            recorded["config_sha256"],
+            current["config_sha256"],
+            "The workstation configuration (paths, GPU or runner) changed",
+        )
+    for name in sorted(set(recorded["models"]) | set(current["models"])):
+        was, now = recorded["models"].get(name, {}), current["models"].get(name, {})
+        if canonical(was) != canonical(now):
+            if now.get("sha256") is None:
+                state = "is not in this Fusion's model list or its file is missing"
+            elif was.get("sha256") is None:
+                state = "was not recorded"
+            else:
+                state = f"has different bytes ({short(was['sha256'])} now {short(now['sha256'])})"
+            add("model", name, was.get("sha256"), now.get("sha256"), f"Model {name} {state}")
+    return found

@@ -18,14 +18,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from common import (
-    ADAPTER_CONTROLS,
     APP,
     CONFIG_ERROR,
     REVISION,
     SETTINGS,
     atomic_json,
     ffmpeg_input,
+    file_sha256,
     fusion_compatibility,
+    initial_controls,
     input_path,
     layouts,
     probe,
@@ -65,14 +66,6 @@ def initialize(controls):
     window.models_processor.update_provider_configuration("CUDA")
     window.function_worker = FunctionWorker(window.models_processor)
     return window
-
-
-def initial_controls(specs, requested):
-    """Fusion's control defaults, then the adapter's, then the request's validated controls."""
-    control = {k: v["default"] for k, v in specs.items()}
-    control.update(ADAPTER_CONTROLS, LandmarkDetectToggle=False, ForceSwapToggle=False)
-    control.update(requested)
-    return control
 
 
 def display_transform(stream):
@@ -1948,6 +1941,12 @@ def normalize_video(request, directory):
     }
 
 
+def loaded_models(window):
+    """Names of the Fusion models loaded when the job finished, which recipes fingerprint."""
+    models = getattr(getattr(window, "models_processor", None), "models", None) or {}
+    return sorted(name for name, model in models.items() if model is not None)
+
+
 def run(directory):
     # Linux kills the worker if its supervisor dies, including the startup race.
     parent = int(os.environ["VM_SUPERVISOR_PID"])
@@ -1974,6 +1973,15 @@ def run(directory):
         # FFmpeg only: Fusion and the GPU are never loaded.
         atomic_json(directory / "result.json", normalize_video(request, directory))
         return
+    expected = request.get("media_sha256")
+    if expected is not None:
+        # Recipe jobs name the media bytes they reproduce; hashed once, before Fusion loads.
+        atomic_json(directory / "progress.json", {"stage": "verifying_media"})
+        if file_sha256(input_path(request["media_path"])) != expected:
+            raise ValueError(
+                f"Media {request['media_path']} changed after submission (expected SHA-256 "
+                f"{expected}); verify the recipe again and resubmit"
+            )
     atomic_json(directory / "progress.json", {"stage": "loading_models"})
     window = initialize(request.get("controls", {}))
     artifacts = directory / "artifacts"
@@ -2010,6 +2018,9 @@ def run(directory):
         else:
             result = render_video(window, request, directory, worker)
         result["references"] = used
+        result["models"] = loaded_models(window)
+        if request.get("recipe"):
+            result["recipe"] = request["recipe"]
     result["revision"] = REVISION
     atomic_json(directory / "result.json", result)
 
