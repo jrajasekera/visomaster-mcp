@@ -553,11 +553,14 @@ def test_unqualified_combinations_are_labelled_but_still_accepted(site, monkeypa
     control.cancel("unqualified")
     two = swap(site)
     two["mappings"][0]["source_faces"] = [site.source, site.face]
-    differs = by_name(preflight(two))["qualification"]["evidence"]["mappings"][0]
+    assert by_name(preflight(two))["qualification"]["code"] == "qualified"
+    five = swap(site)
+    five["mappings"][0]["source_faces"] = [site.source, site.face] * 2 + [site.source]
+    differs = by_name(preflight(five))["qualification"]["evidence"]["mappings"][0]
     assert differs["nearest"]["differs_in"] == ["sources"]
     # Weight 0 excludes a source, so it does not count.
-    two["mappings"][0]["source_weights"] = [1, 0]
-    assert by_name(preflight(two))["qualification"]["code"] == "qualified"
+    five["mappings"][0]["source_weights"] = [1, 0, 0, 0, 0]
+    assert by_name(preflight(five))["qualification"]["code"] == "qualified"
     # Another hardware class, or none observed, is not covered by this evidence.
     monkeypatch.setattr(control, "output", lambda arguments: "8.6, 12288, 0\n")
     other = by_name(preflight(swap(site)))["qualification"]["evidence"]["mappings"][0]

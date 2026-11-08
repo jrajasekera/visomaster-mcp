@@ -381,7 +381,7 @@ def test_segment_accounting_is_restored_at_the_resume_point(site, monkeypatch):
         ({"record": "models"}, "Model YoloFace8n has different bytes"),
         ({"record": "adapter"}, "Adapter engine.py of release r1"),
         ({"record": "revision"}, "Fusion revision"),
-        ({"record": "tracking"}, "FaceTrackingEnableToggle carry tracking state"),
+        ({"record": "tracking"}, "FaceTrackingEnableToggle carries tracking state"),
         ({"request": {"report": {"review_images": 3}}}, "request differs"),
         ({"runtime": "ffmpeg version 0.1"}, "FFmpeg changed"),
     ],

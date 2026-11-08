@@ -180,6 +180,54 @@ QUALIFICATIONS = (
         "max_mappings": 1,
         "max_sources": 1,
     },
+    {
+        "id": "mappings-2026-11-08",
+        "date": "2026-11-08",
+        "source": "VERIFICATION.md: Feature qualification on 2026-11-08",
+        "fusion_revision": REVISION,
+        "hardware": {"architecture": "Maxwell", "compute_capability": "5.2", "vram_class": "24 GB"},
+        "modes": ["preview", "render"],
+        "detector": ["Yolov8"],
+        "swap_model": ["Inswapper128"],
+        "restorer": [None, "GFPGAN-v1.4"],
+        "expression": [False],
+        "occluder": [False],
+        "xseg": [False],
+        "max_mappings": 3,
+        "max_sources": 2,
+    },
+    {
+        "id": "sources-2026-11-08",
+        "date": "2026-11-08",
+        "source": "VERIFICATION.md: Feature qualification on 2026-11-08",
+        "fusion_revision": REVISION,
+        "hardware": {"architecture": "Maxwell", "compute_capability": "5.2", "vram_class": "24 GB"},
+        "modes": ["preview"],
+        "detector": ["Yolov8"],
+        "swap_model": ["Inswapper128"],
+        "restorer": [None],
+        "expression": [False],
+        "occluder": [False],
+        "xseg": [False],
+        "max_mappings": 1,
+        "max_sources": 4,
+    },
+    {
+        "id": "ghostface-2026-11-08",
+        "date": "2026-11-08",
+        "source": "VERIFICATION.md: Feature qualification on 2026-11-08",
+        "fusion_revision": REVISION,
+        "hardware": {"architecture": "Maxwell", "compute_capability": "5.2", "vram_class": "24 GB"},
+        "modes": ["preview"],
+        "detector": ["Yolov8"],
+        "swap_model": ["GhostFace-v1"],
+        "restorer": [None],
+        "expression": [False],
+        "occluder": [False],
+        "xseg": [False],
+        "max_mappings": 1,
+        "max_sources": 2,
+    },
 )
 # Render segments (docs/explanation/video-processing.md, Segments). Selections that load models or
 # choose the detection path hold for the whole render, so a segment cannot set them.
@@ -1524,7 +1572,8 @@ def resume_problems(manifest, request, record):
     enabled = temporal(record["settings"]["controls"])
     if enabled:
         found.append(
-            f"{' and '.join(enabled)} carry tracking state from frame to frame, which "
+            f"{' and '.join(enabled)} {'carries' if len(enabled) == 1 else 'carry'} tracking "
+            "state from frame to frame, which "
             "checkpoints do not hold; resuming would restart it at the boundary"
         )
     now = ffmpeg_version()
