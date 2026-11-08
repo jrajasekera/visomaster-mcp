@@ -891,9 +891,16 @@ def validate_comparison(request):
         if settings in overrides:
             raise ValueError(f"Variant {name} repeats another variant's overrides")
         overrides.add(settings)
-    for variant in variants:
+    for number, variant in enumerate(variants):
+        single = variant_request(request, variant)
+        if number:
+            # Every variant reads the same references, whose pinned bytes the first one checked;
+            # hashing them again per variant would hold the submit lock for nothing.
+            for mapping in single["mappings"]:
+                mapping.pop("target_sha256", None)
+                mapping.pop("source_sha256", None)
         try:
-            validate_fusion_request(variant_request(request, variant))
+            validate_fusion_request(single)
         except (ValueError, KeyError, TypeError, AttributeError) as error:
             message = str(error) if isinstance(error, ValueError) else f"invalid request ({error})"
             raise ValueError(f"Variant {variant['name']}: {message}") from None

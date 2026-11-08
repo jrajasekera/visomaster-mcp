@@ -4,12 +4,14 @@ comparison references."""
 
 import os
 import threading
+from pathlib import Path
 
 import common
 import control
 import engine
 import pytest
 import test_cancel
+import test_compare
 import test_jobs
 import test_preflight
 import test_recipes
@@ -289,3 +291,29 @@ def test_clients_may_leave_a_source_unpinned():
         source_sha256=["0" * 64, None],
     )
     assert mapping.model_dump(exclude_none=True)["source_sha256"] == ["0" * 64, None]
+
+
+# Pinned comparison references (finding 6)
+
+
+def test_comparisons_hash_each_pinned_reference_once(monkeypatch, tmp_path):
+    monkeypatch.setattr(common, "layouts", lambda: test_compare.LAYOUTS)
+    monkeypatch.setattr(common, "input_path", Path)
+    face, other = tmp_path / "face.png", tmp_path / "other.png"
+    face.write_bytes(b"face")
+    other.write_bytes(b"other")
+    request = test_compare.comparison("/m/clip.mp4", str(face), frames=[3])
+    extra = {"name": "loose", "parameters": {"SimilarityThresholdSlider": 50}, "controls": {}}
+    request["variants"].append(extra)
+    request["mappings"][0].update(
+        source_faces=[str(face), str(other)],
+        target_sha256=common.file_sha256(face),
+        source_sha256=[common.file_sha256(face), common.file_sha256(other)],
+    )
+    hashed, original = [], common.file_sha256
+    monkeypatch.setattr(common, "file_sha256", lambda path: hashed.append(path) or original(path))
+    common.validate_request(request)
+    assert len(request["variants"]) == 3 and len(hashed) == 3
+    other.write_bytes(b"changed")
+    with pytest.raises(ValueError, match="Variant base: .*no longer has SHA-256"):
+        common.validate_request(request)
