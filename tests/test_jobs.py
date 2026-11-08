@@ -295,8 +295,9 @@ def test_render_progress_reports_throughput_and_eta(tmp_path, monkeypatch):
         engine.render_video(None, request, tmp_path, worker)
     progress = [p for p in progress if "stage" in p]  # Not the checkpoint manifest.
     assert [p["frames"] for p in progress] == [1, 2, 3]
+    assert progress[0]["frames_per_second"] is progress[0]["eta_seconds"] is None
     assert progress[-1]["eta_seconds"] == 0
-    assert all(p["frames_per_second"] > 0 for p in progress)
+    assert all(p["frames_per_second"] > 0 for p in progress[1:])
 
 
 def test_render_worker_consumes_fusion_sequential_detections(monkeypatch):

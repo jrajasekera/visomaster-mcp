@@ -2313,10 +2313,6 @@ def encode_range(request, directory, worker, name, observe=None, progress=None, 
             frame = next(frames, None)
             if frame is None:
                 raise RuntimeError(f"Input decoding stopped at {index}, expected {expected} frames")
-            if started is None:
-                # The rate counts this attempt's frames from its first decoded one: FFmpeg's
-                # start-up, and a resume's seek past the reused chunks, are not rendering time.
-                started = time.monotonic()
             number = plan.at(index) if plan else None
             swaps = worker.swap_count
             if plan and plan.runs[number]["passthrough"]:
@@ -2332,7 +2328,14 @@ def encode_range(request, directory, worker, name, observe=None, progress=None, 
                     observe(index - start, frame, swapped)
             if plan:
                 plan.count(number, worker.swap_count - swaps)
-            rate = (index + 1 - first) / max(time.monotonic() - started, 1e-6)
+            # The rate counts this attempt's frames after its first, which also bears FFmpeg's
+            # start-up, a resume's seek past the reused chunks and model warm-up. It, and the
+            # ETA, are null until a second frame is done.
+            now, rate = time.monotonic(), None
+            if started is None:
+                started = now
+            else:
+                rate = (index - first) / max(now - started, 1e-6)
             atomic_json(
                 directory / "progress.json",
                 {
@@ -2341,8 +2344,8 @@ def encode_range(request, directory, worker, name, observe=None, progress=None, 
                     "frames": index + 1 - start,
                     "total_frames": expected,
                     "swapped_faces": worker.swap_count,
-                    "frames_per_second": round(rate, 2),
-                    "eta_seconds": round((end - index - 1) / rate, 1),
+                    "frames_per_second": rate and round(rate, 2),
+                    "eta_seconds": rate and round((end - index - 1) / rate, 1),
                     **({"segment": plan.runs[number]["segment"]} if plan else {}),
                     **({"reused_frames": first - start} if checkpoint else {}),
                 },

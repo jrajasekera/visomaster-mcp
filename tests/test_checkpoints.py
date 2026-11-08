@@ -364,7 +364,8 @@ def test_a_resume_of_a_resume_continues_the_chain(site, reference, monkeypatch):
 @pytest.mark.parametrize("resumed", [False, True])
 def test_progress_rate_and_eta_count_only_this_attempts_frames(site, monkeypatch, resumed):
     # On a scripted clock the decoder takes 100 s to reach its first frame (FFmpeg start-up
-    # and, when resuming, the seek past the reused chunks) and each frame takes 1 s to process.
+    # and, when resuming, the seek past the reused chunks), the attempt's first frame takes 50 s
+    # to process (model warm-up) and each later one 1 s.
     request, clock = render_request(site), [0.0]
     if resumed:
         attempt(monkeypatch, "broken", request, Worker(crash=13))
@@ -382,7 +383,7 @@ def test_progress_rate_and_eta_count_only_this_attempts_frames(site, monkeypatch
 
     class Timed(Worker):
         def process(self, worker, bgr, index):
-            clock[0] += 1
+            clock[0] += 1 if self.seen else 50
             return super().process(worker, bgr, index)
 
     monkeypatch.setattr(engine, "decode", decode)
@@ -394,9 +395,12 @@ def test_progress_rate_and_eta_count_only_this_attempts_frames(site, monkeypatch
     assert not isinstance(result, Exception), result
     first = 11 if resumed else START  # The resume reuses chunks [3, 7) and [7, 11).
     assert [r["frames"] for r in records] == list(range(first - START + 1, END - START + 1))
-    for index, record in zip(range(first, END), records):
+    for record in records:
         assert record["total_frames"] == END - START
         assert record["reused_frames"] == first - START
+    # No rate is known until a frame after the first is done.
+    assert records[0]["frames_per_second"] is records[0]["eta_seconds"] is None
+    for index, record in zip(range(first + 1, END), records[1:]):
         # One frame per second, however many frames came before this attempt.
         assert record["frames_per_second"] == 1.0
         assert record["eta_seconds"] == END - index - 1

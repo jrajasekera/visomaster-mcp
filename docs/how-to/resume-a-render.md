@@ -20,7 +20,7 @@ cancelled, you can continue it from the chunks it finished instead of starting a
 3. Follow the new job with `job_status`. `job_status` and `list_jobs` show the earlier job as
    `resume_from`. Its progress counts `frames` from the start of the range, reused ones
    included, and reports them as `reused_frames`; `frames_per_second` and `eta_seconds` cover
-   only the frames it renders.
+   only the frames it renders, and are null until its second frame is done.
 
 The earlier job keeps its terminal state and is not changed. The new job repeats the earlier
 request, reuses the longest run of chunks from the start whose files still verify, and renders
