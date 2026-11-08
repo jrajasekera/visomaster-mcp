@@ -34,20 +34,16 @@ from common import (  # noqa: E402
     CODE,
     CONFIG_ERROR,
     CONTROLS,
-    DETECTOR_MODELS,
-    EXPRESSION_MODELS,
     GPU,
     JOB_ID,
     LOCK_DIR,
     PARAMETERS,
     QUALIFICATIONS,
-    RESTORER_MODELS,
     REVISION,
     RUNNER,
     SETTINGS,
     SHA256,
     STATE,
-    SWAPPER_MODELS,
     TERMINAL,
     ConfigError,
     atomic_json,
@@ -64,12 +60,15 @@ from common import (  # noqa: E402
     layouts,
     load_config,
     model_catalog,
+    model_choices,
     probe,
     provenance,
     provenance_changes,
     read_json,
     recorded_inputs,
     reference_path,
+    required_models,
+    setting_variants,
     validate_request,
     validate_settings,
 )
@@ -1241,53 +1240,20 @@ def positive(mapping):
 
 
 def combinations(request, control, parameters):
-    """Model choices of each mapping, with Fusion's, the adapter's and the request's values in
-    the order the engine applies them."""
-    controls = initial_controls(control, request.get("controls") or {})
+    """Each mapping's model choices (common.model_choices) with its weighted source count, for
+    the base settings and then for each segment that overrides them (segment None: the base)."""
+    defaults = {key: spec["default"] for key, spec in parameters.items()}
+    settings = {
+        "controls": initial_controls(control, request.get("controls") or {}),
+        "parameters": [{**defaults, **(m.get("parameters") or {})} for m in request["mappings"]],
+    }
     found = []
-    for mapping in request["mappings"]:
-        values = {key: spec["default"] for key, spec in parameters.items()}
-        values.update(mapping.get("parameters") or {})
-        restorer = values.get("FaceRestorerEnableToggle") is True
-        found.append(
-            {
-                "detector": controls.get("DetectorModelSelection"),
-                "recognition": controls.get("RecognitionModelSelection"),
-                "swap_model": values.get("SwapModelSelection"),
-                "restorer": values.get("FaceRestorerTypeSelection") if restorer else None,
-                "expression": values.get("FaceExpressionEnableBothToggle") is True,
-                "occluder": values.get("OccluderEnableToggle") is True,
-                "xseg": values.get("DFLXSegEnableToggle") is True,
-                "sources": len(positive(mapping)),
-            }
-        )
+    for segment, indexes, variant in setting_variants(settings, request.get("segments")):
+        for index, choice in zip(indexes, model_choices(variant)):
+            mapping = request["mappings"][index]
+            choice = {**choice, "sources": len(positive(mapping))}
+            found.append({"mapping": index, "segment": segment, "choice": choice})
     return found
-
-
-def required_models(choice):
-    """Fusion model names a mapping's choices load, and selections the adapter cannot map."""
-    names, unknown = set(), []
-
-    def need(table, key, value):
-        found = table.get(value) if isinstance(value, str) else None
-        if found is None:
-            unknown.append(f"{key}={value!r}")
-        else:
-            names.update((found,) if isinstance(found, str) else found)
-
-    need(DETECTOR_MODELS, "DetectorModelSelection", choice["detector"])
-    if isinstance(choice["recognition"], str):
-        names.add(choice["recognition"])
-    need(SWAPPER_MODELS, "SwapModelSelection", choice["swap_model"])
-    if choice["restorer"] is not None:
-        need(RESTORER_MODELS, "FaceRestorerTypeSelection", choice["restorer"])
-    if choice["occluder"]:
-        names.add("Occluder")
-    if choice["xseg"]:
-        names.add("XSeg")
-    if choice["expression"]:
-        names.update(EXPRESSION_MODELS)
-    return names, unknown
 
 
 def differences(record, mode, choice, mappings, hardware):
@@ -1523,8 +1489,8 @@ def settings_checks(request, checks):
         checks.append(finding("model_assets", "not_checked", "model_list_unreadable", message))
         return combos, []
     needed, unknown, models, absent = set(), [], [], []
-    for choice in combos:
-        found, unmapped = required_models(choice)
+    for entry in combos:
+        found, unmapped = required_models(entry["choice"])
         needed |= found
         unknown += [item for item in unmapped if item not in unknown]
     for name in sorted(needed):
@@ -1581,17 +1547,19 @@ def storage_check(media):
     return finding("storage", "passed", "space_ok", "Free space exceeds the estimate", evidence)
 
 
-def qualification_check(mode, combos, hardware):
+def qualification_check(mode, combos, mappings, hardware):
     entries, covered = [], True
-    for index, choice in enumerate(combos):
-        matches, nearest = [], None
+    for combo in combos:
+        choice, matches, nearest = combo["choice"], [], None
         for record in QUALIFICATIONS:
-            missing = differences(record, mode, choice, len(combos), hardware)
+            missing = differences(record, mode, choice, mappings, hardware)
             if not missing:
                 matches.append({key: record[key] for key in ("id", "date", "source", "hardware")})
             elif nearest is None or len(missing) < len(nearest["differs_in"]):
                 nearest = {"record": record["id"], "differs_in": missing}
-        entry = {"mapping": index, "combination": choice, "qualified_by": matches}
+        entry = {"mapping": combo["mapping"], "combination": choice, "qualified_by": matches}
+        if combo["segment"] is not None:
+            entry["segment"] = combo["segment"]
         if not matches:
             covered = False
             entry["nearest"] = nearest
@@ -1722,7 +1690,9 @@ def preflight(payload):
     if combos is None:
         skip("qualification", "The settings, and so the model choices, are unknown")
     else:
-        checks.append(qualification_check(request["kind"], combos, hardware))
+        checks.append(
+            qualification_check(request["kind"], combos, len(request["mappings"]), hardware)
+        )
 
     try:
         validate_request(copy.deepcopy(request))  # Exactly what submission runs first.

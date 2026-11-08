@@ -371,6 +371,26 @@ def test_missing_and_unmapped_model_files(site):
     assert unmapped["status"] == "not_checked" and unmapped["code"] == "model_unmapped"
 
 
+def test_models_a_segment_enables_are_checked_and_qualified(site):
+    restored = {"FaceRestorerEnableToggle": True, "FaceRestorerTypeSelection": "CodeFormer"}
+    segment = {"id": "close-up", "start_frame": 2, "end_frame": 5, "parameters": restored}
+    request = swap(site, max_frames=10, segments=[segment])
+    checks = by_name(preflight(request))
+    assets = {m["model"] for m in checks["model_assets"]["evidence"]["models"]}
+    assert "CodeFormer" in assets and checks["model_assets"]["code"] == "models_present"
+    # The segment's restorer is outside the recorded qualification; the base is inside it.
+    entries = checks["qualification"]["evidence"]["mappings"]
+    assert [(e["mapping"], e.get("segment")) for e in entries] == [(0, None), (0, "close-up")]
+    assert entries[0]["qualified_by"] and entries[1]["nearest"]["differs_in"] == ["restorer"]
+    assert checks["qualification"]["code"] == "unqualified"
+    (site.fusion / "model_assets/codeformer_fp16.onnx").unlink()
+    missing = by_name(preflight(request))["model_assets"]
+    assert missing["code"] == "model_missing" and "codeformer_fp16.onnx" in missing["message"]
+    passthrough = {"id": "titles", "start_frame": 2, "end_frame": 5, "passthrough": True}
+    plain = by_name(preflight(swap(site, max_frames=10, segments=[passthrough])))
+    assert plain["model_assets"]["code"] == "models_present"
+
+
 def test_missing_media_and_refused_references(site, tmp_path):
     outside = tmp_path / "outside.png"
     shutil.copy(site.face, outside)

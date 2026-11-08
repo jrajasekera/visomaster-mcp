@@ -1140,28 +1140,90 @@ def model_catalog():
     return models, maps
 
 
-def model_names(settings, catalog):
-    """Models a swap's effective settings select: detector, recognizer, swapper and ArcFace.
-
-    A swap selection names its model with punctuation the model list may drop (GhostFace-v1 is
-    GhostFacev1), so names are also matched on letters and digits alone.
-    """
-    models, maps = catalog
-
-    def key(value):
-        return re.sub(r"[^0-9a-z]", "", str(value).lower())
-
-    loose = {key(name): name for name in models}
+def model_choices(settings):
+    """Each mapping's model selections in a swap's effective settings (effective_settings):
+    detector, recognizer, swap model, restorer (None when off) and the toggles that load a
+    model. Preflight checks, and provenance hashes, the files these select."""
     controls = settings["controls"]
-    names = {
-        controls.get("RecognitionModelSelection"),
-        maps.get("detection_model_mapping", {}).get(controls.get("DetectorModelSelection")),
-    }
-    for parameters in settings["parameters"]:
-        swap = parameters.get("SwapModelSelection")
-        names.add(maps.get("arcface_mapping_model_dict", {}).get(swap))
-        names.add(swap if swap in models else loose.get(key(swap), swap))
-    return {name for name in names if isinstance(name, str) and name}
+    return [
+        {
+            "detector": controls.get("DetectorModelSelection"),
+            "recognition": controls.get("RecognitionModelSelection"),
+            "swap_model": values.get("SwapModelSelection"),
+            "restorer": values.get("FaceRestorerTypeSelection")
+            if values.get("FaceRestorerEnableToggle") is True
+            else None,
+            "expression": values.get("FaceExpressionEnableBothToggle") is True,
+            "occluder": values.get("OccluderEnableToggle") is True,
+            "xseg": values.get("DFLXSegEnableToggle") is True,
+        }
+        for values in settings["parameters"]
+    ]
+
+
+def required_models(choice):
+    """Fusion model names a mapping's choices load (DETECTOR_MODELS, SWAPPER_MODELS,
+    RESTORER_MODELS, the mask and expression models), and selections the tables lack."""
+    names, unknown = set(), []
+
+    def need(table, key, value):
+        found = table.get(value) if isinstance(value, str) else None
+        if found is None:
+            unknown.append(f"{key}={value!r}")
+        else:
+            names.update((found,) if isinstance(found, str) else found)
+
+    need(DETECTOR_MODELS, "DetectorModelSelection", choice["detector"])
+    if isinstance(choice["recognition"], str):
+        names.add(choice["recognition"])
+    need(SWAPPER_MODELS, "SwapModelSelection", choice["swap_model"])
+    if choice["restorer"] is not None:
+        need(RESTORER_MODELS, "FaceRestorerTypeSelection", choice["restorer"])
+    if choice["occluder"]:
+        names.add("Occluder")
+    if choice["xseg"]:
+        names.add("XSeg")
+    if choice["expression"]:
+        names.update(EXPRESSION_MODELS)
+    return names, unknown
+
+
+def setting_variants(settings, segments=None):
+    """(segment id, mapping indexes, settings) of a render's base settings, then of each segment
+    that overrides parameters or controls, merged as the engine's Segments.settings merges them
+    (the base mapping's parameters, then the segment's; the base controls, then the segment's).
+    A segment can enable a restorer or mask the base settings leave off."""
+    count = len(settings["parameters"])
+    variants = [(None, list(range(count)), settings)]
+    for segment in segments if isinstance(segments, list) else []:
+        if not isinstance(segment, dict) or segment.get("passthrough"):
+            continue
+        parameters, controls = segment.get("parameters"), segment.get("controls")
+        parameters = parameters if isinstance(parameters, dict) else {}
+        controls = controls if isinstance(controls, dict) else {}
+        if not (parameters or controls):
+            continue
+        chosen = segment.get("mappings")
+        chosen = chosen if isinstance(chosen, list) else range(count)
+        chosen = [i for i in chosen if type(i) is int and 0 <= i < count]
+        variant = {
+            "controls": {**settings["controls"], **controls},
+            "parameters": [{**settings["parameters"][i], **parameters} for i in chosen],
+        }
+        variants.append((segment.get("id"), chosen, variant))
+    return variants
+
+
+def model_names(settings, segments=None):
+    """Models a swap's effective settings, and its segments' overrides, load, from the same
+    tables preflight checks: the detector, recognizer, swapper with its ArcFace models, and an
+    enabled restorer, occluder, XSeg or expression restorer. A selection the tables lack adds
+    nothing; at another Fusion revision provenance reports the revision change instead."""
+    names = set()
+    for _, _, variant in setting_variants(settings, segments):
+        for choice in model_choices(variant):
+            names |= required_models(choice)[0]
+    return names
 
 
 def model_identity(names, catalog):
@@ -1235,7 +1297,9 @@ def provenance(request, models=()):
         "fusion_revision": fusion_compatibility(APP)[0],
         "adapter": code_identity(),
         "config_sha256": SETTINGS.sha256,
-        "models": model_identity(model_names(settings, catalog) | set(models), catalog),
+        "models": model_identity(
+            model_names(settings, request.get("segments")) | set(models), catalog
+        ),
     }
 
 
@@ -1307,6 +1371,13 @@ def provenance_changes(recorded, current):
         if canonical(was) != canonical(now):
             if now.get("sha256") is None:
                 state = "is not in this Fusion's model list or its file is missing"
+            elif name not in recorded["models"]:
+                # Revisions saved before restorer, mask, expression and CSCS adapter models were
+                # fingerprinted lack them, so their bytes then are unknown.
+                state = (
+                    "was not recorded when this revision was saved, so whether it changed is "
+                    "unknown; save a new revision to record it"
+                )
             elif was.get("sha256") is None:
                 state = "was not recorded"
             else:
