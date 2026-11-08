@@ -168,6 +168,7 @@ The supervisor starts each GPU job as `<runner...> <release>/engine.py <job dire
 | `detect_faces` | Queue detection at a selected frame and produce reference crops, or sample up to 64 frames (`sample_frames` or `frames`) and group faces into identities (optional `similarity_threshold`) with one reference crop each; only verified crops get a `reference_path`. Queues as `interactive` unless `priority` says otherwise |
 | `analyze_references` | Queue a GPU check of up to 20 candidate source images: face count, size, sharpness, duplicates and embedding consistency, with a crop per usable image and a labelled `contact.jpg`. Queues as `interactive` unless `priority` says otherwise |
 | `submit_swap` | Queue a frame/image preview (`interactive`) or a video render (`normal`) with explicit face mappings, optional per-source weights and expected fingerprints; results include a per-mapping `swap_report` summary and the `swap-report.json` artifact, and renders write labelled review images (optional `report`: `review_images`, `expected_visible`, `min_coverage`); optional `priority` overrides the class |
+| `compare_variants` | Queue one job that runs 2–6 named settings variants over the same 1–4 still frames (`interactive`) or the same clip of up to 120 frames (`normal`), with labelled original-versus-variant grids, full-resolution outputs, a `compare.json` manifest and a ready `submit_swap` request per variant; optional `priority` overrides the class |
 | `normalize_media` | Queue a CPU-only FFmpeg conversion to a render-ready video (CFR, zero start, even dimensions, rotation and flips applied); does not wait for the GPU |
 | `job_status` | State, frame progress and result manifest; `wait_seconds` (≤ 50) long-polls for the next change, including a change of queue position or reason; GPU jobs report `priority` and `sequence`, and queued ones a `queue` standing; log tail on request or failure |
 | `list_jobs` | Recent job summaries shared across clients (kind, media, frame selection or sampling, timing, status, progress, and for GPU jobs `priority`, `sequence` and, while queued, `queue`), filterable by `status` and `kind`, `limit` up to 200 |
@@ -211,7 +212,7 @@ A `FaceMapping` may add `source_weights`, one finite, nonnegative number per `so
 2. Use an absolute workstation media path under `media_root`, or upload a local file with `upload_media`.
 3. Call `detect_faces` on a representative frame, or with `sample_frames` (for example 16) to find everyone who appears across a video. Call `job_status` with `wait_seconds: 50` until `completed`, then inspect the returned crops with `view_artifact`; `contact.jpg` shows them all in one labelled grid.
 4. Use the selected crop's or identity's `reference_path` as `target_face` (it is null for unverified crops). Supply one or more reference images of the replacement identity as `source_faces`. Each reference image must contain exactly one detected face. With several, run `analyze_references` on them, view its `contact.jpg`, and pass its `sha256` values as `source_sha256`, plus `source_weights` to exclude (0) or down-weight images it flags.
-5. Submit a `preview`, inspect its image, then submit a short `render`. After reviewing that clip, submit the full frame range.
+5. Submit a `preview`, inspect its image, then submit a short `render`. After reviewing that clip, submit the full frame range. To choose between settings, run `compare_variants` on the same frames or a short clip, view its `compare-f<N>.jpg` grids, and submit the chosen variant's `submit_swap` arguments from the result.
 6. Follow the job with `job_status` and `wait_seconds`, then download `result.mp4` or `result.png` after completion. Check the result's `swap_report` for warnings, such as a mapping that never swapped, and view the `review-NN.jpg` images it lists.
 
 Renders reject variable frame rate video, video whose timestamps do not start at zero, odd frame dimensions and rotated or mirrored display metadata. When a render fails for one of these reasons, call `normalize_media` with the same `media_path` (optionally `fps`, such as `25` or `"30000/1001"`), wait for the job, and use its result's `media_path` (the job's `normalized.mp4` artifact) for detection, preview and rendering. Frame indices then refer to the normalized timeline.
@@ -289,6 +290,35 @@ Revisions are immutable: saving again under a name adds the next revision, and a
 
 Saving, verifying and running a recipe hash the media, references and model files in a streamed pass on the workstation, so a long video takes a while (these calls allow 15 minutes); status polls never hash. A recipe reproduces configuration, inputs and versions, not bits: the GPU, its driver and CUDA libraries are not recorded, and outputs are expected to be equivalent rather than bit-identical.
 
+### Variant comparisons
+
+`compare_variants` takes the arguments of `submit_swap` that every variant shares (`media_path`, `mappings`, `controls`) and a list of `variants`, each with a `name` and optional `parameters` and `controls`. A variant's `parameters` are merged over every mapping's `parameters`, and its `controls` over the common `controls`; nothing else differs between variants. It compares either explicit still `frames` or a contiguous clip (`start_frame` and `max_frames`) of a constant-frame-rate video, as renders require. Nothing picks a best variant; the choice stays with you.
+
+| Limit | Value |
+| --- | --- |
+| Variants | 2–6, names of 1–20 letters, digits, `_` or `-`, unique ignoring case, with distinct overrides |
+| Still frames | 1–4 distinct frames (images: `[0]`) |
+| Clip | 1–120 frames per variant |
+| Source frame size | At most 3840 × 2160 pixels (8,294,400); every output keeps the source dimensions |
+| Grids | Cells of 480 × 480, 4 per row: at most 1952 pixels wide and 2 rows |
+
+Submission validates each variant's merged request as `submit_swap` would, so an unknown setting, an invalid value, a duplicate name or an over-limit selection is refused before anything is queued, naming the variant. The job is one durable job like any other: a stable `job_id` makes retries return it, a changed request is a conflict, `job_status` and `list_jobs` show its progress (`stage: comparing`, with `variant`, `variants` and `name`; a long poll returns when the variant changes), and `cancel_job` stops every variant. Variants run one after another, in request order, in a single worker that holds the GPU for the whole comparison. Still comparisons queue as `interactive` and clip comparisons, which render up to six clips, as `normal`.
+
+Every variant gets the same decoded frames. Stills are decoded once and passed to each variant, which processes each frame as a separate preview. A clip is decoded once per variant with the render's frame-accurate path, and the job fails the variant if its frames differ from the others' (each variant's `input_sha256` covers every frame it received) or from the separately decoded original stills. Each clip covers the same range, frame count, rate and duration, and its frames sit at the same output times. Clips have no composite: each `v<index>-<name>.mp4` carries the source's first audio stream over the compared interval, cut and encoded as renders do, so all clips share identical audio and nothing is duplicated.
+
+Artifacts, in the order the result lists them:
+
+- `compare-f<N>.jpg`: one grid per compared frame (for clips, the first, middle and last frame): the original, then each variant labelled `<index> <name>`. Each tile is scaled to fit a 480-pixel cell at the source's display aspect ratio (pixel aspect applied), so tiles are directly comparable. View these first.
+- `compare.json`: the manifest, identical to the job result plus the Fusion revision.
+- `original-f<N>.png`: the decoded source frames at full resolution.
+- `v<index>-<name>-f<N>.png`: each variant's full-resolution output of those frames, before any encoding.
+- `v<index>-<name>.mp4` (clips): the variant's clip, validated like a render's `result.mp4`.
+- `v<index>-<name>-swap-report.json`: the variant's swap report (for stills, a list of one preview report per frame).
+
+The manifest records `source` (dimensions, `sample_aspect_ratio`, compared `frames` and the SHA-256 of each original frame, and for clips the rational `fps`, `start_frame`, `end_frame` (exclusive), `frame_count`, `start_time` on the source clock and `duration`), the ordering and audio policy, and per variant: `index`, `name`, `status`, `error`, `overrides`, `settings` (the effective value of every adjustable control and, per mapping, every adjustable parameter after Fusion's and the adapter's defaults), `references` (fingerprints and weights used), `input_sha256`, `artifacts`, swap report summaries, `swapped_faces` and `submit_swap`. `submit_swap` holds arguments that repeat that variant alone with exactly its merged settings: a preview of the first compared frame, or a render of the compared range, with each mapping's `source_sha256` pinned to the bytes the comparison used. Add a `job_id`, change `frame` or the range as needed, and submit it.
+
+A variant that fails, for example on a Fusion error or because it swapped no face in any compared frame, keeps its `error`, loses its artifacts and appears as a red `FAILED` tile. The job still completes when at least one variant succeeded, but then `complete` is false, `failed_variants` names the failures and `warning` explains them; only a result with `complete: true` is a full comparison. A frame where a variant swapped nothing is reported in its swap report, not as a failure. When every variant fails, the job fails with each variant's reason, and as for every failed job its artifacts are withheld.
+
 ## Storage
 
 Job state, logs and artifacts live in `<state_dir>/jobs/JOB_ID`, and recipe revisions in `<state_dir>/recipes/NAME`. Uploaded media lives in `<state_dir>/uploads`, named by SHA-256 so identical uploads share one file. Terminal jobs remain until `delete_job` or `prune_storage` removes them. `prune_storage` deletes terminal jobs finished more than `older_than_days` ago (default 30) and uploads untouched for that long, unless a saved recipe or a queued or running job uses their files as input, as well as staging and trash directories left by crashes and partial uploads idle for over an hour. It reports byte totals and is a dry run unless `dry_run` is false; the dry run applies the same checks. Partial files from cancelled or failed jobs remain for diagnosis, and artifact tools expose only completed jobs. Each downloaded artifact has its own job subdirectory. Repeating the same download atomically replaces that local copy.
@@ -301,10 +331,10 @@ GPU jobs run one at a time, in an order every client and every deployment sharin
 
 | Class | Default for | Order |
 | --- | --- | --- |
-| `interactive` | `detect_faces`, `submit_swap` previews | Starts before waiting normal jobs, oldest first |
-| `normal` | `submit_swap` renders, and any GPU job kind not listed | Oldest first; becomes due under the fairness rule |
+| `interactive` | `detect_faces`, `submit_swap` previews, `analyze_references`, still `compare_variants` | Starts before waiting normal jobs, oldest first |
+| `normal` | `submit_swap` renders, clip `compare_variants`, and any GPU job kind not listed | Oldest first; becomes due under the fairness rule |
 
-Pass `priority` to `detect_faces` or `submit_swap` to choose the class, for example `"normal"` for a batch of detections that should not delay someone else's previews. A retried submission with the same `job_id` keeps its sequence, so reconnecting never moves a job forward or back. Normalization does not use the GPU and is not queued.
+Pass `priority` to `detect_faces`, `analyze_references`, `submit_swap` or `compare_variants` to choose the class, for example `"normal"` for a batch of detections that should not delay someone else's previews. A retried submission with the same `job_id` keeps its sequence, so reconnecting never moves a job forward or back. Normalization does not use the GPU and is not queued.
 
 Fairness rule: when both classes are waiting, an interactive job starts next unless the waiting normal work is due. It becomes due after 3 interactive jobs have started in a row while it waited, or 300 seconds after the first of them started. Starting a normal job resets both, so a steady stream of previews delays a waiting render by at most three previews (and no preview starts more than five minutes after the first of them), and previews then go first again.
 

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,9 @@ from types import SimpleNamespace
 from common import (
     APP,
     CONFIG_ERROR,
+    CONTROLS,
+    MAX_COMPARE_PIXELS,
+    PARAMETERS,
     REVISION,
     SETTINGS,
     atomic_json,
@@ -32,6 +36,7 @@ from common import (
     probe,
     read_json,
     validate_request,
+    variant_request,
 )
 
 
@@ -1659,8 +1664,9 @@ def output_audio(metadata, expected, end, missing):
     return audio
 
 
-def render_video(window, request, directory, worker):
-    source = input_path(request["media_path"])
+def clip_range(source, request):
+    """(metadata, video stream, rate, start, frame count) of the CFR range a render processes:
+    `start_frame` and at most `max_frames` frames (None: through the end)."""
     metadata = probe(source)
     stream = video_stream(metadata)
     fps = Fraction(stream["avg_frame_rate"])
@@ -1672,17 +1678,71 @@ def render_video(window, request, directory, worker):
     expected = min(limit or total, total - start)
     if expected <= 0:
         raise ValueError("Requested frame range is empty")
+    if int(stream["width"]) % 2 or int(stream["height"]) % 2:
+        raise ValueError("H.264 output requires even frame dimensions; run normalize_media first")
+    return metadata, stream, fps, start, expected
+
+
+def render_video(window, request, directory, worker):
+    artifacts = directory / "artifacts"
+
+    def first(offset, frame, swapped):
+        if offset == 0:
+            save_image(artifacts / "before.jpg", frame)
+            save_image(artifacts / "preview.jpg", swapped)
+
+    clip = encode_range(request, directory, worker, "result.mp4", first)
+    report, fps, start = clip.report, clip.fps, clip.start
+    # Review pairs come from the source and the published output, decoded at the same frame.
+    limit = report["options"]["review_images"]
+    for number, (mapping, frame, reason) in enumerate(review_frames(report, limit), 1):
+        name = f"review-{number:02d}.jpg"
+        seconds, output_seconds = frame_times(frame, fps, start)
+        label = f"mapping {mapping} | frame {frame} | {seconds:.3f} s | {reason} | before, after"
+        before = read_frame(clip.source, clip.stream, frame)
+        after = read_frame(clip.output, clip.video, frame - start)
+        review_image(artifacts / name, before, after, label)
+        report["review_images"].append(
+            {
+                "artifact": name,
+                "mapping": mapping,
+                "frame": frame,
+                "time": seconds,
+                "output_time": output_seconds,
+                "reason": reason,
+            }
+        )
+    atomic_json(artifacts / "swap-report.json", report)
+    names = [r["artifact"] for r in report["review_images"]]
+    return {
+        "frames": clip.frames,
+        "fps": str(fps),
+        "duration": clip.duration,
+        "swapped_faces": worker.swap_count,
+        "audio": clip.audio,
+        "swap_report": report_summary(report),
+        "artifacts": ["result.mp4", "preview.jpg", "before.jpg", "swap-report.json", *names],
+    }
+
+
+def encode_range(request, directory, worker, name, observe, progress=None):
+    """Process a render request's range into the validated video artifact `name`.
+
+    `observe(offset, source frame, swapped frame)` sees each frame before it is encoded.
+    `progress` adds fields to each progress record (stage "rendering" by default). Returns the
+    clip's source, streams, rate, range, audio and swap report (review images not yet added).
+    """
+    source = input_path(request["media_path"])
+    metadata, stream, fps, start, expected = clip_range(source, request)
     options = request.get("report") or {}
     telemetry = worker.telemetry
     telemetry.expect(expected_ranges(options, start + expected))
-    video_only = directory / "video-only.mp4"
+    video_only = directory / f"{Path(name).stem}.video-only.mp4"
     artifacts = directory / "artifacts"
     encoder = None
     frames = decode(source, stream, start, expected)
     processed = 0
     width, height = int(stream["width"]), int(stream["height"])
-    if width % 2 or height % 2:
-        raise ValueError("H.264 output requires even frame dimensions; run normalize_media first")
     try:
         encoder = subprocess.Popen(
             encode_command(stream, fps, video_only),
@@ -1698,9 +1758,7 @@ def render_video(window, request, directory, worker):
             swapped = process(worker, frame, start + offset)
             if swapped.shape[:2] != (height, width):
                 raise RuntimeError("Fusion changed the frame dimensions")
-            if offset == 0:
-                save_image(artifacts / "before.jpg", frame)
-                save_image(artifacts / "preview.jpg", swapped)
+            observe(offset, frame, swapped)
             encoder.stdin.write(swapped.tobytes())
             processed += 1
             rate = processed / max(time.monotonic() - started, 1e-6)
@@ -1708,6 +1766,7 @@ def render_video(window, request, directory, worker):
                 directory / "progress.json",
                 {
                     "stage": "rendering",
+                    **(progress or {}),
                     "frames": processed,
                     "total_frames": expected,
                     "swapped_faces": worker.swap_count,
@@ -1723,6 +1782,10 @@ def render_video(window, request, directory, worker):
         if encoder is not None and encoder.poll() is None:
             encoder.kill()
             encoder.wait()
+        if encoder is not None:
+            # A comparison's worker goes on to other variants, so the pipe must not leak.
+            with contextlib.suppress(OSError):
+                encoder.stdin.close()
     if worker.swap_count == 0:
         raise RuntimeError("No faces matched the target references in the requested range")
     telemetry.finish(start + processed)
@@ -1733,7 +1796,7 @@ def render_video(window, request, directory, worker):
             f"Swap coverage is below min_coverage {report['options']['min_coverage']:g}: "
             + "; ".join(shortfalls)
         )
-    output = artifacts / "result.mp4"
+    output = artifacts / name
     duration = float(Fraction(processed, 1) / fps)
     offset = float(Fraction(start, 1) / fps)
     audio = audio_overlaps(source, metadata, offset, duration)
@@ -1748,35 +1811,296 @@ def render_video(window, request, directory, worker):
         raise RuntimeError("Encoded pixel aspect ratio differs from the source")
     emitted = output_audio(verified, audio, duration, "Audio missing from output")
     video_only.unlink()
-    # Review pairs come from the source and the published output, decoded at the same frame.
-    limit = report["options"]["review_images"]
-    for number, (mapping, frame, reason) in enumerate(review_frames(report, limit), 1):
-        name = f"review-{number:02d}.jpg"
-        seconds, output_seconds = frame_times(frame, fps, start)
-        label = f"mapping {mapping} | frame {frame} | {seconds:.3f} s | {reason} | before, after"
-        before = read_frame(source, stream, frame)
-        review_image(artifacts / name, before, read_frame(output, video, frame - start), label)
-        report["review_images"].append(
-            {
-                "artifact": name,
-                "mapping": mapping,
-                "frame": frame,
-                "time": seconds,
-                "output_time": output_seconds,
-                "reason": reason,
-            }
-        )
-    atomic_json(artifacts / "swap-report.json", report)
-    names = [r["artifact"] for r in report["review_images"]]
+    return SimpleNamespace(
+        source=source,
+        stream=stream,
+        output=output,
+        video=video,
+        fps=fps,
+        start=start,
+        frames=processed,
+        duration=duration,
+        audio="AAC" if emitted else "none",
+        report=report,
+    )
+
+
+# Variant comparisons (DESIGN.md, Variant comparisons).
+COMPARE_VERSION = 1
+COMPARE_TILE = 480  # Grid cells fit a display-aspect thumbnail in this square.
+COMPARE_COLUMNS = 4
+COMPARE_ORDER = (
+    "Variants run in request order (index 1 first) in one worker under one GPU admission, each "
+    "on the same decoded source frames. Frames are zero-based source indices in ascending "
+    "order; a clip's stills are its first, middle and last frames. Grid tiles are display-"
+    "aspect thumbnails of the original and of Fusion's output before encoding; full-resolution "
+    "PNGs and clips are separate artifacts."
+)
+AUDIO_POLICY = (
+    "Each variant clip carries the source's first audio stream over the compared interval, cut "
+    "and encoded as renders do, so all clips have the same audio. No composite combines clips, "
+    "so no audio is duplicated. Stills carry no audio."
+)
+
+
+def frame_digest(frame):
+    return hashlib.sha256(frame.tobytes()).hexdigest()
+
+
+def thumbnail(image, aspect):
+    """`image` at its display aspect (pixel aspect ratio `aspect`), fit inside a grid cell."""
+    import cv2
+
+    height, width = image.shape[:2]
+    scale = min(1.0, COMPARE_TILE / (width * aspect), COMPARE_TILE / height)
+    size = (max(1, round(width * aspect * scale)), max(1, round(height * scale)))
+    return cv2.resize(image, size, interpolation=cv2.INTER_AREA)
+
+
+def blank(shape):
+    import numpy as np
+
+    return np.full(shape, 48, np.uint8)
+
+
+def configure_variant(window, request, specs):
+    """Apply one variant's request to the shared window: Fusion reads window.control and
+    window.parameters live, so they are refilled in place. Returns what each mapping used and
+    the variant's effective adjustable settings."""
+    window.control.clear()
+    window.control.update(initial_controls(specs, request.get("controls", {})))
+    window.target_faces.clear()
+    window.parameters.clear()
+    used = configure_faces(window, request["mappings"])
+    defaults = dict(window.default_parameters)
+    mappings = []
+    for mapping in request["mappings"]:
+        merged = {**defaults, **mapping.get("parameters", {})}
+        mappings.append({key: merged[key] for key in sorted(PARAMETERS) if key in merged})
+    controls = {key: window.control[key] for key in sorted(CONTROLS) if key in window.control}
+    return used, {"controls": controls, "mappings": mappings}
+
+
+def follow_up(original, resolved, variant):
+    """submit_swap arguments that repeat one variant alone, from the request rather than labels.
+    Each mapping pins the source fingerprints the comparison used."""
+    single = variant_request(original, variant)
+    mappings = []
+    for mapping, pinned in zip(single["mappings"], resolved["mappings"]):
+        mapping = {key: value for key, value in mapping.items() if key != "target_sha256"}
+        mappings.append({**mapping, "source_sha256": pinned["source_sha256"]})
+    keys = ("frame",) if single["kind"] == "preview" else ("start_frame", "max_frames")
     return {
-        "frames": processed,
-        "fps": str(fps),
-        "duration": duration,
-        "swapped_faces": worker.swap_count,
-        "audio": "AAC" if emitted else "none",
-        "swap_report": report_summary(report),
-        "artifacts": ["result.mp4", "preview.jpg", "before.jpg", "swap-report.json", *names],
+        "media_path": single["media_path"],
+        "mode": single["kind"],
+        **{key: single[key] for key in keys},
+        "mappings": mappings,
+        "controls": single["controls"],
     }
+
+
+def compare_variants(window, request, directory):
+    """Run each variant over the same decoded source frames, in request order.
+
+    `request` is the resolved request. A failed variant is recorded with its reason and its
+    partial artifacts are removed; the comparison fails only when every variant fails.
+    """
+    import cv2
+
+    original = read_json(directory / "request.json")
+    source = input_path(request["media_path"])
+    artifacts = directory / "artifacts"
+    variants, clip = request["variants"], "max_frames" in request
+    fps = start = count = None
+    if clip:
+        _, stream, fps, start, count = clip_range(source, request)
+        frames = sorted({start, start + (count - 1) // 2, start + count - 1})
+        aspect = sample_aspect(stream)
+        originals = {number: read_frame(source, stream, number) for number in frames}
+    else:
+        frames, aspect, timing = sorted(request["frames"]), Fraction(1), None
+        if cv2.imread(str(source)) is None:
+            aspect = sample_aspect(video_stream(probe(source)))
+            timing = timeline(source, frames[-1] + 1) if frames[-1] else None
+        originals = {number: load_frame(source, number, timing) for number in frames}
+    height, width = originals[frames[0]].shape[:2]
+    if width * height > MAX_COMPARE_PIXELS:
+        raise ValueError(
+            f"Comparisons accept frames of at most {MAX_COMPARE_PIXELS} pixels (3840x2160); "
+            f"this source is {width}x{height}"
+        )
+    digests = {number: frame_digest(frame) for number, frame in originals.items()}
+    names, tiles = [], {}
+    for number, frame in originals.items():
+        save_image(artifacts / f"original-f{number}.png", frame)
+        names.append(f"original-f{number}.png")
+        tiles[number] = [(f"original f{number}", thumbnail(frame, aspect), True)]
+    specs = layouts()[0]
+    run_detect = window.function_worker.run_detect
+    entries, reference = [], None
+    for index, variant in enumerate(variants, 1):
+        prefix = f"v{index}-{variant['name']}"
+        single = variant_request(request, variant)
+        entry = {
+            "index": index,
+            "name": variant["name"],
+            "status": "failed",
+            "error": None,
+            "overrides": {key: variant.get(key, {}) for key in ("parameters", "controls")},
+            "settings": None,
+            "submit_swap": follow_up(original, request, variant),
+            "references": None,
+            "input_sha256": None,
+            "artifacts": [],
+        }
+        progress = {"stage": "comparing", "variant": index, "variants": len(variants)}
+        progress["name"] = variant["name"]
+        total = count if clip else len(frames)
+        atomic_json(directory / "progress.json", {**progress, "frames": 0, "total_frames": total})
+        written, shown, seen = [], {}, hashlib.sha256()
+        try:
+            entry["references"], entry["settings"] = configure_variant(window, single, specs)
+            if clip:
+
+                def observe(offset, frame, swapped):
+                    seen.update(frame.tobytes())
+                    number = start + offset
+                    if number in digests:
+                        if frame_digest(frame) != digests[number]:
+                            raise RuntimeError(
+                                f"Decoded source frame {number} differs from the compared original"
+                            )
+                        written.append(f"{prefix}-f{number}.png")
+                        save_image(artifacts / written[-1], swapped)
+                        shown[number] = thumbnail(swapped, aspect)
+
+                tracking = ("FaceTrackingEnableToggle", "KPSSmoothingEnableToggle")
+                worker = make_worker(window, sequential=any(window.control[k] for k in tracking))
+                written.append(f"{prefix}.mp4")
+                internal = {**single, "report": {"review_images": 0}}
+                result = encode_range(internal, directory, worker, written[-1], observe, progress)
+                if reference is not None and seen.hexdigest() != reference:
+                    raise RuntimeError("Decoded clip differs from the other variants' input")
+                report = result.report
+                summaries = [report_summary(report)]
+                outcome = {
+                    "swapped_faces": worker.swap_count,
+                    "clip": {
+                        "artifact": f"{prefix}.mp4",
+                        "frames": result.frames,
+                        "fps": str(result.fps),
+                        "duration": result.duration,
+                        "audio": result.audio,
+                    },
+                    "frames": [{"frame": n, "artifact": f"{prefix}-f{n}.png"} for n in frames],
+                    "swap_report": summaries[0],
+                }
+            else:
+                report, cells = [], []
+                for done, number in enumerate(frames, 1):
+                    frame = originals[number]
+                    seen.update(frame.tobytes())
+                    window.function_worker.run_detect = run_detect  # Unwrap the last worker.
+                    worker = make_worker(window)
+                    swapped = process(worker, frame, number)
+                    if swapped.shape != frame.shape:
+                        raise RuntimeError("Fusion changed the frame dimensions")
+                    written.append(f"{prefix}-f{number}.png")
+                    save_image(artifacts / written[-1], swapped)
+                    shown[number] = thumbnail(swapped, aspect)
+                    worker.telemetry.finish(number + 1)
+                    cell = variant_request(request, variant, number)
+                    report.append(swap_report(cell, worker.telemetry, None, number))
+                    cells.append(
+                        {
+                            "frame": number,
+                            "artifact": written[-1],
+                            "swapped_faces": worker.swap_count,
+                            "swap_report": report_summary(report[-1]),
+                        }
+                    )
+                    atomic_json(
+                        directory / "progress.json",
+                        {**progress, "frames": done, "total_frames": total},
+                    )
+                swapped_faces = sum(cell["swapped_faces"] for cell in cells)
+                if not swapped_faces:
+                    raise RuntimeError("No faces matched the target references in any frame")
+                summaries = [cell["swap_report"] for cell in cells]
+                outcome = {"swapped_faces": swapped_faces, "frames": cells}
+            # Clips: the clip's report; stills: one preview report per frame.
+            written.append(f"{prefix}-swap-report.json")
+            atomic_json(artifacts / written[-1], report)
+            for summary in summaries:
+                summary["artifact"] = written[-1]
+            entry.update(status="completed", input_sha256=seen.hexdigest(), artifacts=written)
+            entry.update(outcome)
+            reference = reference or entry["input_sha256"]
+            names += written
+        except Exception as error:
+            traceback.print_exc()  # The reason is in the manifest; the traceback in worker.log.
+            entry["error"] = str(error) or type(error).__name__
+            for name in written:
+                (artifacts / name).unlink(missing_ok=True)
+            (directory / f"{prefix}.video-only.mp4").unlink(missing_ok=True)
+            shown = {}
+        finally:
+            window.function_worker.run_detect = run_detect
+        label = f"{index} {variant['name']}" + ("" if shown else " FAILED")
+        for number in frames:
+            image = shown.get(number)
+            image = blank(tiles[number][0][1].shape) if image is None else image
+            tiles[number].append((label, image, bool(shown)))
+        entries.append(entry)
+    failed = [entry for entry in entries if entry["status"] == "failed"]
+    if len(failed) == len(entries):
+        reasons = "; ".join(f"{entry['name']}: {entry['error']}" for entry in failed)
+        raise RuntimeError(f"Every variant failed: {reasons}")
+    grids = []
+    for number in frames:
+        grids.append({"frame": number, "artifact": f"compare-f{number}.jpg"})
+        contact_sheet(
+            artifacts / grids[-1]["artifact"], tiles[number], COMPARE_TILE, COMPARE_COLUMNS
+        )
+    selection = {"frames": frames}
+    if clip:
+        selection.update(
+            fps=str(fps),
+            start_frame=start,
+            end_frame=start + count,
+            frame_count=count,
+            start_time=float(start / fps),
+            duration=float(count / fps),
+        )
+    manifest = {
+        "version": COMPARE_VERSION,
+        "kind": "clip" if clip else "stills",
+        "complete": not failed,
+        "failed_variants": [entry["name"] for entry in failed],
+        "media_path": original["media_path"],
+        "source": {
+            "width": width,
+            "height": height,
+            "sample_aspect_ratio": f"{aspect.numerator}:{aspect.denominator}",
+            **selection,
+            "frame_sha256": {str(number): digest for number, digest in digests.items()},
+        },
+        "order": COMPARE_ORDER,
+        "audio_policy": AUDIO_POLICY,
+        "original": [{"frame": number, "artifact": f"original-f{number}.png"} for number in frames],
+        "grids": grids,
+        "variants": entries,
+    }
+    if failed:
+        listed = ", ".join(f"{entry['name']} ({entry['error']})" for entry in failed)
+        manifest["warning"] = (
+            f"{len(failed)} of {len(entries)} variants failed: {listed}. The comparison is "
+            "incomplete; failed variants appear as FAILED tiles and have no artifacts."
+        )
+    names = [grid["artifact"] for grid in grids] + ["compare.json"] + names
+    manifest["artifacts"] = names
+    atomic_json(artifacts / "compare.json", {**manifest, "revision": REVISION})
+    return manifest
 
 
 STANDARD_RATES = [
@@ -1991,6 +2315,8 @@ def run(directory):
         result = detect_frame(window, request, directory)
     elif request["kind"] == "analyze":
         result = analyze_references(window, request, directory)
+    elif request["kind"] == "compare":
+        result = compare_variants(window, request, directory)
     else:
         used = configure_faces(window, request["mappings"])
         # Fusion's tracking is opt-in and only meaningful across consecutive render frames.

@@ -27,7 +27,8 @@ mcp = FastMCP(
         "contact.jpg shows every labelled crop of a detection job at once. Before swapping with "
         "several source images, run analyze_references to check their quality, duplicates and "
         "consistency. Use explicit target/source "
-        "references, preview before long renders, and follow jobs with job_status(wait_seconds=50), "
+        "references, preview before long renders (compare_variants previews several settings "
+        "on the same frames or short clip in one job), and follow jobs with job_status(wait_seconds=50), "
         "which returns early on any state change, instead of polling rapidly. "
         "Use a stable job_id to make retries idempotent. Jobs survive client disconnection."
     ),
@@ -46,8 +47,8 @@ JobId = Annotated[
 Priority = Annotated[
     Literal["interactive", "normal"] | None,
     Field(
-        description="GPU queue class. Default: interactive for detection and previews, normal "
-        "for renders. Interactive jobs start first; a waiting normal job goes next after 3 "
+        description="GPU queue class. Default: interactive for detection, previews, reference "
+        "analysis and still comparisons, normal for renders and clip comparisons. Interactive jobs start first; a waiting normal job goes next after 3 "
         "interactive jobs in a row or 300 s of them. Pass normal for batch work that should "
         "not delay others' previews. Never interrupts a running job."
     ),
@@ -80,6 +81,22 @@ class FaceMapping(BaseModel):
     )
     parameters: dict = Field(
         default_factory=dict, description="Validated Fusion keys from get_settings"
+    )
+
+
+class Variant(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,19}$",
+        description="Label of this variant: 1–20 letters, digits, underscores or hyphens; "
+        "unique, ignoring case. Names the variant's artifacts and grid tiles.",
+    )
+    parameters: dict = Field(
+        default_factory=dict,
+        description="Fusion parameters from get_settings, merged over every mapping's parameters",
+    )
+    controls: dict = Field(
+        default_factory=dict, description="Controls from get_settings, merged over `controls`"
     )
 
 
@@ -303,6 +320,63 @@ async def submit_swap(
 
 
 @mcp.tool(annotations=WRITE)
+async def compare_variants(
+    media_path: str,
+    mappings: list[FaceMapping],
+    variants: Annotated[list[Variant], Field(min_length=2, max_length=6)],
+    frames: Annotated[
+        list[int] | None,
+        Field(
+            min_length=1,
+            max_length=4,
+            description="Still comparison: 1–4 distinct zero-based frames (images: [0])",
+        ),
+    ] = None,
+    start_frame: Annotated[
+        int | None, Field(ge=0, description="Clip comparison: first frame (default 0)")
+    ] = None,
+    max_frames: Annotated[
+        int | None,
+        Field(ge=1, le=120, description="Clip comparison: frames to render per variant"),
+    ] = None,
+    controls: dict | None = None,
+    job_id: JobId = None,
+    priority: Priority = None,
+) -> dict[str, Any]:
+    """Queue one job that runs 2–6 named settings variants over the same frames or clip.
+
+    Give `frames` for stills, or `max_frames` (and `start_frame`) for a contiguous CFR clip.
+    Every variant uses the same `mappings` and `controls`; its own `parameters` are merged
+    over each mapping's and its `controls` over the common ones, and each merged request is
+    validated like submit_swap before anything is queued. Variants run in order in one worker
+    under one GPU admission, on identical decoded frames; cancel_job stops them all. Stills
+    queue as interactive, clips as normal (see `priority`).
+
+    The result (also compare.json) lists per variant its status, error, overrides, effective
+    `settings`, `references`, swap report summaries, artifacts and `submit_swap`: arguments
+    that repeat that variant alone (add a job_id; change frame or the range as needed).
+    compare-f<N>.jpg grids show the original and each variant labelled "<index> <name>", at
+    display aspect; view them first. Full-resolution PNGs are original-f<N>.png and
+    v<index>-<name>-f<N>.png; clips are v<index>-<name>.mp4 with the same range, frame count,
+    duration and source audio. A failed variant keeps its reason, appears as a red FAILED
+    tile and has no artifacts; the job then completes with `complete: false` and a `warning`,
+    and fails only when every variant fails. Nothing chooses a best variant.
+    """
+    selection = (("frames", frames), ("start_frame", start_frame), ("max_frames", max_frames))
+    return await command(
+        "submit",
+        job_id=uuid.uuid4().hex if job_id is None else job_id,
+        kind="compare",
+        media_path=media_path,
+        mappings=[m.model_dump(exclude_none=True) for m in mappings],
+        variants=[v.model_dump() for v in variants],
+        controls=controls or {},
+        **{k: v for k, v in selection if v is not None},
+        **({} if priority is None else {"priority": priority}),
+    )
+
+
+@mcp.tool(annotations=WRITE)
 async def analyze_references(
     references: Annotated[
         list[str],
@@ -405,14 +479,15 @@ async def job_status(
 @mcp.tool(annotations=READ)
 async def list_jobs(
     status: Literal["queued", "running", "completed", "failed", "cancelled"] | None = None,
-    kind: Literal["detect", "preview", "render", "normalize", "analyze"] | None = None,
+    kind: Literal["detect", "preview", "render", "normalize", "analyze", "compare"] | None = None,
     limit: Annotated[int, Field(ge=1, le=200)] = 50,
 ) -> list[dict[str, Any]]:
     """List the most recently updated jobs, including jobs submitted by another client.
 
     Each summary has kind, status, media_path, frame (sample_frames or frames, and any
     similarity_threshold, for multi-frame detection; start_frame/max_frames for renders; fps
-    for normalization; references for reference analysis), created/started/finished
+    for normalization; references for reference analysis; frames or start_frame/max_frames
+    and variant names for comparisons), created/started/finished
     timestamps, elapsed_seconds since submission (until finish), error and progress; GPU
     jobs add priority and sequence, and queued ones the advisory queue standing that
     job_status describes. Use job_status for results and logs.

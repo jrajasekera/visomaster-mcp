@@ -118,9 +118,10 @@ def current(directory):
 
 
 def observed(state):
-    """What ends a long poll when it changes: status, progress stage and queue standing."""
-    queue = state.get("queue") or {}
-    stage = (state.get("progress") or {}).get("stage")
+    """What ends a long poll when it changes: status, progress stage (and a comparison's
+    variant) and queue standing."""
+    queue, progress = state.get("queue") or {}, state.get("progress") or {}
+    stage = progress.get("stage"), progress.get("variant")
     return state["status"], stage, queue.get("position"), queue.get("reason")
 
 
@@ -174,11 +175,18 @@ def list_jobs(only_status=None, only_kind=None, limit=50):
             "render": ("start_frame", "max_frames"),
             "normalize": ("fps",),
             "analyze": ("references",),
+            "compare": ("frames", "start_frame", "max_frames"),
         }.get(request.get("kind"), ("frame",))
         if request.get("kind") == "detect":
             # Multi-frame detection reports its sampling instead of the unused single frame.
             multi = ("sample_frames", "frames", "similarity_threshold")
             frames = tuple(k for k in multi if request.get(k) is not None) or frames
+        selection = {key: request.get(key) for key in frames}
+        if request.get("kind") == "compare":
+            # Stills or a clip, and the variant names in order.
+            selection = {key: value for key, value in selection.items() if key in request}
+            variants = request.get("variants") or []
+            selection["variants"] = [v.get("name") for v in variants if isinstance(v, dict)]
         created, end = state.get("created_at"), state.get("finished_at") or time.time()
         jobs.append(
             {
@@ -186,7 +194,7 @@ def list_jobs(only_status=None, only_kind=None, limit=50):
                 "kind": request.get("kind"),
                 "status": state["status"],
                 "media_path": request.get("media_path"),
-                **{key: request.get(key) for key in frames},
+                **selection,
                 **{key: state.get(key) for key in ("created_at", "started_at", "finished_at")},
                 "elapsed_seconds": round(end - created, 1) if created else None,
                 "error": state.get("error"),

@@ -14,7 +14,7 @@ def test_stdio_discovery():
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = {tool.name: tool for tool in (await session.list_tools()).tools}
-                assert len(tools) == 21
+                assert len(tools) == 22
                 assert tools["health_check"].annotations.readOnlyHint
                 normalize = tools["normalize_media"]
                 assert not normalize.annotations.readOnlyHint
@@ -28,7 +28,7 @@ def test_stdio_discovery():
                 detect = tools["detect_faces"].inputSchema["properties"]
                 assert {"frame", "sample_frames", "frames", "similarity_threshold"} <= detect.keys()
                 assert detect["sample_frames"]["anyOf"][0]["maximum"] == 64
-                for name in ("detect_faces", "submit_swap"):
+                for name in ("detect_faces", "submit_swap", "compare_variants"):
                     priority = tools[name].inputSchema["properties"]["priority"]
                     assert priority["anyOf"][0]["enum"] == ["interactive", "normal"]
                     assert priority["default"] is None
@@ -61,6 +61,17 @@ def test_stdio_discovery():
                 )
                 assert tools["save_recipe"].inputSchema["required"] == ["name"]
                 assert tools["import_recipe"].inputSchema["required"] == ["local_path"]
+                compare = tools["compare_variants"]
+                assert not compare.annotations.readOnlyHint
+                assert compare.inputSchema["required"] == ["media_path", "mappings", "variants"]
+                schema = compare.inputSchema["properties"]
+                assert (schema["variants"]["minItems"], schema["variants"]["maxItems"]) == (2, 6)
+                assert schema["frames"]["anyOf"][0]["maxItems"] == 4
+                assert schema["max_frames"]["anyOf"][0]["maximum"] == 120
+                variant = compare.inputSchema["$defs"]["Variant"]
+                assert variant["properties"].keys() == {"name", "parameters", "controls"}
+                assert variant["additionalProperties"] is False
+                assert compare.outputSchema["type"] == "object"
                 result = await session.call_tool(
                     "submit_swap", {"media_path": "x", "mappings": [{}]}
                 )

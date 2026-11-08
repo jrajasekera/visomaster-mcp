@@ -28,6 +28,7 @@ PRIORITIES = {
     "detect": "interactive",
     "preview": "interactive",
     "analyze": "interactive",
+    "compare": "interactive",  # Still comparisons; clip comparisons are normal (job_priority).
     "render": "normal",
 }
 DEFAULT_PRIORITY = "normal"
@@ -76,6 +77,24 @@ THRESHOLDS = {
     "outlier_similarity": (float, 0, 100),
 }
 MAX_REFERENCES = 20
+# Variant comparisons (DESIGN.md, Variant comparisons): bounded so a request cannot schedule a sweep.
+COMPARE_KEYS = {
+    "kind",
+    "media_path",
+    "mappings",
+    "controls",
+    "frames",
+    "start_frame",
+    "max_frames",
+    "variants",
+    "priority",
+}
+VARIANT_KEYS = {"name", "parameters", "controls"}
+VARIANT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,19}")
+MIN_VARIANTS, MAX_VARIANTS = 2, 6
+MAX_COMPARE_FRAMES = 4  # Explicit still frames.
+MAX_COMPARE_CLIP = 120  # Frames of a contiguous clip.
+MAX_COMPARE_PIXELS = 3840 * 2160  # Source frame area; outputs keep the source dimensions.
 MAX_REFERENCE_BYTES = 256 * 1024**2
 SHA256 = re.compile(r"[0-9a-f]{64}")
 CONTROLS = {
@@ -537,9 +556,13 @@ def validate_settings(values, definitions, allowed):
 
 def job_priority(request):
     """The scheduling class of a GPU job request, or None for normalization."""
-    if request.get("kind") == "normalize":
+    kind = request.get("kind")
+    if kind == "normalize":
         return None
-    priority = request.get("priority", PRIORITIES.get(request.get("kind"), DEFAULT_PRIORITY))
+    default = PRIORITIES.get(kind, DEFAULT_PRIORITY)
+    if kind == "compare" and request.get("max_frames") is not None:
+        default = "normal"  # A clip comparison renders up to MAX_VARIANTS clips.
+    priority = request.get("priority", default)
     if priority not in CLASSES:
         raise ValueError(f"priority must be one of {', '.join(CLASSES)}")
     return priority
@@ -547,11 +570,21 @@ def job_priority(request):
 
 def validate_request(request):
     """Validate a job request; normalization alone never reads Fusion's layout metadata."""
-    if request.get("kind") not in {"detect", "preview", "render", "normalize", "analyze"}:
+    if request.get("kind") not in {
+        "detect",
+        "preview",
+        "render",
+        "normalize",
+        "analyze",
+        "compare",
+    }:
         raise ValueError("Unknown job kind")
     if request["kind"] == "analyze":
         job_priority(request)
         return validate_analysis(request)
+    if request["kind"] == "compare":
+        job_priority(request)
+        return validate_comparison(request)
     input_path(request["media_path"])
     fps = request.get("fps")
     if fps is not None:
@@ -638,6 +671,92 @@ def validate_fusion_request(request):
         if request["kind"] != "render":
             raise ValueError("report options apply only to renders")
         validate_report(request["report"], request, len(mappings))
+    return request
+
+
+def variant_request(request, variant, frame=None):
+    """The single-variant preview or render request of one comparison variant.
+
+    The variant's parameters are merged over every mapping's and its controls over the common
+    controls; everything else is the comparison's, so variants differ only in their overrides.
+    A still comparison gives a preview of `frame` (default its lowest frame, the first compared),
+    a clip comparison a render of the same range.
+    """
+    overrides = variant.get("parameters", {})
+    mappings = [
+        {**mapping, "parameters": {**mapping.get("parameters", {}), **overrides}}
+        for mapping in request["mappings"]
+    ]
+    single = {
+        "kind": "preview" if "frames" in request else "render",
+        "media_path": request["media_path"],
+        "mappings": mappings,
+        "controls": {**request.get("controls", {}), **variant.get("controls", {})},
+    }
+    if "frames" in request:
+        single["frame"] = min(request["frames"]) if frame is None else frame
+    else:
+        single.update(start_frame=request.get("start_frame", 0), max_frames=request["max_frames"])
+    return single
+
+
+def validate_comparison(request):
+    """Limits, distinct variants and every variant's merged request, validated in full before
+    anything is queued."""
+    extra = sorted(set(request) - COMPARE_KEYS)
+    if extra:
+        raise ValueError(f"Comparisons do not accept {', '.join(extra)}")
+    frames, count = request.get("frames"), request.get("max_frames")
+    if (frames is None) == (count is None):
+        raise ValueError("Compare either explicit frames or a clip of max_frames frames")
+    if frames is not None:
+        if "start_frame" in request:
+            raise ValueError("start_frame applies only to clip comparisons; list frames instead")
+        if (
+            not isinstance(frames, list)
+            or not 1 <= len(frames) <= MAX_COMPARE_FRAMES
+            or any(type(f) is not int or f < 0 for f in frames)
+            or len(set(frames)) != len(frames)
+        ):
+            raise ValueError(
+                f"frames must list 1–{MAX_COMPARE_FRAMES} distinct nonnegative integers"
+            )
+    elif type(count) is not int or not 1 <= count <= MAX_COMPARE_CLIP:
+        raise ValueError(f"max_frames of a clip comparison must be 1–{MAX_COMPARE_CLIP}")
+    mappings = request.get("mappings")
+    if not isinstance(mappings, list) or not all(isinstance(m, dict) for m in mappings):
+        raise ValueError("mappings must list target/source mappings")
+    if not isinstance(request.get("controls", {}), dict):
+        raise ValueError("controls must be an object")
+    variants = request.get("variants")
+    if not isinstance(variants, list) or not MIN_VARIANTS <= len(variants) <= MAX_VARIANTS:
+        raise ValueError(f"variants must list {MIN_VARIANTS}–{MAX_VARIANTS} named variants")
+    names, overrides = set(), set()
+    for variant in variants:
+        if not isinstance(variant, dict) or "name" not in variant or set(variant) - VARIANT_KEYS:
+            raise ValueError("Each variant has a name and optional parameters and controls")
+        name = variant["name"]
+        if not isinstance(name, str) or not VARIANT_NAME.fullmatch(name):
+            raise ValueError(
+                "Variant names are 1–20 letters, digits, underscores or hyphens, starting with "
+                "a letter or digit"
+            )
+        if name.lower() in names:
+            raise ValueError(f"Duplicate variant name {name} (names ignore case)")
+        names.add(name.lower())
+        if not all(isinstance(variant.get(key, {}), dict) for key in ("parameters", "controls")):
+            raise ValueError(f"Variant {name}: parameters and controls must be objects")
+        settings = [variant.get("parameters", {}), variant.get("controls", {})]
+        settings = json.dumps(settings, sort_keys=True)
+        if settings in overrides:
+            raise ValueError(f"Variant {name} repeats another variant's overrides")
+        overrides.add(settings)
+    for variant in variants:
+        try:
+            validate_fusion_request(variant_request(request, variant))
+        except (ValueError, KeyError, TypeError, AttributeError) as error:
+            message = str(error) if isinstance(error, ValueError) else f"invalid request ({error})"
+            raise ValueError(f"Variant {variant['name']}: {message}") from None
     return request
 
 
