@@ -72,6 +72,11 @@ grace period. Terminal states record `finished_at`.
 | `comparing` | `compare` | `variant`, `variants`, `name`, `frames`, `total_frames`; clip comparisons also `swapped_faces`, `frames_per_second`, `eta_seconds` |
 | `normalizing` | `normalize` | `frames`, `estimated_total_frames`, `frames_per_second`, `eta_seconds` (the estimate and ETA are null when the extent is unknown) |
 
+A render's `frames` counts from the start of its range and includes the `reused_frames` a resumed
+render took from earlier chunks (0 otherwise). `frames_per_second` and `eta_seconds` count only
+the frames the current attempt renders, timed from its first decoded frame, so a resume's seek
+past the reused frames does not lower the rate.
+
 ### Long polling
 
 `job_status` with `wait_seconds` (at most 50) blocks on the workstation until one of these

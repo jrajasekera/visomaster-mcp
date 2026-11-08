@@ -14,6 +14,7 @@ import json
 import threading
 import time
 from fractions import Fraction
+from types import SimpleNamespace
 
 import common
 import control
@@ -358,6 +359,67 @@ def test_a_resume_of_a_resume_continues_the_chain(site, reference, monkeypatch):
     worker, result = resume(monkeypatch, "third", "second", Worker(misses={10, 11, 12}))
     assert min(worker.seen) == 15 and result["checkpoint"]["resumed_from"] == "second"
     same_as_reference("third", result, reference)
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+def test_progress_rate_and_eta_count_only_this_attempts_frames(site, monkeypatch, resumed):
+    # On a scripted clock the decoder takes 100 s to reach its first frame (FFmpeg start-up
+    # and, when resuming, the seek past the reused chunks) and each frame takes 1 s to process.
+    request, clock = render_request(site), [0.0]
+    if resumed:
+        attempt(monkeypatch, "broken", request, Worker(crash=13))
+    monkeypatch.setattr(engine, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+    real_decode, real_json, records = engine.decode, engine.atomic_json, []
+
+    def decode(*args):
+        clock[0] += 100
+        yield from real_decode(*args)
+
+    def atomic_json(path, value):
+        if path.name == "progress.json":
+            records.append(value)
+        real_json(path, value)
+
+    class Timed(Worker):
+        def process(self, worker, bgr, index):
+            clock[0] += 1
+            return super().process(worker, bgr, index)
+
+    monkeypatch.setattr(engine, "decode", decode)
+    monkeypatch.setattr(engine, "atomic_json", atomic_json)
+    if resumed:
+        _, result = resume(monkeypatch, "timed", "broken", Timed())
+    else:
+        _, result = attempt(monkeypatch, "timed", request, Timed())
+    assert not isinstance(result, Exception), result
+    first = 11 if resumed else START  # The resume reuses chunks [3, 7) and [7, 11).
+    assert [r["frames"] for r in records] == list(range(first - START + 1, END - START + 1))
+    for index, record in zip(range(first, END), records):
+        assert record["total_frames"] == END - START
+        assert record["reused_frames"] == first - START
+        # One frame per second, however many frames came before this attempt.
+        assert record["frames_per_second"] == 1.0
+        assert record["eta_seconds"] == END - index - 1
+
+
+@pytest.mark.parametrize(
+    "changes, advice",
+    [({}, "Analyze it again and resubmit"), ({"resume": {"from_job_id": "x"}}, "submit a fresh")],
+)
+def test_a_reference_changed_after_submission_fails_with_advice_for_the_job(
+    site, tmp_path, monkeypatch, changes, advice
+):
+    face = str(site / "face.png")
+    request = render_request(site, start_frame=0, max_frames=8, **changes)
+    # The SHA-256 recorded at submission no longer matches, as after an edit.
+    request["mappings"] = [
+        {"target_face": face, "source_faces": [face], "source_sha256": ["0" * 64]}
+    ]
+    (tmp_path / "job").mkdir()
+    with pytest.raises(common.Refusal, match=f"content changed.*{advice}") as refused:
+        test_timing.run_job(tmp_path / "job", monkeypatch, request)
+    assert refused.value.code == "reference_changed"
+    assert ("Analyze" in str(refused.value)) == (not changes)
 
 
 def test_segment_accounting_is_restored_at_the_resume_point(site, monkeypatch):

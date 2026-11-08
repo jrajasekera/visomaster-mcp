@@ -18,7 +18,9 @@ cancelled, you can continue it from the chunks it finished instead of starting a
    was given explicitly, otherwise `normal`.
 
 3. Follow the new job with `job_status`. `job_status` and `list_jobs` show the earlier job as
-   `resume_from`.
+   `resume_from`. Its progress counts `frames` from the start of the range, reused ones
+   included, and reports them as `reused_frames`; `frames_per_second` and `eta_seconds` cover
+   only the frames it renders.
 
 The earlier job keeps its terminal state and is not changed. The new job repeats the earlier
 request, reuses the longest run of chunks from the start whose files still verify, and renders
@@ -41,7 +43,8 @@ recorded. It refuses, with a list of the differences, when any of these changed:
 - the FFmpeg build.
 
 Submit a fresh render in that case. The new job's worker repeats the comparison before it reuses
-anything.
+anything: a reference image that changes after `resume_render` accepted the job fails it with
+`reference_changed`, which also advises a fresh render.
 
 Renders with `FaceTrackingEnableToggle` or `KPSSmoothingEnableToggle` are always refused: their
 tracking and smoothing state is not checkpointed. Submit them again from the start.

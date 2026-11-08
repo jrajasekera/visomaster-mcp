@@ -520,11 +520,19 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def reference_path(value, expected=None):
+REANALYZE = "Analyze it again and resubmit with the new fingerprint."
+# A resume repeats the fingerprints of the render it continues, so a new one cannot help.
+RESUBMIT = (
+    "The checkpointed chunks cannot be reused; submit a fresh render with submit_swap instead."
+)
+
+
+def reference_path(value, expected=None, remedy=REANALYZE):
     """A face reference input; with `expected`, its bytes must still have that SHA-256.
 
     Submission checks fingerprints a caller took from analyze_references, and the worker checks
-    those recorded at submission, so a changed file is reported rather than silently used.
+    those recorded at submission, so a changed file is reported, with `remedy`, rather than
+    silently used.
     """
     path = input_path(value)
     if path.stat().st_size > MAX_REFERENCE_BYTES:
@@ -535,7 +543,7 @@ def reference_path(value, expected=None):
         raise Refusal(
             "reference_changed",
             f"Reference {value} no longer has SHA-256 {expected}: its content changed after it "
-            "was fingerprinted. Analyze it again and resubmit with the new fingerprint.",
+            f"was fingerprinted. {remedy}",
         )
     return path
 
@@ -837,11 +845,12 @@ def validate_fusion_request(request):
         raise ValueError("At least one explicit target/source mapping is required")
     if len(mappings) > 20:
         raise ValueError("At most 20 mappings are supported")
+    remedy = REANALYZE if request.get("resume") is None else RESUBMIT
     for mapping in mappings:
         target = mapping.get("target_sha256")
         if target is not None and not (isinstance(target, str) and SHA256.fullmatch(target)):
             raise ValueError("target_sha256 must be a 64-hex-digit SHA-256")
-        reference_path(mapping["target_face"], target)
+        reference_path(mapping["target_face"], target, remedy)
         sources = mapping["source_faces"]
         if not isinstance(sources, list) or not 1 <= len(sources) <= MAX_REFERENCES:
             raise ValueError("Each mapping requires 1–20 source images")
@@ -850,7 +859,7 @@ def validate_fusion_request(request):
         read = positive(mapping)
         for number, (source, digest) in enumerate(zip(sources, expected)):
             if number in read:
-                reference_path(source, digest)
+                reference_path(source, digest, remedy)
             elif not (isinstance(source, str) and os.path.isabs(source)):
                 message = f"Source images must be absolute workstation paths: {source!r}"
                 raise Refusal("path_not_absolute", message)

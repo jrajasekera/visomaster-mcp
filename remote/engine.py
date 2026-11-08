@@ -2308,11 +2308,15 @@ def encode_range(request, directory, worker, name, observe=None, progress=None, 
         first = sink.begin(stream, fps, start, end, worker, plan)
         if first < end:
             frames = decode(source, stream, first, end - first)
-        started = time.monotonic()
+        started = None
         for index in range(first, end):
             frame = next(frames, None)
             if frame is None:
                 raise RuntimeError(f"Input decoding stopped at {index}, expected {expected} frames")
+            if started is None:
+                # The rate counts this attempt's frames from its first decoded one: FFmpeg's
+                # start-up, and a resume's seek past the reused chunks, are not rendering time.
+                started = time.monotonic()
             number = plan.at(index) if plan else None
             swaps = worker.swap_count
             if plan and plan.runs[number]["passthrough"]:

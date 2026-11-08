@@ -80,7 +80,7 @@ def comparison(media_path, face, **fields):
 def validation(monkeypatch):
     monkeypatch.setattr(common, "layouts", lambda: LAYOUTS)
     monkeypatch.setattr(common, "input_path", lambda path: path)
-    monkeypatch.setattr(common, "reference_path", lambda path, expected=None: path)
+    monkeypatch.setattr(common, "reference_path", lambda path, *checks: path)
     return comparison("/m/clip.mp4", "/m/face.png", frames=[3])
 
 

@@ -36,7 +36,7 @@ PARAMETER_SPECS = {
 @pytest.fixture
 def stubbed(monkeypatch):
     monkeypatch.setattr(common, "input_path", lambda path: path)
-    monkeypatch.setattr(common, "reference_path", lambda path, expected=None: path)
+    monkeypatch.setattr(common, "reference_path", lambda path, *checks: path)
     monkeypatch.setattr(common, "layouts", lambda: (CONTROL_SPECS, PARAMETER_SPECS))
 
 

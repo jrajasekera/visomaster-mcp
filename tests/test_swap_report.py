@@ -515,7 +515,7 @@ def test_expected_range_past_the_video_fails_before_processing(media, tmp_path, 
 
 def test_report_options_are_validated(monkeypatch):
     monkeypatch.setattr(common, "input_path", lambda path: path)
-    monkeypatch.setattr(common, "reference_path", lambda path, expected=None: path)
+    monkeypatch.setattr(common, "reference_path", lambda path, *checks: path)
     monkeypatch.setattr(common, "layouts", lambda: ({}, {}))
     base = {**request(), "start_frame": 10, "max_frames": 20}
     good = {
