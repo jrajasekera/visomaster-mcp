@@ -93,6 +93,10 @@ def fusion(tmp_path, monkeypatch):
     monkeypatch.setitem(
         sys.modules, "cv2", SimpleNamespace(imread=lambda path: saved.get(Path(path)))
     )
+    # References are decoded from their fingerprinted bytes; saved images are in memory here.
+    monkeypatch.setattr(
+        engine, "reference_image", lambda path, digest=None: ("0" * 64, saved.get(Path(path)))
+    )
     (tmp_path / "artifacts").mkdir()
     return SimpleNamespace(
         window=window, frames=frames, calls=calls, saved=saved, sheets=sheets, directory=tmp_path
@@ -121,7 +125,8 @@ def configure(fusion, monkeypatch, reference):
     for name, module in (("app", ModuleType("app")), ("app.helpers", ModuleType("app.helpers"))):
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setitem(sys.modules, "app.helpers.miscellaneous", helpers)
-    monkeypatch.setitem(sys.modules, "numpy", SimpleNamespace(mean=lambda values, axis: values[0]))
+    numpy = SimpleNamespace(asarray=lambda values, dtype: values, float32="float32")
+    monkeypatch.setitem(sys.modules, "numpy", numpy)
     window = fusion.window
     window.default_parameters = {"SwapModelSelection": "Inswapper128"}
     window.parameters, window.target_faces = {}, {}

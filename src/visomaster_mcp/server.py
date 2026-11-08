@@ -24,7 +24,9 @@ mcp = FastMCP(
     instructions=(
         "Run health_check and get_settings first. Paths are absolute workstation paths. "
         "Detect faces and inspect their crops before assigning identities; view_artifact "
-        "contact.jpg shows every labelled crop of a detection job at once. Use explicit target/source "
+        "contact.jpg shows every labelled crop of a detection job at once. Before swapping with "
+        "several source images, run analyze_references to check their quality, duplicates and "
+        "consistency. Use explicit target/source "
         "references, preview before long renders, and follow jobs with job_status(wait_seconds=50), "
         "which returns early on any state change, instead of polling rapidly. "
         "Use a stable job_id to make retries idempotent. Jobs survive client disconnection."
@@ -43,6 +45,10 @@ JobId = Annotated[
 ]
 
 
+Weight = Annotated[float, Field(ge=0, allow_inf_nan=False)]
+Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
 class FaceMapping(BaseModel):
     model_config = ConfigDict(extra="forbid")
     target_face: str = Field(
@@ -51,8 +57,40 @@ class FaceMapping(BaseModel):
     source_faces: list[str] = Field(
         min_length=1, max_length=20, description="Workstation images of the replacement identity"
     )
+    source_weights: list[Weight] | None = Field(
+        None,
+        description="Optional weight per source image, in source_faces order: finite, "
+        "nonnegative, with a positive sum. 0 excludes an image (it is not read). Embeddings are "
+        "averaged with these weights, then L2-normalized as Fusion's merge does, so only their "
+        "ratios matter. Omit for equal weights (the plain average).",
+    )
+    source_sha256: list[Digest] | None = Field(
+        None,
+        description="Optional SHA-256 per source image, in source_faces order, as "
+        "analyze_references reported them. Submission fails if any file's bytes changed since.",
+    )
     parameters: dict = Field(
         default_factory=dict, description="Validated Fusion keys from get_settings"
+    )
+
+
+class ReferenceThresholds(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    min_face_pixels: int | None = Field(
+        None, ge=1, le=4096, description="Shorter face-box side in pixels; default 112"
+    )
+    min_sharpness: float | None = Field(
+        None, ge=0, le=1_000_000, description="Laplacian variance at 112x112; default 40"
+    )
+    duplicate_similarity: float | None = Field(
+        None, ge=50, le=100, description="Fusion similarity marking near duplicates; default 95"
+    )
+    outlier_similarity: float | None = Field(
+        None,
+        ge=0,
+        le=100,
+        description="Leave-one-out similarity below which a reference is an outlier; default "
+        "Fusion's SimilarityThresholdSlider default (60)",
     )
 
 
@@ -193,17 +231,67 @@ async def submit_swap(
     SimilarityThresholdSlider is left alone while the target is in frame. Turn it off only to
     swap several faces of one identity in a frame. When the target leaves the frame, another
     face can still match; raise SimilarityThresholdSlider (e.g. 75) if the preview shows that.
+
+    Several source images are averaged (source_weights sets explicit weights, 0 excludes one)
+    and the result's `references` lists, per mapping, each source's SHA-256, weight and share.
+    Every reference's bytes are fingerprinted at submission; a file changed before the worker
+    reads it fails the job instead of being used.
     """
     return await command(
         "submit",
         job_id=uuid.uuid4().hex if job_id is None else job_id,
         kind=mode,
         media_path=media_path,
-        mappings=[m.model_dump() for m in mappings],
+        # Unset optional fields are omitted, so earlier requests keep their idempotent form.
+        mappings=[m.model_dump(exclude_none=True) for m in mappings],
         frame=frame,
         start_frame=start_frame,
         max_frames=max_frames,
         controls=controls or {},
+    )
+
+
+@mcp.tool(annotations=WRITE)
+async def analyze_references(
+    references: Annotated[
+        list[str],
+        Field(min_length=1, max_length=20, description="Absolute workstation image paths"),
+    ],
+    swap_model: Annotated[
+        str | None,
+        Field(
+            description="SwapModelSelection whose ArcFace embedding is compared, as the swap "
+            "averages it; default Fusion's default swap model"
+        ),
+    ] = None,
+    thresholds: ReferenceThresholds | None = None,
+    controls: dict | None = None,
+    job_id: JobId = None,
+) -> dict[str, Any]:
+    """Queue a GPU check of candidate source images. Poll job_status, then view contact.jpg.
+
+    Each reference gets an id (r0, r1, ... in request order), its SHA-256, face count, face
+    box, `face_pixels` (shorter box side, source pixels), `sharpness` (Laplacian variance of
+    the box's luma at 112x112), `consistency_score`, a crop artifact when usable and
+    `findings` (code, severity, message). `usable` means submit_swap accepts it: exactly one
+    detected face with an embedding; unreadable, no_face, multiple_faces and unrecognized are
+    errors. Warnings (small_face, blurry, exact_duplicate, near_duplicate, outlier,
+    inconsistent_pair) report concerns for review; nothing is removed or changed. Outlier
+    scores compare each embedding with the mean of the others on Fusion's similarity scale,
+    need 3 distinct usable references (2 give only `pair_similarity`), and suggest a different
+    person, view or lighting rather than establishing identity. Detection uses the same
+    `controls` as submit_swap. Pass the reported sha256 values as FaceMapping.source_sha256 so
+    a later swap fails if the files change, and source_weights to exclude or down-weight.
+    """
+    optional = (("swap_model", swap_model), ("controls", controls))
+    limits = thresholds.model_dump(exclude_none=True) if thresholds else {}
+    return await command(
+        "submit",
+        job_id=uuid.uuid4().hex if job_id is None else job_id,
+        kind="analyze",
+        references=references,
+        **({"thresholds": limits} if limits else {}),
+        **{k: v for k, v in optional if v is not None},
     )
 
 
@@ -259,15 +347,16 @@ async def job_status(
 @mcp.tool(annotations=READ)
 async def list_jobs(
     status: Literal["queued", "running", "completed", "failed", "cancelled"] | None = None,
-    kind: Literal["detect", "preview", "render", "normalize"] | None = None,
+    kind: Literal["detect", "preview", "render", "normalize", "analyze"] | None = None,
     limit: Annotated[int, Field(ge=1, le=200)] = 50,
 ) -> list[dict[str, Any]]:
     """List the most recently updated jobs, including jobs submitted by another client.
 
     Each summary has kind, status, media_path, frame (sample_frames or frames, and any
     similarity_threshold, for multi-frame detection; start_frame/max_frames for renders; fps
-    for normalization), created/started/finished timestamps, elapsed_seconds since submission
-    (until finish), error and progress. Use job_status for results and logs.
+    for normalization; references for reference analysis), created/started/finished
+    timestamps, elapsed_seconds since submission (until finish), error and progress. Use
+    job_status for results and logs.
     """
     return await command("list", status=status, kind=kind, limit=limit)
 

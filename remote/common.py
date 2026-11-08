@@ -44,6 +44,17 @@ PARAMETERS = {
 DEMUXERS = "mov,matroska,avi,mpegts,png_pipe,jpeg_pipe,webp_pipe,bmp_pipe"
 MAX_DETECT_FRAMES = 64
 NORMALIZE_KEYS = {"kind", "media_path", "fps"}
+ANALYZE_KEYS = {"kind", "references", "reference_sha256", "swap_model", "thresholds", "controls"}
+# Reference analysis thresholds: (type, minimum, maximum). The engine documents their defaults.
+THRESHOLDS = {
+    "min_face_pixels": (int, 1, 4096),
+    "min_sharpness": (float, 0, 1_000_000),
+    "duplicate_similarity": (float, 50, 100),
+    "outlier_similarity": (float, 0, 100),
+}
+MAX_REFERENCES = 20
+MAX_REFERENCE_BYTES = 256 * 1024**2
+SHA256 = re.compile(r"[0-9a-f]{64}")
 CONTROLS = {
     "DetectorModelSelection",
     "DetectorScoreSlider",
@@ -299,6 +310,57 @@ def input_path(value):
     return path
 
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def reference_path(value, expected=None):
+    """A face reference input; with `expected`, its bytes must still have that SHA-256.
+
+    Submission checks fingerprints a caller took from analyze_references, and the worker checks
+    those recorded at submission, so a changed file is reported rather than silently used.
+    """
+    path = input_path(value)
+    if path.stat().st_size > MAX_REFERENCE_BYTES:
+        raise ValueError(f"Face references must be images up to 256 MiB: {value}")
+    if expected is not None and file_sha256(path) != expected:
+        raise ValueError(
+            f"Reference {value} no longer has SHA-256 {expected}: its content changed after it "
+            "was fingerprinted. Analyze it again and resubmit with the new fingerprint."
+        )
+    return path
+
+
+def digests(values, count, key):
+    """Expected SHA-256 values, one per reference, or Nones when omitted."""
+    if values is None:
+        return [None] * count
+    if (
+        not isinstance(values, list)
+        or len(values) != count
+        or not all(isinstance(v, str) and SHA256.fullmatch(v) for v in values)
+    ):
+        raise ValueError(f"{key} must list one 64-hex-digit SHA-256 per reference")
+    return values
+
+
+def validate_weights(weights, count):
+    """Explicit source weights: finite, nonnegative, one per source, with a positive sum."""
+    if weights is None:
+        return
+    if not isinstance(weights, list) or len(weights) != count:
+        raise ValueError("source_weights must list one weight per source image")
+    if any(type(w) not in (int, float) or not math.isfinite(w) or w < 0 for w in weights):
+        raise ValueError("source_weights must be finite nonnegative numbers")
+    total = sum(weights)
+    if not (math.isfinite(total) and total > 0):
+        raise ValueError("source_weights must have a positive, finite sum")
+
+
 def artifact_path(job_id, name):
     directory = job_path(job_id) / "artifacts"
     path = (directory / name).resolve(strict=True)
@@ -451,9 +513,11 @@ def validate_settings(values, definitions, allowed):
 
 
 def validate_request(request):
-    """Validate a job request; only detect, preview and render read Fusion's layout metadata."""
-    if request.get("kind") not in {"detect", "preview", "render", "normalize"}:
+    """Validate a job request; normalization alone never reads Fusion's layout metadata."""
+    if request.get("kind") not in {"detect", "preview", "render", "normalize", "analyze"}:
         raise ValueError("Unknown job kind")
+    if request["kind"] == "analyze":
+        return validate_analysis(request)
     input_path(request["media_path"])
     fps = request.get("fps")
     if fps is not None:
@@ -517,11 +581,50 @@ def validate_fusion_request(request):
     if len(mappings) > 20:
         raise ValueError("At most 20 mappings are supported")
     for mapping in mappings:
-        input_path(mapping["target_face"])
+        target = mapping.get("target_sha256")
+        if target is not None and not (isinstance(target, str) and SHA256.fullmatch(target)):
+            raise ValueError("target_sha256 must be a 64-hex-digit SHA-256")
+        reference_path(mapping["target_face"], target)
         sources = mapping["source_faces"]
-        if not isinstance(sources, list) or not 1 <= len(sources) <= 20:
+        if not isinstance(sources, list) or not 1 <= len(sources) <= MAX_REFERENCES:
             raise ValueError("Each mapping requires 1–20 source images")
-        for source in sources:
-            input_path(source)
+        expected = digests(mapping.get("source_sha256"), len(sources), "source_sha256")
+        for source, digest in zip(sources, expected):
+            reference_path(source, digest)
+        validate_weights(mapping.get("source_weights"), len(sources))
         validate_settings(mapping.get("parameters", {}), parameters, PARAMETERS)
+    return request
+
+
+def validate_analysis(request):
+    """References, thresholds and settings of a reference-analysis request."""
+    extra = sorted(set(request) - ANALYZE_KEYS)
+    if extra:
+        raise ValueError(f"Reference analysis does not accept {', '.join(extra)}")
+    references = request.get("references")
+    if (
+        not isinstance(references, list)
+        or not 1 <= len(references) <= MAX_REFERENCES
+        or not all(isinstance(path, str) for path in references)
+    ):
+        raise ValueError(f"references must list 1–{MAX_REFERENCES} image paths")
+    expected = digests(request.get("reference_sha256"), len(references), "reference_sha256")
+    for path, digest in zip(references, expected):
+        reference_path(path, digest)
+    thresholds = request.get("thresholds")
+    thresholds = {} if thresholds is None else thresholds
+    if not isinstance(thresholds, dict):
+        raise ValueError("thresholds must be an object")
+    for key, value in thresholds.items():
+        if key not in THRESHOLDS:
+            raise ValueError(f"Unknown threshold {key}; use {', '.join(THRESHOLDS)}")
+        kind, low, high = THRESHOLDS[key]
+        valid = type(value) in ((int,) if kind is int else (int, float))
+        if not valid or not math.isfinite(value) or not low <= value <= high:
+            number = "an integer" if kind is int else "a number"
+            raise ValueError(f"Threshold {key} must be {number} from {low} to {high}")
+    control, parameters = layouts()
+    validate_settings(request.get("controls", {}), control, CONTROLS)
+    if request.get("swap_model") is not None:
+        validate_settings({"SwapModelSelection": request["swap_model"]}, parameters, PARAMETERS)
     return request

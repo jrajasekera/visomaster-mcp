@@ -3,6 +3,7 @@
 import contextlib
 import ctypes
 import functools
+import hashlib
 import io
 import json
 import math
@@ -586,6 +587,269 @@ def detect_identities(window, request, directory):
     return references(result, identities)
 
 
+# Reference analysis measures faces as submit_swap reads them: the same detector and limit, and
+# the swap model's ArcFace embedding, which the source merge averages.
+RECOGNITION_SIDE = 112  # Fusion's ArcFace input size; sharpness is measured at this scale.
+ANALYSIS_DEFAULTS = {"min_face_pixels": 112, "min_sharpness": 40.0, "duplicate_similarity": 95.0}
+METRICS = {
+    "face_pixels": "Shorter side of the detector's face box, in source-image pixels",
+    "sharpness": (
+        "Variance of the 4-neighbour Laplacian (cv2.Laplacian, ksize 1) of the face box's 8-bit "
+        "luma resized to 112x112, the recognition input size, in squared luma levels. Lower is "
+        "blurrier; faces smaller than 112 pixels are enlarged and score lower"
+    ),
+    "similarity": "Fusion's match scale: 50 + 50 x cosine similarity of the embeddings (0-100)",
+}
+CONSISTENCY_BASIS = (
+    "Leave-one-out: each usable reference's embedding scored on Fusion's similarity scale "
+    "against the normalized mean of the other usable references' unit embeddings, excluding "
+    "byte-identical copies of it"
+)
+LABELS = {
+    "unreadable": "unreadable",
+    "no_face": "no face",
+    "unrecognized": "no embedding",
+    "small_face": "small",
+    "blurry": "blurry",
+    "exact_duplicate": "copy",
+    "near_duplicate": "duplicate",
+    "outlier": "outlier",
+    "inconsistent_pair": "differs",
+}
+
+
+def laplacian_variance(rows):
+    """Variance of the 4-neighbour Laplacian over the interior of `rows` (lists of luma)."""
+    values = [
+        rows[y - 1][x] + rows[y + 1][x] + rows[y][x - 1] + rows[y][x + 1] - 4 * rows[y][x]
+        for y in range(1, len(rows) - 1)
+        for x in range(1, len(rows[y]) - 1)
+    ]
+    if not values:
+        return 0.0
+    mean = sum(values) / len(values)
+    return sum((v - mean) ** 2 for v in values) / len(values)
+
+
+def face_sharpness(image, box):
+    import cv2
+
+    gray = cv2.cvtColor(region(image, box), cv2.COLOR_BGR2GRAY)
+    enlarge = min(gray.shape) < RECOGNITION_SIDE
+    gray = cv2.resize(
+        gray,
+        (RECOGNITION_SIDE, RECOGNITION_SIDE),
+        interpolation=cv2.INTER_CUBIC if enlarge else cv2.INTER_AREA,
+    )
+    return round(laplacian_variance(gray.tolist()), 1)
+
+
+def finding(entry, code, severity, message):
+    entry["findings"].append({"code": code, "severity": severity, "message": message})
+
+
+def inspect_reference(window, entry, image, model, thresholds):
+    """Detect and measure one decoded reference as submit_swap would; returns its embedding,
+    or None when submit_swap would refuse it."""
+    tensor, boxes, points = detect_reference(window, image)
+    entry["faces"] = len(boxes)
+    if len(boxes) != 1:
+        entry["boxes"] = [[int(v) for v in box[:4]] for box in boxes]
+        if boxes:
+            message = f"{len(boxes)} faces detected; crop it to one face (detect_faces does)"
+            finding(entry, "multiple_faces", "error", message)
+        else:
+            finding(entry, "no_face", "error", "No face detected; submit_swap requires one")
+        return None
+    height, width = image.shape[:2]
+    box = crop_bounds([int(v) for v in boxes[0][:4]], 0, (0, 0, width, height))
+    entry["box"] = list(box)
+    entry["face_pixels"] = pixels = min(box[2] - box[0], box[3] - box[1])
+    if pixels < thresholds["min_face_pixels"]:
+        message = (
+            f"The face is {pixels} px on its shorter side, below {thresholds['min_face_pixels']}; "
+            "recognition enlarges it, so its identity detail is limited"
+        )
+        finding(entry, "small_face", "warning", message)
+    if pixels > 2:
+        entry["sharpness"] = face_sharpness(image, box)
+        if entry["sharpness"] < thresholds["min_sharpness"]:
+            message = (
+                f"Sharpness {entry['sharpness']} is below {thresholds['min_sharpness']}; the "
+                "face looks blurred at recognition scale"
+            )
+            finding(entry, "blurry", "warning", message)
+    embedding = window.function_worker.run_recognize_direct(tensor, points[0], "Auto", model)[0]
+    if embedding is None:
+        finding(entry, "unrecognized", "error", f"{model} produced no embedding for the face")
+        return None
+    entry["usable"] = True
+    return [float(v) for v in embedding.ravel()]
+
+
+def assess_collection(entries, embeddings, thresholds, model):
+    """Duplicates and embedding consistency within one collection, as findings on `entries`.
+
+    `embeddings` maps the index of each usable entry to its embedding. Returns the duplicates
+    and the consistency summary. Consistency needs at least two distinct usable references, and
+    outlier scores three: with two, a disagreement cannot be attributed to either.
+    """
+    duplicates = []
+    for later, entry in enumerate(entries):
+        for earlier, other in enumerate(entries[:later]):
+            score = None
+            if other["sha256"] == entry["sha256"]:
+                kind, code = "identical_bytes", "exact_duplicate"
+                message = f"Same bytes as {other['id']}, so an average counts that image twice"
+            elif earlier in embeddings and later in embeddings:
+                score = round(similarity(embeddings[earlier], embeddings[later]), 1)
+                if score < thresholds["duplicate_similarity"]:
+                    continue
+                kind, code = "near_identical", "near_duplicate"
+                message = (
+                    f"Scores {score} against {other['id']}, at least "
+                    f"{thresholds['duplicate_similarity']}: nearly the same image, so it adds "
+                    "weight rather than new information"
+                )
+            else:
+                continue
+            duplicates.append(
+                {
+                    "reference": entry["id"],
+                    "duplicate_of": other["id"],
+                    "kind": kind,
+                    "similarity": score,
+                }
+            )
+            finding(entry, code, "warning", message)
+            break
+    usable = sorted(embeddings)
+    distinct = {}
+    for index in usable:
+        distinct.setdefault(entries[index]["sha256"], index)
+    consistency = {"model": model, "basis": CONSISTENCY_BASIS, "available": False}
+    limit = thresholds["outlier_similarity"]
+    if len(distinct) >= 3:
+        consistency["available"] = True
+        for index in usable:
+            others = [
+                unit(embeddings[j])
+                for j in usable
+                if entries[j]["sha256"] != entries[index]["sha256"]
+            ]
+            score = round(similarity(embeddings[index], [sum(c) for c in zip(*others)]), 1)
+            entries[index]["consistency_score"] = score
+            if score < limit:
+                message = (
+                    f"Scores {score} against the other references' mean, below {limit}: it may "
+                    "show another person or an unusual view or lighting. Review its crop; "
+                    "nothing was removed"
+                )
+                finding(entries[index], "outlier", "warning", message)
+    elif len(distinct) == 2:
+        first, second = distinct.values()
+        score = round(similarity(embeddings[first], embeddings[second]), 1)
+        consistency["pair_similarity"] = score
+        consistency["reason"] = (
+            "Outlier scores need at least 3 distinct usable references; with 2, a disagreement "
+            "cannot be attributed to either"
+        )
+        if score < limit:
+            for index, other in ((first, second), (second, first)):
+                message = (
+                    f"Scores {score} against {entries[other]['id']}, below {limit}: one of the "
+                    "two may show another person; review both"
+                )
+                finding(entries[index], "inconsistent_pair", "warning", message)
+    else:
+        consistency["reason"] = "Consistency needs at least 2 distinct usable references"
+    return duplicates, consistency
+
+
+def analyze_references(window, request, directory):
+    """Per-reference face count, size, sharpness, duplicates and embedding consistency.
+
+    References are decoded from the bytes fingerprinted at submission and are never altered or
+    dropped: findings only report. Writes a crop per usable reference, a labelled contact sheet
+    of every reference and analysis.json.
+    """
+    import numpy as np
+
+    parameters = layouts()[1]
+    swap_model = request.get("swap_model") or parameters["SwapModelSelection"]["default"]
+    model = window.function_worker.get_arcface_model(swap_model)
+    thresholds = {
+        **ANALYSIS_DEFAULTS,
+        "outlier_similarity": parameters["SimilarityThresholdSlider"]["default"],
+        **(request.get("thresholds") or {}),
+    }
+    paths = request["references"]
+    expected = request.get("reference_sha256") or [None] * len(paths)
+    artifacts = directory / "artifacts"
+    entries, embeddings, shown = [], {}, []
+    for index, (path, digest) in enumerate(zip(paths, expected)):
+        atomic_json(
+            directory / "progress.json",
+            {"stage": "analyzing", "references": index, "total_references": len(paths)},
+        )
+        entry = {
+            "id": f"r{index}",
+            "path": path,
+            "sha256": None,
+            "usable": False,
+            "faces": None,
+            "image_size": None,
+            "box": None,
+            "face_pixels": None,
+            "sharpness": None,
+            "consistency_score": None,
+            "artifact": None,
+            "findings": [],
+        }
+        entry["sha256"], image = reference_image(path, digest)
+        picture = np.full((RECOGNITION_SIDE, RECOGNITION_SIDE, 3), 48, np.uint8)
+        if image is None:
+            message = "Not a decodable image (PNG, JPEG, WebP or BMP); submit_swap refuses it"
+            finding(entry, "unreadable", "error", message)
+        else:
+            entry["image_size"] = [int(image.shape[1]), int(image.shape[0])]
+            embedding = inspect_reference(window, entry, image, model, thresholds)
+            picture = image
+            if embedding is not None:
+                embeddings[index] = embedding
+                bounds = crop_bounds(entry["box"], PADDING[0], (0, 0, *entry["image_size"]))
+                picture = region(image, bounds)
+                entry["artifact"] = f"reference-{index}.png"
+                save_image(artifacts / entry["artifact"], picture)
+        entries.append(entry)
+        shown.append(picture)
+    duplicates, consistency = assess_collection(entries, embeddings, thresholds, model)
+    tiles = []
+    for entry, picture in zip(entries, shown):
+        codes = [f["code"] for f in entry["findings"]]
+        label = LABELS.get(codes[0], f"{entry['faces']} faces") if codes else "ok"
+        more = "+" if len(codes) > 1 else ""
+        tiles.append((f"{entry['id']} {label}{more}", picture, entry["usable"]))
+    contact_sheet(artifacts / "contact.jpg", tiles)
+    severities = [f["severity"] for entry in entries for f in entry["findings"]]
+    result = {
+        "swap_model": swap_model,
+        "model": model,
+        "usable": len(embeddings),
+        "errors": severities.count("error"),
+        "warnings": severities.count("warning"),
+        "references": entries,
+        "duplicates": duplicates,
+        "consistency": consistency,
+        "thresholds": thresholds,
+        "metrics": METRICS,
+        "artifacts": ["contact.jpg", "analysis.json"]
+        + [entry["artifact"] for entry in entries if entry["artifact"]],
+    }
+    atomic_json(artifacts / "analysis.json", {**result, "revision": REVISION})
+    return result
+
+
 class TargetFace:
     def __init__(self, face_id, embeddings, sources):
         self.face_id = face_id
@@ -599,13 +863,46 @@ class TargetFace:
         return self.embeddings[model]
 
 
-def configure_faces(window, mappings):
+def reference_image(path, digest=None):
+    """(SHA-256, BGR image or None if undecodable) of a reference, decoded from the bytes hashed.
+
+    With `digest`, those bytes must have it: a file changed since submission is refused. cv2's
+    imdecode applies EXIF orientation as imread does.
+    """
     import cv2
+    import numpy as np
+
+    data = Path(input_path(path)).read_bytes()
+    found = hashlib.sha256(data).hexdigest()
+    if digest is not None and found != digest:
+        raise ValueError(
+            f"Reference {path} changed after submission (SHA-256 {found}, expected {digest}); "
+            "analyze it again and resubmit"
+        )
+    return found, cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+
+
+def merge_embeddings(vectors, weights):
+    """Fusion's source merge (EmbMergeMethodSelection "Mean", then L2 normalization, as in
+    calculate_assigned_input_embedding) with explicit weights; equal weights are its mean."""
+    total = sum(weights)
+    mean = [
+        sum(w * float(v[i]) for v, w in zip(vectors, weights)) / total
+        for i in range(len(vectors[0]))
+    ]
+    return unit(mean)
+
+
+def configure_faces(window, mappings):
+    """Bind each mapping's target and weighted source embeddings; returns what each mapping used.
+
+    Sources with weight 0 are excluded and never read. Omitted weights are equal.
+    """
     import numpy as np
     from app.helpers.miscellaneous import ParametersDict
 
-    def embeddings(path, models):
-        image = cv2.imread(str(input_path(path)))
+    def embeddings(path, digest, models):
+        sha256, image = reference_image(path, digest)
         if image is None:
             raise ValueError(f"Face reference must be an image: {path}")
         tensor, boxes, points = detect_reference(window, image)
@@ -613,11 +910,10 @@ def configure_faces(window, mappings):
             raise ValueError(
                 f"Reference must contain exactly one detected face: {path} ({len(boxes)})"
             )
-        return {
-            model: window.function_worker.run_recognize_direct(tensor, points[0], "Auto", model)[0]
-            for model in models
-        }
+        recognize = window.function_worker.run_recognize_direct
+        return sha256, {model: recognize(tensor, points[0], "Auto", model)[0] for model in models}
 
+    used = []
     for index, mapping in enumerate(mappings):
         parameters = dict(window.default_parameters)
         parameters.update(mapping.get("parameters", {}))
@@ -625,12 +921,40 @@ def configure_faces(window, mappings):
             window.control["RecognitionModelSelection"],
             window.function_worker.get_arcface_model(parameters["SwapModelSelection"]),
         }
-        target = embeddings(mapping["target_face"], models)
-        sources = [embeddings(path, models) for path in mapping["source_faces"]]
-        merged = {model: np.mean([source[model] for source in sources], axis=0) for model in models}
+        target_sha256, target = embeddings(
+            mapping["target_face"], mapping.get("target_sha256"), models
+        )
+        paths = mapping["source_faces"]
+        weights = mapping.get("source_weights") or [1] * len(paths)
+        expected = mapping.get("source_sha256") or [None] * len(paths)
+        sources, report = [], []
+        for path, digest, weight in zip(paths, expected, weights):
+            sha256 = digest
+            if weight > 0:
+                sha256, store = embeddings(path, digest, models)
+                sources.append((store, weight))
+            share = round(weight / sum(weights), 6)
+            report.append({"path": path, "sha256": sha256, "weight": weight, "share": share})
+        merged = {
+            model: np.asarray(
+                merge_embeddings([store[model] for store, _ in sources], [w for _, w in sources]),
+                dtype=np.float32,
+            )
+            for model in models
+        }
         face_id = str(index)
         window.target_faces[face_id] = TargetFace(face_id, target, merged)
         window.parameters[face_id] = ParametersDict(parameters, dict(window.default_parameters))
+        used.append(
+            {
+                "mapping": index,
+                "target_face": mapping["target_face"],
+                "target_sha256": target_sha256,
+                "weighted": mapping.get("source_weights") is not None,
+                "sources": report,
+            }
+        )
+    return used
 
 
 def make_worker(window, sequential=False):
@@ -1121,8 +1445,10 @@ def run(directory):
         result = detect_identities(window, request, directory)
     elif request["kind"] == "detect":
         result = detect_frame(window, request, directory)
+    elif request["kind"] == "analyze":
+        result = analyze_references(window, request, directory)
     else:
-        configure_faces(window, request["mappings"])
+        used = configure_faces(window, request["mappings"])
         # Fusion's tracking is opt-in and only meaningful across consecutive render frames.
         tracking = any(
             window.control[k] for k in ("FaceTrackingEnableToggle", "KPSSmoothingEnableToggle")
@@ -1142,6 +1468,7 @@ def run(directory):
             }
         else:
             result = render_video(window, request, directory, worker)
+        result["references"] = used
     result["revision"] = REVISION
     atomic_json(directory / "result.json", result)
 

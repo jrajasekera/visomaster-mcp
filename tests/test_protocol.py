@@ -14,7 +14,7 @@ def test_stdio_discovery():
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = {tool.name: tool for tool in (await session.list_tools()).tools}
-                assert len(tools) == 14
+                assert len(tools) == 15
                 assert tools["health_check"].annotations.readOnlyHint
                 normalize = tools["normalize_media"]
                 assert not normalize.annotations.readOnlyHint
@@ -29,6 +29,13 @@ def test_stdio_discovery():
                 assert {"frame", "sample_frames", "frames", "similarity_threshold"} <= detect.keys()
                 assert detect["sample_frames"]["anyOf"][0]["maximum"] == 64
                 assert tools["submit_swap"].outputSchema["type"] == "object"
+                analyze = tools["analyze_references"]
+                assert not analyze.annotations.readOnlyHint
+                assert analyze.inputSchema["required"] == ["references"]
+                assert analyze.inputSchema["properties"]["references"]["maxItems"] == 20
+                assert analyze.outputSchema["type"] == "object"
+                mapping = tools["submit_swap"].inputSchema["$defs"]["FaceMapping"]["properties"]
+                assert {"source_weights", "source_sha256"} <= mapping.keys()
                 assert "mappings" in tools["submit_swap"].inputSchema["required"]
                 result = await session.call_tool(
                     "submit_swap", {"media_path": "x", "mappings": [{}]}

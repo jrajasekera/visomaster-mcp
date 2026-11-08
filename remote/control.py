@@ -44,6 +44,7 @@ from common import (  # noqa: E402
     ConfigError,
     atomic_json,
     config_path,
+    file_sha256,
     fusion_compatibility,
     input_path,
     job_path,
@@ -150,9 +151,11 @@ def list_jobs(only_status=None, only_kind=None, limit=50):
             only_kind and request.get("kind") != only_kind
         ):
             continue
-        frames = {"render": ("start_frame", "max_frames"), "normalize": ("fps",)}.get(
-            request.get("kind"), ("frame",)
-        )
+        frames = {
+            "render": ("start_frame", "max_frames"),
+            "normalize": ("fps",),
+            "analyze": ("references",),
+        }.get(request.get("kind"), ("frame",))
         if request.get("kind") == "detect":
             # Multi-frame detection reports its sampling instead of the unused single frame.
             multi = ("sample_frames", "frames", "similarity_threshold")
@@ -218,7 +221,7 @@ def submit(request):
             (staging / "artifacts").mkdir()
             atomic_json(staging / "request.json", request)
             # The worker opens and retention protects these files, whatever aliases point to later.
-            atomic_json(staging / "resolved.json", resolve_inputs(request))
+            atomic_json(staging / "resolved.json", fingerprint(resolve_inputs(request)))
             atomic_json(
                 staging / "state.json",
                 {
@@ -580,6 +583,11 @@ def resolve_inputs(request):
     resolved = copy.deepcopy(request)
     if isinstance(resolved.get("media_path"), str):
         resolved["media_path"] = os.path.realpath(resolved["media_path"])
+    if isinstance(resolved.get("references"), list):
+        resolved["references"] = [
+            os.path.realpath(path) if isinstance(path, str) else path
+            for path in resolved["references"]
+        ]
     for mapping in resolved.get("mappings") or []:
         if isinstance(mapping, dict):
             if isinstance(mapping.get("target_face"), str):
@@ -592,8 +600,23 @@ def resolve_inputs(request):
     return resolved
 
 
+def fingerprint(resolved):
+    """Record the SHA-256 of each face reference the worker will read, unless the request gave
+    one (validation has compared those), so the worker uses exactly the bytes submitted."""
+    if isinstance(resolved.get("references"), list) and resolved.get("reference_sha256") is None:
+        resolved["reference_sha256"] = [file_sha256(path) for path in resolved["references"]]
+    for mapping in resolved.get("mappings") or []:
+        if mapping.get("target_sha256") is None:
+            mapping["target_sha256"] = file_sha256(mapping["target_face"])
+        if mapping.get("source_sha256") is None:
+            mapping["source_sha256"] = [file_sha256(path) for path in mapping["source_faces"]]
+    return resolved
+
+
 def request_paths(request):
     paths = [request.get("media_path")]
+    if isinstance(request.get("references"), list):
+        paths.extend(request["references"])
     for mapping in request.get("mappings") or []:
         if isinstance(mapping, dict):
             paths.append(mapping.get("target_face"))

@@ -166,7 +166,8 @@ The supervisor starts each GPU job as `<runner...> <release>/engine.py <job dire
 | `upload_media` | Stream a local image/video into private workstation storage, reusing identical uploads |
 | `inspect_media` | FFprobe metadata for a workstation file |
 | `detect_faces` | Queue detection at a selected frame and produce reference crops, or sample up to 64 frames (`sample_frames` or `frames`) and group faces into identities (optional `similarity_threshold`) with one reference crop each; only verified crops get a `reference_path` |
-| `submit_swap` | Queue a frame/image preview or a video render with explicit face mappings |
+| `analyze_references` | Queue a GPU check of up to 20 candidate source images: face count, size, sharpness, duplicates and embedding consistency, with a crop per usable image and a labelled `contact.jpg` |
+| `submit_swap` | Queue a frame/image preview or a video render with explicit face mappings, optional per-source weights and expected fingerprints |
 | `normalize_media` | Queue a CPU-only FFmpeg conversion to a render-ready video (CFR, zero start, even dimensions, rotation and flips applied); does not wait for the GPU |
 | `job_status` | State, frame progress and result manifest; `wait_seconds` (≤ 50) long-polls for the next change; log tail on request or failure |
 | `list_jobs` | Recent job summaries shared across clients (kind, media, frame selection or sampling, timing, status, progress), filterable by `status` and `kind`, `limit` up to 200 |
@@ -180,12 +181,30 @@ Multi-frame detection embeds every detected face with the configured recognition
 
 A crop is verified when it is a reference `submit_swap` accepts for that same face: it re-detects as exactly one face under the same detector limit, the detected box overlaps the original by an IoU of at least 0.5, and its embedding scores at least the default `SimilarityThresholdSlider` against the original detection. When the 30% padding takes in a neighbouring face, a crop padded by 10% is tried. Single-frame `faces` and multi-frame `identities` carry `reference_verified`; an unverified crop keeps its `artifact` for inspection but has `reference_path: null`, is marked `*` and framed in red on `contact.jpg`, and a result with no verified crop carries a `warning`.
 
+### Reference analysis
+
+`analyze_references` takes `references` (absolute image paths, 1–20), an optional `swap_model` (default Fusion's default swap model), optional `thresholds` and the same detector `controls` as `submit_swap`. It is a queued GPU job that shares the GPU lock. It reads each image exactly as `submit_swap` does: the same detector with its 20-face limit, and the ArcFace embedding of `swap_model`, which is the embedding the swap averages. Each reference in `result.references` has:
+
+- `id` (`r0`, `r1`, … in request order), `path` and `sha256` of the bytes analyzed;
+- `usable`: true when `submit_swap` accepts it (exactly one detected face with an embedding), with `faces`, `box` (or `boxes` when several are found) and `image_size`;
+- `face_pixels`: the shorter side of the detector's box in source-image pixels;
+- `sharpness`: the variance of the 4-neighbour Laplacian (OpenCV's `Laplacian` with aperture 1) of the box's 8-bit luma resized to 112 × 112, the ArcFace input size, in squared luma levels. Faces smaller than 112 pixels are enlarged and score lower;
+- `consistency_score` and `findings` (`code`, `severity`, `message`), and `artifact`, the padded crop `reference-N.png` of a usable reference.
+
+Errors mark images `submit_swap` refuses: `unreadable`, `no_face`, `multiple_faces` and `unrecognized`. Warnings mark images to review: `small_face` (below `min_face_pixels`, default 112), `blurry` (below `min_sharpness`, default 40), `exact_duplicate` (same bytes as an earlier reference), `near_duplicate` (scores at least `duplicate_similarity`, default 95, against an earlier reference), `outlier` and `inconsistent_pair`. `result.duplicates` lists each redundant reference with the earlier one it repeats. Outlier evidence compares embeddings on Fusion's similarity scale (50 + 50 × cosine): each usable reference scores against the normalized mean of the other usable references, excluding byte-identical copies, and scores below `outlier_similarity` (default `SimilarityThresholdSlider`'s default, 60) are flagged. `result.consistency` states the model and basis. It needs three distinct usable references; with two it reports only their `pair_similarity` (flagging both when it is below the threshold), and with one it is unavailable. A low score suggests another person, an unusual view or unusual lighting; it does not establish identity. The defaults come from a small sample of face crops: sharp crops measured about 90–850 and the same crops blurred measured about 10–90, so tune thresholds on your own material.
+
+Analysis never removes, edits or reorders references. `contact.jpg` shows every reference labelled with its id and first finding (`+` when there are more), unusable ones framed in red; `analysis.json` holds the result with the Fusion revision. Raw embeddings are not returned.
+
+### Source weights and fingerprints
+
+A `FaceMapping` may add `source_weights`, one finite, nonnegative number per `source_faces` entry with a positive sum. The adapter merges source embeddings as Fusion's own merge does (`EmbMergeMethodSelection` "Mean", then L2 normalization), weighted: weight 2 counts like two copies of an image, only ratios matter, and weight 0 excludes an image, which is then not read. Omitting `source_weights` gives the equal average. It may also add `source_sha256`, one SHA-256 per source as `analyze_references` reported; submission then fails if any file changed since the analysis. Whether or not they are given, submission records every target and source image's SHA-256 in `resolved.json`, and the worker decodes exactly those bytes or fails the job. Reference images are limited to 256 MiB. Preview and render results list under `references`, per mapping, the target's SHA-256 and each source's path, SHA-256, weight and normalized `share`. Requests that omit the new fields keep their earlier form, so earlier `job_id` retries stay idempotent. Analysis results are not reused by later jobs: each swap recomputes embeddings from the fingerprinted bytes with its own swap model, so rerun the analysis after changing images or `SwapModelSelection`.
+
 ## Typical workflow
 
 1. Call `health_check` and `get_settings`.
 2. Use an absolute workstation media path under `media_root`, or upload a local file with `upload_media`.
 3. Call `detect_faces` on a representative frame, or with `sample_frames` (for example 16) to find everyone who appears across a video. Call `job_status` with `wait_seconds: 50` until `completed`, then inspect the returned crops with `view_artifact`; `contact.jpg` shows them all in one labelled grid.
-4. Use the selected crop's or identity's `reference_path` as `target_face` (it is null for unverified crops). Supply one or more reference images of the replacement identity as `source_faces`. Each reference image must contain exactly one detected face.
+4. Use the selected crop's or identity's `reference_path` as `target_face` (it is null for unverified crops). Supply one or more reference images of the replacement identity as `source_faces`. Each reference image must contain exactly one detected face. With several, run `analyze_references` on them, view its `contact.jpg`, and pass its `sha256` values as `source_sha256`, plus `source_weights` to exclude (0) or down-weight images it flags.
 5. Submit a `preview`, inspect its image, then submit a short `render`. After reviewing that clip, submit the full frame range.
 6. Follow the job with `job_status` and `wait_seconds`, then download `result.mp4` or `result.png` after completion.
 

@@ -565,7 +565,7 @@ def test_submission_schemas_describe_the_job_id_format():
                 return {tool.name: tool.inputSchema for tool in (await session.list_tools()).tools}
 
     found = asyncio.run(schemas())
-    for name in ("detect_faces", "submit_swap", "normalize_media"):
+    for name in ("detect_faces", "submit_swap", "normalize_media", "analyze_references"):
         description = found[name]["properties"]["job_id"]["description"]
         assert "1–64 letters, digits, underscores or hyphens" in description
         assert "omit" in description.lower()
