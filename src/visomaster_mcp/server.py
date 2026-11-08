@@ -43,6 +43,15 @@ JobId = Annotated[
         "or hyphens, starting with a letter or digit. Omit it (or pass null) to generate one."
     ),
 ]
+Priority = Annotated[
+    Literal["interactive", "normal"] | None,
+    Field(
+        description="GPU queue class. Default: interactive for detection and previews, normal "
+        "for renders. Interactive jobs start first; a waiting normal job goes next after 3 "
+        "interactive jobs in a row or 300 s of them. Pass normal for batch work that should "
+        "not delay others' previews. Never interrupts a running job."
+    ),
+]
 
 
 Weight = Annotated[float, Field(ge=0, allow_inf_nan=False)]
@@ -203,6 +212,7 @@ async def detect_faces(
     ] = None,
     controls: dict | None = None,
     job_id: JobId = None,
+    priority: Priority = None,
 ) -> dict[str, Any]:
     """Queue face detection. Poll job_status, then inspect crops with view_artifact.
 
@@ -222,6 +232,7 @@ async def detect_faces(
         ("sample_frames", sample_frames),
         ("frames", frames),
         ("similarity_threshold", similarity_threshold),
+        ("priority", priority),
     )
     return await command(
         "submit",
@@ -246,13 +257,15 @@ async def submit_swap(
     controls: dict | None = None,
     report: SwapReportOptions | None = None,
     job_id: JobId = None,
+    priority: Priority = None,
 ) -> dict[str, Any]:
     """Queue an image/frame preview or CFR video render using explicit identity mappings.
 
     Preview processes `frame`. Render processes `start_frame` and at most `max_frames`
     (None means through the end). Outputs are new job artifacts. Video output is H.264,
     with the selected interval's first audio stream encoded to AAC, or no audio if that stream
-    has no samples there. Preview defaults to Inswapper128. Consult get_settings before changing parameters. GPU jobs run one at a time.
+    has no samples there. Preview defaults to Inswapper128. Consult get_settings before changing parameters. GPU jobs run one at a time:
+    previews queue as interactive and renders as normal (see `priority`).
     Renders reject VFR, nonzero start times, odd dimensions, rotation and display flips; use
     normalize_media. Each target swaps only its best-matching face per frame by default
     (control SwapOnlyBestMatchEnableToggle), so a look-alike that clears the mapping's
@@ -285,6 +298,7 @@ async def submit_swap(
         controls=controls or {},
         # Omitted when unset so earlier requests keep their idempotent form.
         **({} if report is None else {"report": report.model_dump(exclude_none=True)}),
+        **({} if priority is None else {"priority": priority}),
     )
 
 
@@ -304,6 +318,7 @@ async def analyze_references(
     thresholds: ReferenceThresholds | None = None,
     controls: dict | None = None,
     job_id: JobId = None,
+    priority: Priority = None,
 ) -> dict[str, Any]:
     """Queue a GPU check of candidate source images. Poll job_status, then view contact.jpg.
 
@@ -319,8 +334,9 @@ async def analyze_references(
     person, view or lighting rather than establishing identity. Detection uses the same
     `controls` as submit_swap. Pass the reported sha256 values as FaceMapping.source_sha256 so
     a later swap fails if the files change, and source_weights to exclude or down-weight.
+    Analysis queues as interactive unless `priority` says otherwise.
     """
-    optional = (("swap_model", swap_model), ("controls", controls))
+    optional = (("swap_model", swap_model), ("controls", controls), ("priority", priority))
     limits = thresholds.model_dump(exclude_none=True) if thresholds else {}
     return await command(
         "submit",
@@ -367,10 +383,15 @@ async def job_status(
 ) -> dict[str, Any]:
     """Read durable queued/running/completed/failed/cancelled state, progress and results.
 
-    With wait_seconds > 0 the call blocks on the workstation until the job's status or
-    progress stage differs from its value at call time, the job is terminal, or the wait
-    elapses, then returns the current state. Frame counts advancing within a stage do not
-    end the wait. The worker log tail is returned when include_log is true or the job failed.
+    With wait_seconds > 0 the call blocks on the workstation until the job's status, progress
+    stage or queue position/reason differs from its value at call time, the job is terminal,
+    or the wait elapses, then returns the current state. Frame counts advancing within a stage
+    do not end the wait. The worker log tail is returned when include_log is true or the job
+    failed. GPU jobs carry `priority` and `sequence` (FIFO order within a class); while queued,
+    `queue` gives an advisory `position` (1 = next to start), `reason` (next, gpu_busy,
+    behind_earlier, behind_interactive, behind_due_normal, cancel_requested, starting),
+    `interactive_streak` and `waiting_seconds`. Positions can change as jobs arrive, end or
+    become due under the fairness rule; there is no start-time estimate.
     """
     return await command(
         "status",
@@ -392,8 +413,9 @@ async def list_jobs(
     Each summary has kind, status, media_path, frame (sample_frames or frames, and any
     similarity_threshold, for multi-frame detection; start_frame/max_frames for renders; fps
     for normalization; references for reference analysis), created/started/finished
-    timestamps, elapsed_seconds since submission (until finish), error and progress. Use
-    job_status for results and logs.
+    timestamps, elapsed_seconds since submission (until finish), error and progress; GPU
+    jobs add priority and sequence, and queued ones the advisory queue standing that
+    job_status describes. Use job_status for results and logs.
     """
     return await command("list", status=status, kind=kind, limit=limit)
 

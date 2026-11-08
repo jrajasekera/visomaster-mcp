@@ -418,7 +418,9 @@ def test_upload_and_normalized_artifact_feed_later_jobs_with_external_state(make
     mapping = {"target_face": face, "source_faces": [face], "parameters": {}}
     render = {"kind": "render", "media_path": normalized, "mappings": [mapping]}
     control.submit({"job_id": "consumer", **render, "start_frame": 0, "controls": {}})
-    control.submit({"job_id": "crops", "kind": "detect", "media_path": face, "frame": 0})
+    # Normal class, so it queues behind the render in FIFO order instead of passing it.
+    crops = {"kind": "detect", "media_path": face, "frame": 0, "priority": "normal"}
+    control.submit({"job_id": "crops", **crops})
     wait_file(common.job_path("consumer") / "entered")  # Detection waits for the GPU lock.
     # Retention compares resolved paths: the producer and the upload stay while consumers run.
     with pytest.raises(ValueError, match="uses this job's artifacts"):

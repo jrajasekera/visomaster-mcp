@@ -140,7 +140,7 @@ SSH calls use `BatchMode=yes` and share one multiplexed connection through `~/.s
 | `state_dir` | no | `<media_root>/runtime/visomaster-mcp` | Inside `media_root` or on separate storage, but not `media_root` itself, an ancestor of it or inside `fusion_dir`; created with mode 0700. Only `uploads/*` (complete files) and `jobs/<id>/artifacts/**` of completed jobs are accepted as inputs; requests, logs, locks, staging and partial files never are, even when `state_dir` lies inside `media_root`. Paths are resolved before the check, so symlinks and `..` cannot reach other files |
 | `gpu` | no | `"0"` | GPU index as a string, without leading zeros. Sets `CUDA_VISIBLE_DEVICES` (with `CUDA_DEVICE_ORDER=PCI_BUS_ID`) and names the lock `gpu-<index>.lock` |
 | `runner` | yes | | Path, or list of arguments, whose first element is an absolute executable. Never passed through a shell |
-| `lock_dir` | no | `state_dir` | Existing writable directory for `gpu-<index>.lock` |
+| `lock_dir` | no | `state_dir` | Existing writable directory for `gpu-<index>.lock` and the GPU queue (`gpu-<index>.queue.json`, `gpu-<index>.queue.lock`) |
 
 Several deployments on one host that share a GPU must use the same `lock_dir` and the same `gpu` index, so their jobs serialize on one lock file. A deployment with its own `lock_dir` does not coordinate with others. The legacy `VM_BASE`, `VM_APP`, `VM_STATE` and `VM_GPU` variables are no longer read; if one is set to a different value, the workstation reports an error instead of ignoring it.
 
@@ -165,12 +165,12 @@ The supervisor starts each GPU job as `<runner...> <release>/engine.py <job dire
 | `get_settings` | Supported Fusion settings with effective defaults and limits |
 | `upload_media` | Stream a local image/video into private workstation storage, reusing identical uploads |
 | `inspect_media` | FFprobe metadata for a workstation file |
-| `detect_faces` | Queue detection at a selected frame and produce reference crops, or sample up to 64 frames (`sample_frames` or `frames`) and group faces into identities (optional `similarity_threshold`) with one reference crop each; only verified crops get a `reference_path` |
-| `analyze_references` | Queue a GPU check of up to 20 candidate source images: face count, size, sharpness, duplicates and embedding consistency, with a crop per usable image and a labelled `contact.jpg` |
-| `submit_swap` | Queue a frame/image preview or a video render with explicit face mappings, optional per-source weights and expected fingerprints; results include a per-mapping `swap_report` summary and the `swap-report.json` artifact, and renders write labelled review images (optional `report`: `review_images`, `expected_visible`, `min_coverage`) |
+| `detect_faces` | Queue detection at a selected frame and produce reference crops, or sample up to 64 frames (`sample_frames` or `frames`) and group faces into identities (optional `similarity_threshold`) with one reference crop each; only verified crops get a `reference_path`. Queues as `interactive` unless `priority` says otherwise |
+| `analyze_references` | Queue a GPU check of up to 20 candidate source images: face count, size, sharpness, duplicates and embedding consistency, with a crop per usable image and a labelled `contact.jpg`. Queues as `interactive` unless `priority` says otherwise |
+| `submit_swap` | Queue a frame/image preview (`interactive`) or a video render (`normal`) with explicit face mappings, optional per-source weights and expected fingerprints; results include a per-mapping `swap_report` summary and the `swap-report.json` artifact, and renders write labelled review images (optional `report`: `review_images`, `expected_visible`, `min_coverage`); optional `priority` overrides the class |
 | `normalize_media` | Queue a CPU-only FFmpeg conversion to a render-ready video (CFR, zero start, even dimensions, rotation and flips applied); does not wait for the GPU |
-| `job_status` | State, frame progress and result manifest; `wait_seconds` (≤ 50) long-polls for the next change; log tail on request or failure |
-| `list_jobs` | Recent job summaries shared across clients (kind, media, frame selection or sampling, timing, status, progress), filterable by `status` and `kind`, `limit` up to 200 |
+| `job_status` | State, frame progress and result manifest; `wait_seconds` (≤ 50) long-polls for the next change, including a change of queue position or reason; GPU jobs report `priority` and `sequence`, and queued ones a `queue` standing; log tail on request or failure |
+| `list_jobs` | Recent job summaries shared across clients (kind, media, frame selection or sampling, timing, status, progress, and for GPU jobs `priority`, `sequence` and, while queued, `queue`), filterable by `status` and `kind`, `limit` up to 200 |
 | `cancel_job` | Request cancellation, then poll for terminal state |
 | `delete_job` | Permanently remove a terminal job's directory, logs and artifacts |
 | `prune_storage` | Report (dry run, default) or delete old terminal jobs, unused uploads and crash leftovers |
@@ -272,6 +272,30 @@ Pass these options to a render as `report`, for example:
 Job state, logs and artifacts live in `<state_dir>/jobs/JOB_ID`. Uploaded media lives in `<state_dir>/uploads`, named by SHA-256 so identical uploads share one file. Terminal jobs remain until `delete_job` or `prune_storage` removes them. `prune_storage` deletes terminal jobs finished more than `older_than_days` ago (default 30) and uploads untouched for that long, unless a queued or running job uses their files as input, as well as staging and trash directories left by crashes and partial uploads idle for over an hour. It reports byte totals and is a dry run unless `dry_run` is false; the dry run applies the same checks. Partial files from cancelled or failed jobs remain for diagnosis, and artifact tools expose only completed jobs. Each downloaded artifact has its own job subdirectory. Repeating the same download atomically replaces that local copy.
 
 MCP GPU jobs share a process lock across all client sessions. Fusion's desktop GUI has its own GPU workload, so coordinate large GUI renders with MCP renders.
+
+## GPU scheduling
+
+GPU jobs run one at a time, in an order every client and every deployment sharing the `lock_dir` agrees on. Each job gets a class and a sequence number at submission, both reported by `job_status` and `list_jobs` and kept for the job's lifetime:
+
+| Class | Default for | Order |
+| --- | --- | --- |
+| `interactive` | `detect_faces`, `submit_swap` previews | Starts before waiting normal jobs, oldest first |
+| `normal` | `submit_swap` renders, and any GPU job kind not listed | Oldest first; becomes due under the fairness rule |
+
+Pass `priority` to `detect_faces` or `submit_swap` to choose the class, for example `"normal"` for a batch of detections that should not delay someone else's previews. A retried submission with the same `job_id` keeps its sequence, so reconnecting never moves a job forward or back. Normalization does not use the GPU and is not queued.
+
+Fairness rule: when both classes are waiting, an interactive job starts next unless the waiting normal work is due. It becomes due after 3 interactive jobs have started in a row while it waited, or 300 seconds after the first of them started. Starting a normal job resets both, so a steady stream of previews delays a waiting render by at most three previews (and no preview starts more than five minutes after the first of them), and previews then go first again.
+
+Scheduling only happens between jobs. A running render keeps the GPU until it finishes, fails or is cancelled; a preview never interrupts it, the queue never stops other processes, and Fusion's GUI does not take part. Yielding to previews at chunk boundaries of long renders is separate future work.
+
+While a GPU job is queued, its `queue` object reports:
+
+- `position`: its place in the order the rule would produce now, with 1 next. It is advisory and can change: new interactive jobs move normal jobs back, a due render moves forward, and jobs that finish, fail or are cancelled move the rest forward.
+- `reason`: `next` (first and the GPU is free), `gpu_busy` (first, waiting for the running job), `behind_earlier` (older jobs of its own class are ahead), `behind_interactive` (a normal job waiting for interactive jobs), `behind_due_normal` (an interactive job waiting for a due normal job), `cancel_requested` (no longer eligible) or `starting` (being admitted).
+- `interactive_streak`: interactive jobs started in a row ahead of waiting normal work (the rule allows 3).
+- `waiting_seconds`: time since submission.
+
+There is no start-time estimate. `job_status` with `wait_seconds` returns early when the position or reason changes. Cancelling a queued job takes it out of the order at once; a cancellation that arrives just as the job starts stops it like any running job, and one that arrives after the job succeeded leaves it completed.
 
 ## Troubleshooting
 

@@ -30,6 +30,7 @@ from common import (  # noqa: E402
     ADAPTER_CONTROLS,
     APP,
     BASE,
+    CLASSES,
     CONFIG_ERROR,
     CONTROLS,
     GPU,
@@ -48,6 +49,7 @@ from common import (  # noqa: E402
     fusion_compatibility,
     input_path,
     job_path,
+    job_priority,
     layouts,
     load_config,
     probe,
@@ -108,16 +110,23 @@ def current(directory):
     return state
 
 
+def observed(state):
+    """What ends a long poll when it changes: status, progress stage and queue standing."""
+    queue = state.get("queue") or {}
+    stage = (state.get("progress") or {}).get("stage")
+    return state["status"], stage, queue.get("position"), queue.get("reason")
+
+
 def status(job_id, wait=0, include_log=False):
     directory = job_path(job_id)
-    state = current(directory)
-    # Long poll: return once status or progress stage changes, or the job becomes terminal.
-    initial = (state["status"], state.get("progress", {}).get("stage"))
+    state = queued(directory, current(directory))
+    # Long poll: return once status, progress stage or queue standing changes, or the job ends.
+    initial = observed(state)
     deadline = time.monotonic() + min(max(float(wait), 0.0), MAX_WAIT)
     while state["status"] not in TERMINAL and time.monotonic() < deadline:
         time.sleep(0.25)
-        state = current(directory)
-        if (state["status"], state.get("progress", {}).get("stage")) != initial:
+        state = queued(directory, current(directory))
+        if observed(state) != initial:
             break
     result = directory / "result.json"
     if state["status"] == "completed" and result.exists():
@@ -140,7 +149,7 @@ def modified(path):
 def list_jobs(only_status=None, only_kind=None, limit=50):
     limit = min(max(int(limit), 1), 200)
     paths = sorted((STATE / "jobs").glob("*/state.json"), key=modified, reverse=True)
-    jobs = []
+    jobs, view = [], None
     for path in paths:
         try:
             state = current(path.parent)
@@ -151,6 +160,9 @@ def list_jobs(only_status=None, only_kind=None, limit=50):
             only_kind and request.get("kind") != only_kind
         ):
             continue
+        if state["status"] == "queued" and state.get("priority"):
+            view = queue_view() if view is None else view  # One snapshot for the whole list.
+            queued(path.parent, state, view)
         frames = {
             "render": ("start_frame", "max_frames"),
             "normalize": ("fps",),
@@ -172,6 +184,8 @@ def list_jobs(only_status=None, only_kind=None, limit=50):
                 "elapsed_seconds": round(end - created, 1) if created else None,
                 "error": state.get("error"),
                 "progress": state.get("progress"),
+                # GPU jobs only, and queue standing only while queued.
+                **{key: state[key] for key in ("priority", "sequence", "queue") if key in state},
             }
         )
         if len(jobs) == limit:
@@ -181,6 +195,214 @@ def list_jobs(only_status=None, only_kind=None, limit=50):
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+# GPU scheduling (DESIGN.md, GPU scheduling). Each GPU's queue lives beside its lock in the lock
+# directory, so every deployment sharing that directory shares one queue and one decision.
+MAX_STREAK = 3  # Interactive admissions in a row ahead of waiting normal work before it is due.
+AGE_LIMIT = 300  # Seconds after the first of them at which waiting normal work is due anyway.
+ENTRY = {
+    "job": (str,),
+    "job_id": (str,),
+    "priority": (str,),
+    "sequence": (int,),
+    "enqueued_at": (int, float),
+}
+
+
+def load_queue(path):
+    """The queue file's contents; malformed parts are dropped and supervisors rejoin."""
+    try:
+        raw = read_json(path)
+    except (OSError, ValueError):
+        raw = {}
+    raw = raw if isinstance(raw, dict) else {}
+    entries = raw.get("waiting") if isinstance(raw.get("waiting"), list) else []
+    waiting = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and all(type(entry.get(key)) in types for key, types in ENTRY.items())
+        and entry["priority"] in CLASSES
+    ]
+    number = raw.get("next_sequence")
+    since = raw.get("passed_since")
+    return {
+        "next_sequence": max(
+            [number if type(number) is int else 1] + [entry["sequence"] + 1 for entry in waiting]
+        ),
+        "streak": raw["streak"] if type(raw.get("streak")) is int else 0,
+        "passed_since": since if type(since) in (int, float) else None,
+        "waiting": waiting,
+    }
+
+
+@contextlib.contextmanager
+def scheduler(lock_dir, gpu):
+    """This GPU's queue under its scheduling lock, saved on normal exit if changed.
+
+    Submission, admission, status and listing read and change the queue only under this lock,
+    so one decision at a time picks the next job and that job takes the GPU lock within it.
+    """
+    path = Path(lock_dir) / f"gpu-{gpu}.queue.json"
+    with (Path(lock_dir) / f"gpu-{gpu}.queue.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        queue = load_queue(path)
+        before = canonical(queue)
+        yield queue
+        if canonical(queue) != before:
+            atomic_json(path, queue)
+
+
+def fifo(entry):
+    return entry["sequence"], entry["enqueued_at"], entry["job"]
+
+
+def enqueue(queue, directory, state):
+    """Queue a job at its recorded sequence, or record the next sequence in its state."""
+    if state.get("sequence") is None:
+        state["sequence"] = queue["next_sequence"]
+    queue["next_sequence"] = max(queue["next_sequence"], state["sequence"] + 1)
+    queue["waiting"].append(
+        {
+            "job": str(directory),
+            "job_id": state["job_id"],
+            "priority": state["priority"],
+            "sequence": state["sequence"],
+            "enqueued_at": state.get("created_at") or time.time(),
+        }
+    )
+
+
+def standing(entry):
+    """ "waiting" for an eligible entry, "cancelled" while its cancelled job is still exiting,
+    or "drop" when its job ended, vanished or was replaced under the same ID."""
+    directory = Path(entry["job"])
+    try:
+        if not valid_job_directory(directory):
+            return "drop"
+        state = current(directory)  # Fails a job whose supervisor died.
+    except (OSError, ValueError, KeyError, TypeError):
+        return "drop"  # A live supervisor rejoins at its recorded sequence.
+    if state["status"] != "queued" or state.get("sequence") != entry["sequence"]:
+        return "drop"
+    return "cancelled" if (directory / "cancel").exists() else "waiting"
+
+
+def lanes(queue, heads=False):
+    """Eligible entries of each class in FIFO order and cancelled ones; drops ended entries.
+    With heads, only the first eligible entry of each class is looked for."""
+    found, cancelled = {name: [] for name in CLASSES}, []
+    for entry in sorted(queue["waiting"], key=fifo):
+        if heads and found[entry["priority"]]:
+            continue
+        verdict = standing(entry)
+        if verdict == "drop":
+            queue["waiting"].remove(entry)
+        else:
+            (cancelled if verdict == "cancelled" else found[entry["priority"]]).append(entry)
+    return found, cancelled
+
+
+def pick(found, queue, now):
+    """The next admission: the interactive head, unless waiting normal work is due."""
+    interactive, normal = found["interactive"], found["normal"]
+    since = queue["passed_since"]
+    due = queue["streak"] >= MAX_STREAK or (since is not None and now - since >= AGE_LIMIT)
+    if normal and (due or not interactive):
+        return normal[0]
+    return interactive[0] if interactive else None
+
+
+def record(queue, entry, found, now):
+    """Count an interactive admission that passes waiting normal work; anything else resets."""
+    if entry["priority"] == "normal" or not found["normal"]:
+        queue.update(streak=0, passed_since=None)
+    else:
+        since = queue["passed_since"]
+        queue.update(streak=queue["streak"] + 1, passed_since=now if since is None else since)
+
+
+def predicted(found, queue, now):
+    """Admission order if nothing else arrives and no time passes; advisory."""
+    found = {name: list(entries) for name, entries in found.items()}
+    queue, order = dict(queue), []
+    while (entry := pick(found, queue, now)) is not None:
+        record(queue, entry, found, now)
+        found[entry["priority"]].remove(entry)
+        order.append(entry)
+    return order
+
+
+def admit(settings, directory, state, gpu_lock):
+    """One scheduling decision: True once this job is next and holds the GPU lock. The choice,
+    the lock and leaving the queue happen under the scheduling lock, so they are one step."""
+    name = str(directory)
+    with scheduler(settings.lock_dir, settings.gpu) as queue:
+        if not any(entry["job"] == name for entry in queue["waiting"]):
+            enqueue(queue, directory, state)  # The queue file was lost: rejoin in place.
+        now = time.time()
+        found, _ = lanes(queue, heads=True)
+        chosen = pick(found, queue, now)
+        if chosen is None or chosen["job"] != name or (directory / "cancel").exists():
+            return False
+        try:
+            fcntl.flock(gpu_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False  # A running worker or an unqueued holder has the GPU.
+        record(queue, chosen, found, now)
+        queue["waiting"].remove(chosen)
+        return True
+
+
+def leave(settings, directory):
+    with scheduler(settings.lock_dir, settings.gpu) as queue:
+        queue["waiting"] = [entry for entry in queue["waiting"] if entry["job"] != str(directory)]
+
+
+def gpu_busy(lock_dir, gpu):
+    """Whether something holds the GPU lock. Callers hold the scheduling lock, so the probe
+    cannot delay an admission."""
+    with (Path(lock_dir) / f"gpu-{gpu}.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+
+
+def queue_view():
+    """Advisory standing of this GPU's waiting jobs, keyed by job directory."""
+    now = time.time()
+    with scheduler(LOCK_DIR, GPU) as queue:
+        found, cancelled = lanes(queue)
+        order = predicted(found, queue, now)
+        busy = bool(order) and gpu_busy(LOCK_DIR, GPU)
+        streak = queue["streak"]
+    view = {entry["job"]: (None, "cancel_requested") for entry in cancelled}
+    for index, entry in enumerate(order):
+        passed = {other["priority"] for other in order[:index]} - {entry["priority"]}
+        if index == 0:
+            reason = "gpu_busy" if busy else "next"
+        elif passed:
+            reason = "behind_interactive" if entry["priority"] == "normal" else "behind_due_normal"
+        else:
+            reason = "behind_earlier"
+        view[entry["job"]] = (index + 1, reason)
+    return {
+        job: {"position": position, "reason": reason, "interactive_streak": streak}
+        for job, (position, reason) in view.items()
+    }
+
+
+def queued(directory, state, view=None):
+    """Add the advisory queue standing of a queued GPU job to its state."""
+    if state["status"] == "queued" and state.get("priority"):
+        view = queue_view() if view is None else view
+        info = view.get(str(directory)) or {"position": None, "reason": "starting"}
+        waited = round(time.time() - state.get("created_at", time.time()), 1)
+        state["queue"] = {**info, "waiting_seconds": waited}
+    return state
 
 
 class Superseded(Exception):
@@ -216,24 +438,29 @@ def submit(request):
             return status(job_id)
         # Validate under the lock so pruning cannot remove an input before the job exists.
         validate_request(request)
+        priority = job_priority(request)
         with tempfile.TemporaryDirectory(dir=STATE, prefix="prepare-") as temporary:
             staging = Path(temporary)
             (staging / "artifacts").mkdir()
             atomic_json(staging / "request.json", request)
             # The worker opens and retention protects these files, whatever aliases point to later.
             atomic_json(staging / "resolved.json", fingerprint(resolve_inputs(request)))
-            atomic_json(
-                staging / "state.json",
-                {
-                    "job_id": job_id,
-                    "status": "queued",
-                    "created_at": time.time(),
-                    "gpu": GPU,
-                    "config_sha256": SETTINGS.sha256,
-                    "release": str(RELEASE),  # Deployment cleanup keeps it while the job is active.
-                },
-            )
-            os.replace(staging, directory)
+            state = {
+                "job_id": job_id,
+                "status": "queued",
+                "created_at": time.time(),
+                "gpu": GPU,
+                "config_sha256": SETTINGS.sha256,
+                "release": str(RELEASE),  # Deployment cleanup keeps it while the job is active.
+            }
+            # A GPU job takes its queue sequence and appears in the queue in one step with its
+            # publication, so a retry finds the sequence and no scheduler sees a missing job.
+            with scheduler(LOCK_DIR, GPU) if priority else contextlib.nullcontext() as queue:
+                if priority:
+                    state["priority"] = priority
+                    enqueue(queue, directory, state)
+                atomic_json(staging / "state.json", state)
+                os.replace(staging, directory)
         # The supervisor gets the job directory and configuration identity, so a later edit of
         # remote-config.json cannot make it look the job up elsewhere.
         supervisor = [
@@ -424,14 +651,22 @@ def supervise(job_directory, identity):
     with (directory / "lease").open("a") as lease:
         fcntl.flock(lease, fcntl.LOCK_EX)
         state = {"job_id": directory.name, "status": "queued"}
-        guard = child = None
+        guard = child = settings = None
+        gpu = admitted = False
         try:
             # Terminal state always goes to this directory, whatever the configuration says now.
             state = read_json(directory / "state.json")
             settings = verify_config(identity, directory)
             watch = ConfigWatch(settings, identity, directory)
+            request = read_json(directory / "request.json")
             # Normalization is FFmpeg-only, so it neither waits for nor holds the GPU lock.
-            gpu = read_json(directory / "request.json").get("kind") != "normalize"
+            gpu = request.get("kind") != "normalize"
+            if gpu and state.get("sequence") is None:
+                # A job record written without a queue position joins at the next one.
+                state.setdefault("priority", job_priority(request))
+                with scheduler(settings.lock_dir, settings.gpu) as queue:
+                    enqueue(queue, directory, state)
+                    atomic_json(directory / "state.json", state)
             lock_path = settings.lock_dir / f"gpu-{settings.gpu}.lock"
             with lock_path.open("a") as gpu_lock:
                 while True:
@@ -441,11 +676,10 @@ def supervise(job_directory, identity):
                     watch.check()
                     if not gpu:
                         break
-                    try:
-                        fcntl.flock(gpu_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if admit(settings, directory, state, gpu_lock):
+                        admitted = True
                         break
-                    except BlockingIOError:
-                        time.sleep(0.2)
+                    time.sleep(0.2)
                 watch.check(force=True)
                 state.update(status="running", started_at=time.time())
                 atomic_json(directory / "state.json", state)
@@ -531,6 +765,9 @@ def supervise(job_directory, identity):
             state.update(status="failed", error=str(error))
         finally:
             stop(guard, child)
+            if gpu and not admitted and settings is not None:
+                with contextlib.suppress(Exception):
+                    leave(settings, directory)  # Others would drop the ended entry anyway.
             state["finished_at"] = time.time()
             atomic_json(directory / "state.json", state)
 

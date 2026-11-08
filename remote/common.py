@@ -20,6 +20,17 @@ LAYOUT_NAMES = ("settings", "common", "swapper", "face_editor", "denoiser")
 LEGACY = {"VM_BASE": "base", "VM_APP": "app", "VM_STATE": "state", "VM_GPU": "gpu"}
 JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 TERMINAL = {"completed", "failed", "cancelled"}
+# GPU admission class of each job kind (DESIGN.md, GPU scheduling); a request's `priority`
+# overrides it. A GPU kind missing here is scheduled as DEFAULT_PRIORITY. Normalization never
+# waits for the GPU and has no class.
+PRIORITIES = {
+    "detect": "interactive",
+    "preview": "interactive",
+    "analyze": "interactive",
+    "render": "normal",
+}
+DEFAULT_PRIORITY = "normal"
+CLASSES = ("interactive", "normal")
 PARAMETERS = {
     "SwapModelSelection",
     "SwapperResSelection",
@@ -47,7 +58,15 @@ REPORT_KEYS = {"review_images", "expected_visible", "min_coverage"}
 MAX_REVIEW_IMAGES = 24
 MAX_EXPECTED_RANGES = 100
 NORMALIZE_KEYS = {"kind", "media_path", "fps"}
-ANALYZE_KEYS = {"kind", "references", "reference_sha256", "swap_model", "thresholds", "controls"}
+ANALYZE_KEYS = {
+    "kind",
+    "references",
+    "reference_sha256",
+    "swap_model",
+    "thresholds",
+    "controls",
+    "priority",
+}
 # Reference analysis thresholds: (type, minimum, maximum). The engine documents their defaults.
 THRESHOLDS = {
     "min_face_pixels": (int, 1, 4096),
@@ -515,11 +534,22 @@ def validate_settings(values, definitions, allowed):
             raise ValueError("This adapter supports embedding-based swappers only")
 
 
+def job_priority(request):
+    """The scheduling class of a GPU job request, or None for normalization."""
+    if request.get("kind") == "normalize":
+        return None
+    priority = request.get("priority", PRIORITIES.get(request.get("kind"), DEFAULT_PRIORITY))
+    if priority not in CLASSES:
+        raise ValueError(f"priority must be one of {', '.join(CLASSES)}")
+    return priority
+
+
 def validate_request(request):
     """Validate a job request; normalization alone never reads Fusion's layout metadata."""
     if request.get("kind") not in {"detect", "preview", "render", "normalize", "analyze"}:
         raise ValueError("Unknown job kind")
     if request["kind"] == "analyze":
+        job_priority(request)
         return validate_analysis(request)
     input_path(request["media_path"])
     fps = request.get("fps")
@@ -538,6 +568,7 @@ def validate_request(request):
                 f"Normalization accepts only media_path and fps, not {', '.join(extra)}"
             )
         return request
+    job_priority(request)
     return validate_fusion_request(request)
 
 

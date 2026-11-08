@@ -28,6 +28,12 @@ def test_stdio_discovery():
                 detect = tools["detect_faces"].inputSchema["properties"]
                 assert {"frame", "sample_frames", "frames", "similarity_threshold"} <= detect.keys()
                 assert detect["sample_frames"]["anyOf"][0]["maximum"] == 64
+                for name in ("detect_faces", "submit_swap"):
+                    priority = tools[name].inputSchema["properties"]["priority"]
+                    assert priority["anyOf"][0]["enum"] == ["interactive", "normal"]
+                    assert priority["default"] is None
+                    assert "priority" not in tools[name].inputSchema.get("required", [])
+                assert "priority" not in tools["normalize_media"].inputSchema["properties"]
                 assert tools["submit_swap"].outputSchema["type"] == "object"
                 analyze = tools["analyze_references"]
                 assert not analyze.annotations.readOnlyHint
