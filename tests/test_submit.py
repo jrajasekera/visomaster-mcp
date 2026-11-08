@@ -443,6 +443,7 @@ def test_only_managed_state_files_are_inputs(make_site, monkeypatch, tmp_path, e
         shutil.copy(site.face, artifacts / name)
     for name in ("request.json", "state.json", "worker.log", "result.json", "lease"):
         shutil.copy(site.face, state / "jobs/done" / name)
+    common.atomic_json(state / "jobs/done/state.json", {"job_id": "done", "status": "completed"})
     shutil.copy(site.face, state / "uploads" / (Path(face).name + ".1234abcd.partial"))
     shutil.copy(site.face, state / "loose.png")
     (state / "trash-old-1234/artifacts").mkdir(parents=True)

@@ -249,22 +249,53 @@ def managed(path):
     )
 
 
+def require_completed(job_id):
+    """Refuse the artifacts of a job that has not completed: a queued or running job is still
+    writing them, and a failed or cancelled one may have left them partial.
+
+    Submission checks under the submit lock. A completed state is never rewritten, and
+    retention neither deletes nor (by deletion and resubmission) replaces a job whose artifacts
+    a queued or running job uses, so the answer still holds when that job's worker revalidates.
+    """
+    try:
+        status = read_json(STATE / "jobs" / job_id / "state.json")["status"]
+    except (OSError, ValueError, KeyError, TypeError):
+        status = None
+    if status == "completed":
+        return
+    if status in TERMINAL:
+        raise ValueError(
+            f"Job {job_id} did not complete ({status}); only completed jobs' artifacts are "
+            "inputs, so rerun it under a new job_id and use that job's artifacts"
+        )
+    if status is None:
+        raise ValueError(f"Job {job_id} has no readable state; its artifacts are not inputs")
+    raise ValueError(
+        f"Job {job_id} is {status}; wait for it to complete before using its artifacts"
+    )
+
+
 def input_path(value):
     """A media input: a regular file in media_root or a managed file of state_dir.
 
     The path is resolved first, so traversal and symlinks (in the file name or any ancestor)
-    are judged by their target and cannot extend either root.
+    are judged by their target and cannot extend either root. A job artifact is an input only
+    once the job holding it has completed.
     """
     path = Path(value)
     if not path.is_absolute():
         raise ValueError("Media paths must be absolute workstation paths")
     path = path.resolve(strict=True)
+    parts = ()
     if STATE is not None and path.is_relative_to(STATE):
         inside = managed(path)
+        parts = path.relative_to(STATE).parts
     else:
         inside = path.is_relative_to(BASE)
     if not inside or not path.is_file():
         raise ValueError(f"Media must be a regular file inside {BASE}, an upload or a job artifact")
+    if parts[0:1] == ("jobs",):
+        require_completed(parts[1])
     return path
 
 
