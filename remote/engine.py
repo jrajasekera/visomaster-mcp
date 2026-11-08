@@ -20,6 +20,7 @@ from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 
+import common
 from common import (
     APP,
     CHECKPOINT_FORMAT,
@@ -2829,6 +2830,10 @@ def run(directory):
         raise RuntimeError(CONFIG_ERROR)
     if SETTINGS.sha256 != os.environ.get("VM_CONFIG_SHA256"):
         raise RuntimeError("Remote configuration changed after submission; resubmit the job")
+    # Hashes the supervisor took before admission stand for files whose identity and times are
+    # unchanged; any other file is hashed here (DESIGN.md, Checkpoints).
+    if (directory / "digests.json").exists():
+        common.DIGESTS = read_json(directory / "digests.json")
     # Inputs resolved at submission, which retention protects; older jobs keep the raw request.
     resolved = directory / "resolved.json"
     request = read_json(resolved if resolved.exists() else directory / "request.json")

@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from pathlib import Path
 if __name__ == "__main__" and os.path.realpath(__file__) != os.path.abspath(__file__):
     os.execv(sys.executable, [sys.executable, os.path.realpath(__file__), *sys.argv[1:]])
 
+import common  # noqa: E402
 from common import (  # noqa: E402
     ADAPTER_CONTROLS,
     APP,
@@ -366,7 +368,8 @@ def admit(settings, directory, state, gpu_lock):
     name = str(directory)
     with scheduler(settings.lock_dir, settings.gpu) as queue:
         if not any(entry["job"] == name for entry in queue["waiting"]):
-            enqueue(queue, directory, state)  # The queue file was lost: rejoin in place.
+            # Joining after hashing its inputs, or the queue file was lost: at its sequence.
+            enqueue(queue, directory, state)
         now = time.time()
         found, _ = lanes(queue, heads=True)
         chosen = pick(found, queue, now)
@@ -485,10 +488,15 @@ def submit(request):
                 state["resume_from"] = request["resume"]["from_job_id"]
             # A GPU job takes its queue sequence and appears in the queue in one step with its
             # publication, so a retry finds the sequence and no scheduler sees a missing job.
+            # One whose supervisor first hashes its inputs joins at that sequence afterwards.
             with scheduler(LOCK_DIR, GPU) if priority else contextlib.nullcontext() as queue:
                 if priority:
                     state["priority"] = priority
-                    enqueue(queue, directory, state)
+                    if hashed_inputs(request):
+                        state["sequence"] = queue["next_sequence"]
+                        queue["next_sequence"] += 1
+                    else:
+                        enqueue(queue, directory, state)
                 atomic_json(staging / "state.json", state)
                 os.replace(staging, directory)
         # The supervisor gets the job directory and configuration identity, so a later edit of
@@ -565,17 +573,23 @@ def inherit(request, staging):
         )
     source, target = job_path(origin) / "checkpoint" / "chunks", staging / "checkpoint" / "chunks"
     target.mkdir(parents=True)
+    for path in chunk_files(manifest, source):
+        try:
+            os.link(path, target / path.name)
+        except OSError:
+            shutil.copyfile(path, target / path.name)  # A filesystem without hard links.
+    atomic_json(staging / "checkpoint" / "inherited.json", manifest)
+
+
+def chunk_files(manifest, chunks):
+    """The chunk and accounting files in directory `chunks` that a checkpoint manifest lists.
+    Others, and links, are skipped: the worker finds them missing and renders those frames."""
     for entry in manifest["chunks"]:
         for key in ("file", "state"):
             name = entry.get(key) if isinstance(entry, dict) else None
-            path = source / name if isinstance(name, str) and CHUNK_NAME.fullmatch(name) else None
-            if path is None or path.is_symlink() or not path.is_file():
-                continue  # The worker finds it missing and renders those frames again.
-            try:
-                os.link(path, target / name)
-            except OSError:
-                shutil.copyfile(path, target / name)  # A filesystem without hard links.
-    atomic_json(staging / "checkpoint" / "inherited.json", manifest)
+            path = chunks / name if isinstance(name, str) and CHUNK_NAME.fullmatch(name) else None
+            if path is not None and not path.is_symlink() and path.is_file():
+                yield path
 
 
 def resume_render(request):
@@ -615,6 +629,51 @@ def resume_render(request):
             + "\nSubmit a fresh render with submit_swap instead"
         )
     return submit({"job_id": job_id, **new})
+
+
+def hashed_inputs(request):
+    """Whether a job's worker hashes large files before Fusion loads: a render its provenance
+    (media, references, models, adapter code) and any inherited chunks, a recipe job its media.
+    Its supervisor hashes them before the job joins the GPU queue (DESIGN.md, Checkpoints)."""
+    try:
+        if request.get("kind") == "render":
+            return bool(recorded_inputs(request))
+        return request.get("media_sha256") is not None and isinstance(request["media_path"], str)
+    except (KeyError, TypeError, AttributeError):
+        return False  # Malformed: the worker refuses it without hashing.
+
+
+def prehash(directory, watch):
+    """Hash, before GPU admission, what the job's worker would otherwise hash holding the GPU,
+    and record the digests in digests.json for it. The hashing runs in a thread, so the job
+    stays cancellable and its configuration watched meanwhile; returns False when cancelled. A
+    failure is left to the worker, which hashes whatever is not recorded and reports it."""
+    resolved = directory / "resolved.json"
+    request = read_json(resolved if resolved.exists() else directory / "request.json")
+    common.DIGESTS = {}
+
+    def work():
+        with contextlib.suppress(Exception):
+            if request["kind"] != "render":
+                file_sha256(input_path(request["media_path"]))
+                return
+            provenance(request)
+            if request.get("resume") is not None:
+                manifest = read_checkpoint(directory / "checkpoint" / "inherited.json")
+                for path in chunk_files(manifest, directory / "checkpoint" / "chunks"):
+                    file_sha256(path)
+
+    atomic_json(directory / "progress.json", {"stage": "fingerprinting"})
+    hashing = threading.Thread(target=work, daemon=True)
+    hashing.start()
+    while hashing.is_alive():
+        if (directory / "cancel").exists():
+            return False
+        watch.check()
+        hashing.join(0.2)
+    atomic_json(directory / "digests.json", common.DIGESTS)
+    (directory / "progress.json").unlink(missing_ok=True)
+    return True
 
 
 def verify_config(identity, directory):
@@ -797,6 +856,9 @@ def supervise(job_directory, identity):
                 with scheduler(settings.lock_dir, settings.gpu) as queue:
                     enqueue(queue, directory, state)
                     atomic_json(directory / "state.json", state)
+            if gpu and hashed_inputs(request) and not prehash(directory, watch):
+                state["status"] = "cancelled"
+                return
             lock_path = settings.lock_dir / f"gpu-{settings.gpu}.lock"
             with lock_path.open("a") as gpu_lock:
                 while True:

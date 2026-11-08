@@ -445,11 +445,28 @@ def input_path(value):
     return path
 
 
+# Digests a job's supervisor took before GPU admission, keyed by the file's identity and times,
+# so its worker reuses them for unchanged files (DESIGN.md, Checkpoints). None elsewhere.
+DIGESTS = None
+
+
+def file_identity(stream):
+    """Device, inode, size and modification and change times of an open file. Rewriting the
+    bytes changes the change time, which, unlike the modification time, cannot be set back."""
+    info = os.fstat(stream.fileno())
+    return f"{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}:{info.st_ctime_ns}"
+
+
 def file_sha256(path):
-    digest = hashlib.sha256()
     with open(path, "rb") as stream:
+        identity = file_identity(stream)
+        if DIGESTS is not None and identity in DIGESTS:
+            return DIGESTS[identity]
+        digest = hashlib.sha256()
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
+        if DIGESTS is not None and file_identity(stream) == identity:
+            DIGESTS[identity] = digest.hexdigest()  # Not when it changed while being read.
     return digest.hexdigest()
 
 
