@@ -26,9 +26,10 @@ mcp = FastMCP(
         "Detect faces and inspect their crops before assigning identities; view_artifact "
         "contact.jpg shows every labelled crop of a detection job at once. Before swapping with "
         "several source images, run analyze_references to check their quality, duplicates and "
-        "consistency. Use explicit target/source "
-        "references, preview before long renders (compare_variants previews several settings "
-        "on the same frames or short clip in one job), and follow jobs with job_status(wait_seconds=50), "
+        "consistency. Use explicit target/source references, check a request with "
+        "preflight_swap (same arguments as submit_swap, nothing starts), preview before long "
+        "renders (compare_variants previews several settings on the same frames or short clip "
+        "in one job), and follow jobs with job_status(wait_seconds=50), "
         "which returns early on any state change, instead of polling rapidly. "
         "Use a stable job_id to make retries idempotent. Jobs survive client disconnection."
     ),
@@ -179,6 +180,17 @@ async def command(action, timeout=45, **values):
     return response["result"]
 
 
+def local_code():
+    """SHA-256 of this checkout's worker files, or None when they are absent."""
+    try:
+        return {
+            name: hashlib.sha256((LOCAL_CODE / name).read_bytes()).hexdigest()
+            for name in ("common.py", "control.py", "engine.py")
+        }
+    except OSError:
+        return None
+
+
 @mcp.tool(annotations=READ)
 async def health_check() -> dict[str, Any]:
     """Check installed revision, deployed release, GPU, memory use and media/state paths.
@@ -186,13 +198,7 @@ async def health_check() -> dict[str, Any]:
     code_matches compares deployed worker hashes with this checkout, or is null if unknown.
     """
     result = await command("health")
-    try:
-        local = {
-            name: hashlib.sha256((LOCAL_CODE / name).read_bytes()).hexdigest()
-            for name in ("common.py", "control.py", "engine.py")
-        }
-    except OSError:
-        local = None
+    local = local_code()
     result["code_matches"] = (
         None if local is None or "code" not in result else result["code"] == local
     )
@@ -301,21 +307,85 @@ async def submit_swap(
     swap-report.json artifact, with half-open [start_frame, end_frame) source-frame intervals
     and times. Renders also write up to `report.review_images` labelled before/after images
     (review-NN.jpg). `report` applies to renders only; omit it for the defaults.
+
+    preflight_swap takes these same arguments and reports, without starting anything, whether
+    this request can start and what to fix.
     """
-    return await command(
-        "submit",
-        job_id=uuid.uuid4().hex if job_id is None else job_id,
-        kind=mode,
-        media_path=media_path,
+    request = swap_request(
+        media_path, mappings, mode, frame, start_frame, max_frames, controls, report, priority
+    )
+    return await command("submit", job_id=uuid.uuid4().hex if job_id is None else job_id, **request)
+
+
+def swap_request(
+    media_path, mappings, mode, frame, start_frame, max_frames, controls, report, priority
+):
+    """The submit_swap request without its job_id; preflight_swap checks exactly this."""
+    return {
+        "kind": mode,
+        "media_path": media_path,
         # Unset optional fields are omitted, so earlier requests keep their idempotent form.
-        mappings=[m.model_dump(exclude_none=True) for m in mappings],
-        frame=frame,
-        start_frame=start_frame,
-        max_frames=max_frames,
-        controls=controls or {},
-        # Omitted when unset so earlier requests keep their idempotent form.
+        "mappings": [m.model_dump(exclude_none=True) for m in mappings],
+        "frame": frame,
+        "start_frame": start_frame,
+        "max_frames": max_frames,
+        "controls": controls or {},
         **({} if report is None else {"report": report.model_dump(exclude_none=True)}),
         **({} if priority is None else {"priority": priority}),
+    }
+
+
+@mcp.tool(annotations=WRITE)
+async def preflight_swap(
+    media_path: str,
+    mappings: list[FaceMapping],
+    mode: Literal["preview", "render"] = "preview",
+    frame: int = 0,
+    start_frame: int = 0,
+    max_frames: int | None = None,
+    controls: dict | None = None,
+    report: SwapReportOptions | None = None,
+    job_id: JobId = None,
+    priority: Priority = None,
+    analyze_references: Annotated[
+        bool,
+        Field(
+            description="Also queue GPU reference analysis of each mapping's sources (an "
+            "ordinary analyze job, shared GPU lock, interactive class). Repeating the preflight "
+            "finds the same jobs and reports their results."
+        ),
+    ] = False,
+) -> dict[str, Any]:
+    """Check whether a submit_swap request can start, without starting it or using the GPU.
+
+    Takes submit_swap's arguments (validated by the same models and, on the workstation, by
+    the same request validation); job_id, if given, is checked for an existing job. Cheap
+    checks read files and run FFprobe, git and nvidia-smi: Fusion and its models are not
+    loaded and no job starts. They cover the configuration, Fusion revision, deployed code,
+    job_id, media and reference access (with each reference's SHA-256), settings, the model
+    files those settings load, the worker's own media checks (timestamps read only through the
+    requested frames), free space against an estimate, the GPU's class and memory use,
+    recorded GPU qualification and submit_swap's validation itself.
+
+    `readiness` is blocked (a check would make submission or the job fail), pending
+    (analysis still running), warnings, or ready. Each of `checks` has `check`, `status`
+    (passed, warning, blocked, pending or not_checked), `severity`, a stable `code`, `message`,
+    `evidence` and `actions` (tool calls with arguments, or operator steps); `not_checked`
+    lists what was skipped. `qualification` reports combinations no recorded evidence covers
+    as `unqualified`, a warning, never a refusal. Media that normalize_media can fix suggests
+    it; nothing is converted or changed. `fingerprint` hashes the request, the inputs (media
+    identity, reference SHA-256) and the configuration (settings, revision, worker code, model
+    files), with `checked_at`. A preflight reserves nothing: submit_swap checks again.
+    """
+    request = swap_request(
+        media_path, mappings, mode, frame, start_frame, max_frames, controls, report, priority
+    )
+    return await command(
+        "preflight",
+        timeout=300,
+        request={**({} if job_id is None else {"job_id": job_id}), **request},
+        analyze=analyze_references,
+        client_code=local_code(),
     )
 
 

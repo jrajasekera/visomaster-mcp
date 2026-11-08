@@ -115,10 +115,84 @@ ADAPTER_CONTROLS = {
     "MaxFacesToDetectSlider": 20,
     "SwapOnlyBestMatchEnableToggle": True,
 }
+# Fusion model names each selection loads at REVISION (face_detectors.py detector_map,
+# models_data.arcface_mapping_model_dict, face_swappers.py, face_restorers.py, face_masks.py and
+# face_editors.py); models_data.models_list names their files. Preflight checks those files.
+DETECTOR_MODELS = {
+    "RetinaFace": "RetinaFace",
+    "SCRFD": "SCRFD2.5g",
+    "Yolov8": "YoloFace8n",
+    "Yunet": "YunetN",
+    "Yolov11 VR180": "YoloFace11nVR180",
+    "Yolov12 VR180": "YoloFace12nVR180",
+}
+SWAPPER_MODELS = {
+    "Inswapper128": ("Inswapper128", "Inswapper128ArcFace"),
+    "InStyleSwapper256 Version A": ("InStyleSwapper256 Version A", "Inswapper128ArcFace"),
+    "InStyleSwapper256 Version B": ("InStyleSwapper256 Version B", "Inswapper128ArcFace"),
+    "InStyleSwapper256 Version C": ("InStyleSwapper256 Version C", "Inswapper128ArcFace"),
+    "SimSwap512": ("SimSwap512", "SimSwapArcFace"),
+    "GhostFace-v1": ("GhostFacev1", "GhostArcFace"),
+    "GhostFace-v2": ("GhostFacev2", "GhostArcFace"),
+    "GhostFace-v3": ("GhostFacev3", "GhostArcFace"),
+    "CSCS": ("CSCS", "CSCSArcFace", "CSCSIDArcFace"),
+}
+RESTORER_MODELS = {
+    "GFPGAN-v1.4": "GFPGANv1.4",
+    "GFPGAN-1024": "GFPGAN1024",
+    "CodeFormer": "CodeFormer",
+    "GPEN-256": "GPENBFR256",
+    "GPEN-512": "GPENBFR512",
+    "GPEN-1024": "GPENBFR1024",
+    "GPEN-2048": "GPENBFR2048",
+    "RestoreFormer++": "RestoreFormerPlusPlus",
+    "VQFR-v2": "VQFRv2",
+}
+EXPRESSION_MODELS = (
+    "LivePortraitMotionExtractor",
+    "LivePortraitAppearanceFeatureExtractor",
+    "LivePortraitStitchingEye",
+    "LivePortraitStitchingLip",
+    "LivePortraitStitching",
+    "LivePortraitWarpingSpade",
+)
+# GPU qualification evidence (VERIFICATION.md): what was exercised, where, when. Preflight
+# reports a request no record covers as unqualified; that alone never refuses it. Hardware is a
+# class (architecture, compute capability, VRAM class), never a model name. Each listed field
+# holds the values exercised; max_mappings and max_sources bound the counts per request and
+# per mapping (sources with a positive weight).
+QUALIFICATIONS = (
+    {
+        "id": "baseline-2026-11-07",
+        "date": "2026-11-07",
+        "source": "VERIFICATION.md: Verification on 2026-11-07; Detection reference and "
+        "best-match qualification on 2026-11-07",
+        "fusion_revision": REVISION,
+        "hardware": {"architecture": "Maxwell", "compute_capability": "5.2", "vram_class": "24 GB"},
+        "modes": ["preview", "render"],
+        "detector": ["Yolov8"],
+        "swap_model": ["Inswapper128"],
+        "restorer": [None, "GFPGAN-v1.4"],
+        "expression": [False, True],
+        "occluder": [False],
+        "xseg": [False],
+        "max_mappings": 1,
+        "max_sources": 1,
+    },
+)
 
 
 class ConfigError(Exception):
     """The workstation configuration file is missing, malformed or inconsistent."""
+
+
+class Refusal(ValueError):
+    """A refused input with a stable `code` that preflight reports. `normalize` marks media that
+    normalize_media can make acceptable."""
+
+    def __init__(self, code, message, normalize=False):
+        super().__init__(message)
+        self.code, self.normalize = code, normalize
 
 
 @dataclass(frozen=True)
@@ -317,14 +391,19 @@ def require_completed(job_id):
     if status == "completed":
         return
     if status in TERMINAL:
-        raise ValueError(
+        raise Refusal(
+            "artifact_job_incomplete",
             f"Job {job_id} did not complete ({status}); only completed jobs' artifacts are "
-            "inputs, so rerun it under a new job_id and use that job's artifacts"
+            "inputs, so rerun it under a new job_id and use that job's artifacts",
         )
     if status is None:
-        raise ValueError(f"Job {job_id} has no readable state; its artifacts are not inputs")
-    raise ValueError(
-        f"Job {job_id} is {status}; wait for it to complete before using its artifacts"
+        raise Refusal(
+            "artifact_job_incomplete",
+            f"Job {job_id} has no readable state; its artifacts are not inputs",
+        )
+    raise Refusal(
+        "artifact_job_incomplete",
+        f"Job {job_id} is {status}; wait for it to complete before using its artifacts",
     )
 
 
@@ -337,7 +416,7 @@ def input_path(value):
     """
     path = Path(value)
     if not path.is_absolute():
-        raise ValueError("Media paths must be absolute workstation paths")
+        raise Refusal("path_not_absolute", "Media paths must be absolute workstation paths")
     path = path.resolve(strict=True)
     parts = ()
     if STATE is not None and path.is_relative_to(STATE):
@@ -346,7 +425,10 @@ def input_path(value):
     else:
         inside = path.is_relative_to(BASE)
     if not inside or not path.is_file():
-        raise ValueError(f"Media must be a regular file inside {BASE}, an upload or a job artifact")
+        raise Refusal(
+            "path_outside_roots",
+            f"Media must be a regular file inside {BASE}, an upload or a job artifact",
+        )
     if parts[0:1] == ("jobs",):
         require_completed(parts[1])
     return path
@@ -368,11 +450,14 @@ def reference_path(value, expected=None):
     """
     path = input_path(value)
     if path.stat().st_size > MAX_REFERENCE_BYTES:
-        raise ValueError(f"Face references must be images up to 256 MiB: {value}")
+        raise Refusal(
+            "reference_too_large", f"Face references must be images up to 256 MiB: {value}"
+        )
     if expected is not None and file_sha256(path) != expected:
-        raise ValueError(
+        raise Refusal(
+            "reference_changed",
             f"Reference {value} no longer has SHA-256 {expected}: its content changed after it "
-            "was fingerprinted. Analyze it again and resubmit with the new fingerprint."
+            "was fingerprinted. Analyze it again and resubmit with the new fingerprint.",
         )
     return path
 
@@ -435,10 +520,11 @@ def probe(path):
     )
     refused = re.search(rb"^\[(\w+) @ [^]]*\] Format not on whitelist", result.stderr, re.M)
     if refused:
-        raise ValueError(
+        raise Refusal(
+            "unsupported_container",
             f"Unsupported container '{refused[1].decode()}'; use a self-contained video (MP4, "
             "MOV, Matroska, WebM, AVI or MPEG-TS) or image (PNG, JPEG, WebP or BMP), not a "
-            "playlist or concat list"
+            "playlist or concat list",
         )
     result.check_returncode()
     return json.loads(result.stdout)
@@ -531,7 +617,7 @@ def validate_settings(values, definitions, allowed):
         raise ValueError("Settings must be an object")
     for key, value in values.items():
         if key not in allowed or key not in definitions:
-            raise ValueError(f"Unsupported setting {key}; use get_settings")
+            raise Refusal("setting_unsupported", f"Unsupported setting {key}; use get_settings")
         spec = definitions[key]
         default = spec["default"]
         if isinstance(default, bool):
@@ -549,9 +635,11 @@ def validate_settings(values, definitions, allowed):
         else:
             valid = isinstance(value, str)
         if not valid or ("options" in spec and value not in spec["options"]):
-            raise ValueError(f"Invalid value for {key}")
+            raise Refusal("setting_invalid", f"Invalid value for {key}")
         if key == "SwapModelSelection" and value in {"DeepFaceLive (DFM)", "AlphaFace"}:
-            raise ValueError("This adapter supports embedding-based swappers only")
+            raise Refusal(
+                "swapper_unsupported", "This adapter supports embedding-based swappers only"
+            )
 
 
 def job_priority(request):

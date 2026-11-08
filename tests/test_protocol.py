@@ -14,7 +14,7 @@ def test_stdio_discovery():
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = {tool.name: tool for tool in (await session.list_tools()).tools}
-                assert len(tools) == 22
+                assert len(tools) == 23
                 assert tools["health_check"].annotations.readOnlyHint
                 normalize = tools["normalize_media"]
                 assert not normalize.annotations.readOnlyHint
@@ -45,6 +45,20 @@ def test_stdio_discovery():
                 assert "mappings" in tools["submit_swap"].inputSchema["required"]
                 swap = tools["submit_swap"].inputSchema
                 assert "report" in swap["properties"] and "report" not in swap["required"]
+                # Preflight takes submit_swap's arguments, with identical schemas, plus one.
+                preflight = tools["preflight_swap"]
+                checked = preflight.inputSchema
+                assert not preflight.annotations.readOnlyHint
+                assert not preflight.annotations.destructiveHint
+                assert set(checked["properties"]) == set(swap["properties"]) | {
+                    "analyze_references"
+                }
+                for name, schema in swap["properties"].items():
+                    assert checked["properties"][name] == schema, name
+                assert checked["required"] == swap["required"]
+                assert checked["$defs"] == swap["$defs"]
+                assert checked["properties"]["analyze_references"]["default"] is False
+                assert preflight.outputSchema["type"] == "object"
                 options = swap["$defs"]["SwapReportOptions"]["properties"]
                 assert {"review_images", "expected_visible", "min_coverage"} == options.keys()
                 assert options["review_images"]["maximum"] == 24

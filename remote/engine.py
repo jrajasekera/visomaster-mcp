@@ -26,6 +26,7 @@ from common import (
     PARAMETERS,
     REVISION,
     SETTINGS,
+    Refusal,
     atomic_json,
     ffmpeg_input,
     file_sha256,
@@ -86,10 +87,14 @@ def display_transform(stream):
 def video_stream(metadata):
     stream = next((s for s in metadata["streams"] if s["codec_type"] == "video"), None)
     if stream is None:
-        raise ValueError("Media has no video stream")
+        raise Refusal("no_video_stream", "Media has no video stream")
     # Frames are decoded as stored; a flip can have rotation 0, so the matrix itself is checked.
     if display_transform(stream) != (0, False):
-        raise ValueError("Rotated or mirrored video is not supported; run normalize_media first")
+        raise Refusal(
+            "rotated_or_mirrored",
+            "Rotated or mirrored video is not supported; run normalize_media first",
+            normalize=True,
+        )
     return stream
 
 
@@ -130,18 +135,20 @@ def color(stream):
     """Source YUV matrix and range for decoding; RGB has no matrix and is full range."""
     transfer = stream.get("color_transfer")
     if transfer in HDR:
-        raise ValueError(
+        raise Refusal(
+            "hdr_unsupported",
             f"HDR ({HDR[transfer]}) video is not supported because faces are processed as 8-bit "
-            "SDR; tone-map the input to SDR first"
+            "SDR; tone-map the input to SDR first",
         )
     if rgb(stream):
         return None, "pc"
     space = stream.get("color_space", "unknown")
     if space != "unknown" and space not in MATRICES:
-        raise ValueError(
+        raise Refusal(
+            "matrix_unsupported",
             f"Video with the {space} matrix is not supported because FFmpeg's scaler cannot "
             "convert it; transcode it to BT.709 with a tool that supports that matrix, such as "
-            "FFmpeg's zscale filter, and use the result"
+            "FFmpeg's zscale filter, and use the result",
         )
     tagged = stream.get("color_range")
     # Untagged gray is full range, as swscale treats it and FFmpeg 8 reports it.
@@ -1502,9 +1509,10 @@ def expected_ranges(options, end):
     ranges = {}
     for item in options.get("expected_visible", []):
         if item["end_frame"] > end:
-            raise ValueError(
+            raise Refusal(
+                "expected_visible_beyond_range",
                 f"expected_visible range {item['start_frame']}-{item['end_frame']} for mapping "
-                f"{item['mapping']} ends after the rendered range, which ends at frame {end}"
+                f"{item['mapping']} ends after the rendered range, which ends at frame {end}",
             )
         ranges.setdefault(str(item["mapping"]), []).append((item["start_frame"], item["end_frame"]))
     return {face_id: sorted(values) for face_id, values in ranges.items()}
@@ -1561,7 +1569,7 @@ class Timeline:
 
     def __init__(self, times):
         if not times:
-            raise ValueError("No video timestamps found")
+            raise Refusal("no_video_frames", "No video timestamps found")
         self.times = times
         self.start = times[0]
 
@@ -1595,7 +1603,8 @@ def timeline(source, end=None):
         if not value or "D" in flags:
             continue
         if value == "N/A":
-            raise ValueError("Video packets lack timestamps; run normalize_media first")
+            message = "Video packets lack timestamps; run normalize_media first"
+            raise Refusal("missing_timestamps", message, normalize=True)
         times.append(float(value))
     return Timeline(sorted(times)[:end])
 
@@ -1607,9 +1616,11 @@ def validate_timing(source, fps, stream, end=None):
     tick = float(Fraction(stream["time_base"]))
     tolerance = max(0.00001, tick * 1.1)
     if abs(timing.start) > tolerance:
-        raise ValueError("Video timestamps must start at zero; run normalize_media first")
+        message = "Video timestamps must start at zero; run normalize_media first"
+        raise Refusal("nonzero_start", message, normalize=True)
     if not timing.constant(float(fps), tolerance):
-        raise ValueError("Variable frame timestamps detected; run normalize_media first")
+        message = "Variable frame timestamps detected; run normalize_media first"
+        raise Refusal("variable_timestamps", message, normalize=True)
     return len(timing.times)
 
 
@@ -1666,21 +1677,47 @@ def output_audio(metadata, expected, end, missing):
 
 def clip_range(source, request):
     """(metadata, video stream, rate, start, frame count) of the CFR range a render processes:
-    `start_frame` and at most `max_frames` frames (None: through the end)."""
+    `start_frame` and at most `max_frames` frames (None: through the end). Renders, comparison
+    clips and preflight share these checks, made before any frame is loaded: CFR metadata and
+    timestamps over the requested range only, a nonempty range, expected-visible ranges within
+    it, even dimensions and supported colors."""
     metadata = probe(source)
     stream = video_stream(metadata)
     fps = Fraction(stream["avg_frame_rate"])
     if fps <= 0 or fps != Fraction(stream["r_frame_rate"]):
-        raise ValueError("Render requires constant frame rate video; run normalize_media first")
+        message = "Render requires constant frame rate video; run normalize_media first"
+        raise Refusal("variable_frame_rate", message, normalize=True)
     start = request.get("start_frame", 0)
     limit = request.get("max_frames")
     total = validate_timing(source, fps, stream, start + limit if limit else None)
     expected = min(limit or total, total - start)
     if expected <= 0:
-        raise ValueError("Requested frame range is empty")
+        raise Refusal("empty_range", "Requested frame range is empty")
+    expected_ranges(request.get("report") or {}, start + expected)
     if int(stream["width"]) % 2 or int(stream["height"]) % 2:
-        raise ValueError("H.264 output requires even frame dimensions; run normalize_media first")
+        message = "H.264 output requires even frame dimensions; run normalize_media first"
+        raise Refusal("odd_dimensions", message, normalize=True)
+    output_color(stream)  # Rejects HDR and matrices the scaler lacks, as encoding would.
     return metadata, stream, fps, start, expected
+
+
+def preview_source(source, frame):
+    """The checks a preview makes of its media before decoding, which preflight also runs: an
+    image has only frame 0; a video's frame must exist (timestamps up to it are read) and its
+    colors must be supported. Returns the video stream, or None for an image."""
+    metadata = probe(source)
+    if metadata.get("format", {}).get("format_name", "").endswith(("_pipe", "image2")):
+        if frame:
+            raise Refusal("frame_out_of_range", "Images only have frame 0")
+        return None
+    stream = video_stream(metadata)
+    color(stream)
+    if frame:
+        count = len(timeline(source, frame + 1).times)
+        if frame >= count:
+            message = f"Frame {frame} is out of range; the video has {count} frames"
+            raise Refusal("frame_out_of_range", message)
+    return stream
 
 
 def render_video(window, request, directory, worker):

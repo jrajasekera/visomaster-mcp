@@ -34,15 +34,20 @@ from common import (  # noqa: E402
     CODE,
     CONFIG_ERROR,
     CONTROLS,
+    DETECTOR_MODELS,
+    EXPRESSION_MODELS,
     GPU,
     JOB_ID,
     LOCK_DIR,
     PARAMETERS,
+    QUALIFICATIONS,
+    RESTORER_MODELS,
     REVISION,
     RUNNER,
     SETTINGS,
     SHA256,
     STATE,
+    SWAPPER_MODELS,
     TERMINAL,
     ConfigError,
     atomic_json,
@@ -52,17 +57,21 @@ from common import (  # noqa: E402
     current_digest,
     file_sha256,
     fusion_compatibility,
+    initial_controls,
     input_path,
     job_path,
     job_priority,
     layouts,
     load_config,
+    model_catalog,
     probe,
     provenance,
     provenance_changes,
     read_json,
     recorded_inputs,
+    reference_path,
     validate_request,
+    validate_settings,
 )
 
 RELEASE = Path(os.path.realpath(__file__)).parent
@@ -1154,9 +1163,619 @@ def health():
     }
 
 
+# Preflight (DESIGN.md, Preflight). Cheap checks read files and run FFprobe, git and nvidia-smi
+# only: no Fusion import, model loading, GPU lock or job. The optional GPU stage queues ordinary
+# reference-analysis jobs. A preflight reserves nothing; submission revalidates everything.
+SEVERITY = {
+    "passed": "info",
+    "not_checked": "info",
+    "pending": "info",
+    "warning": "warning",
+    "blocked": "error",
+}
+WORST = ("blocked", "pending", "warning", "passed", "not_checked")
+READINESS = {"blocked": "blocked", "pending": "pending", "warning": "warnings"}
+HEADROOM = 1024**3  # Free space within this of the estimate is reported as low.
+PREVIEW_BYTES = 64 * 1024**2  # Preview artifacts, report and log.
+# Inputs a cheap check reports on; the rest are skipped when the request is malformed.
+INPUT_CHECKS = ("media_path", "references", "settings", "model_assets", "media", "storage")
+
+
+def sha256_of(value):
+    return hashlib.sha256(canonical(value).encode()).hexdigest()
+
+
+def finding(name, status, code, message, evidence=None, actions=()):
+    return {
+        "check": name,
+        "status": status,
+        "severity": SEVERITY[status],
+        "code": code,
+        "message": message,
+        "evidence": evidence or {},
+        "actions": list(actions),
+    }
+
+
+def act(description, tool=None, **arguments):
+    """A corrective action: a tool call to make, or (without tool) one for the operator."""
+    return {"description": description, **({"tool": tool, "arguments": arguments} if tool else {})}
+
+
+def refusal_code(error):
+    """The stable code of a refused input; missing and unreadable files have their own."""
+    if isinstance(error, FileNotFoundError):
+        return "path_missing"
+    return getattr(error, "code", "path_unreadable" if isinstance(error, OSError) else "invalid")
+
+
+def gpu_observation():
+    """Compute capability, VRAM class and memory use of the configured GPU, or None."""
+    text = output(
+        [
+            "nvidia-smi",
+            f"--id={GPU}",
+            "--query-gpu=compute_cap,memory.total,memory.used",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    try:
+        capability, total, used = (v.strip() for v in text.strip().splitlines()[0].split(","))
+        total, used = int(float(total)), int(float(used))
+    except (AttributeError, IndexError, ValueError):
+        return None
+    return {
+        "compute_capability": capability,
+        "vram_class": f"{round(total / 1024)} GB",
+        "vram_total_mib": total,
+        "vram_used_mib": used,
+    }
+
+
+def positive(mapping):
+    """Indexes of the sources a mapping reads: those with a positive (or omitted) weight."""
+    count = len(mapping["source_faces"])
+    weights = mapping.get("source_weights")
+    weights = weights if isinstance(weights, list) and len(weights) == count else [1] * count
+    return [i for i, w in enumerate(weights) if type(w) in (int, float) and w > 0]
+
+
+def combinations(request, control, parameters):
+    """Model choices of each mapping, with Fusion's, the adapter's and the request's values in
+    the order the engine applies them."""
+    controls = initial_controls(control, request.get("controls") or {})
+    found = []
+    for mapping in request["mappings"]:
+        values = {key: spec["default"] for key, spec in parameters.items()}
+        values.update(mapping.get("parameters") or {})
+        restorer = values.get("FaceRestorerEnableToggle") is True
+        found.append(
+            {
+                "detector": controls.get("DetectorModelSelection"),
+                "recognition": controls.get("RecognitionModelSelection"),
+                "swap_model": values.get("SwapModelSelection"),
+                "restorer": values.get("FaceRestorerTypeSelection") if restorer else None,
+                "expression": values.get("FaceExpressionEnableBothToggle") is True,
+                "occluder": values.get("OccluderEnableToggle") is True,
+                "xseg": values.get("DFLXSegEnableToggle") is True,
+                "sources": len(positive(mapping)),
+            }
+        )
+    return found
+
+
+def required_models(choice):
+    """Fusion model names a mapping's choices load, and selections the adapter cannot map."""
+    names, unknown = set(), []
+
+    def need(table, key, value):
+        found = table.get(value) if isinstance(value, str) else None
+        if found is None:
+            unknown.append(f"{key}={value!r}")
+        else:
+            names.update((found,) if isinstance(found, str) else found)
+
+    need(DETECTOR_MODELS, "DetectorModelSelection", choice["detector"])
+    if isinstance(choice["recognition"], str):
+        names.add(choice["recognition"])
+    need(SWAPPER_MODELS, "SwapModelSelection", choice["swap_model"])
+    if choice["restorer"] is not None:
+        need(RESTORER_MODELS, "FaceRestorerTypeSelection", choice["restorer"])
+    if choice["occluder"]:
+        names.add("Occluder")
+    if choice["xseg"]:
+        names.add("XSeg")
+    if choice["expression"]:
+        names.update(EXPRESSION_MODELS)
+    return names, unknown
+
+
+def differences(record, mode, choice, mappings, hardware):
+    """What of a mapping's request a qualification record does not cover; empty if covered."""
+    found = []
+    if record["fusion_revision"] != REVISION:
+        found.append("fusion_revision")
+    if hardware is None:
+        found.append("hardware (not observed)")
+    elif any(hardware[k] != record["hardware"][k] for k in ("compute_capability", "vram_class")):
+        found.append("hardware")
+    if mode not in record["modes"]:
+        found.append("mode")
+    for key in ("detector", "swap_model", "restorer", "expression", "occluder", "xseg"):
+        if choice[key] not in record[key]:
+            found.append(key)
+    if mappings > record["max_mappings"]:
+        found.append("mappings")
+    if choice["sources"] > record["max_sources"]:
+        found.append("sources")
+    return found
+
+
+def media_check(request, source):
+    """The worker's own render or preview media checks (engine.clip_range, preview_source);
+    timestamps are read only through the requested frames. Returns the check and its evidence."""
+    import engine  # Its module level is the standard library; Fusion loads only in workers.
+
+    try:
+        if request["kind"] == "render":
+            metadata, stream, fps, start, frames = engine.clip_range(source, request)
+            width, height = int(stream["width"]), int(stream["height"])
+            # Bytes per output frame from the source's bit rate or the resolution, whichever is
+            # more; the video-only intermediate and the muxed result coexist briefly.
+            count = int(stream.get("nb_frames") or 0)
+            count = count or round(float(stream.get("duration") or 0) * fps)
+            per_frame = max(width * height // 20, source.stat().st_size // count if count else 0)
+            evidence = {
+                "kind": "video",
+                "width": width,
+                "height": height,
+                "fps": str(fps),
+                "start_frame": start,
+                "frames": frames,
+                "frames_checked": start + frames,
+                "audio": any(s["codec_type"] == "audio" for s in metadata["streams"]),
+                "estimated_bytes": 2 * per_frame * frames + PREVIEW_BYTES,
+            }
+            message = f"Render media passed the worker's checks over frames 0-{start + frames - 1}"
+        else:
+            frame = request.get("frame", 0)
+            stream = engine.preview_source(source, frame)
+            kind = "image" if stream is None else "video"
+            evidence = {"kind": kind, "frame": frame, "estimated_bytes": PREVIEW_BYTES}
+            message = f"Preview frame {frame} is readable"
+    except (ValueError, OSError, subprocess.SubprocessError, KeyError, ZeroDivisionError) as error:
+        actions = []
+        if getattr(error, "normalize", False):
+            description = (
+                "Queue a render-ready copy (CPU only), then preflight and submit with the "
+                "completed job's result media_path; nothing is converted unless you do this"
+            )
+            actions.append(act(description, "normalize_media", media_path=request["media_path"]))
+        code = getattr(error, "code", "media_unreadable")
+        message = str(error) or type(error).__name__
+        return finding("media", "blocked", code, message, {}, actions), None
+    return finding("media", "passed", "media_ready", message, evidence), evidence
+
+
+def analysis_check(request, digests, enabled):
+    """Queue (or find) one reference-analysis job per distinct set of sources the swap reads."""
+    if not enabled:
+        action = act("Rerun preflight_swap with analyze_references=true to queue it")
+        message = "The optional GPU reference analysis was not requested"
+        return finding("reference_analysis", "not_checked", "not_requested", message, {}, [action])
+    jobs = {}
+    for index, mapping in enumerate(request["mappings"]):
+        used = positive(mapping)
+        analysis = {
+            "kind": "analyze",
+            "references": [mapping["source_faces"][i] for i in used],
+            "reference_sha256": [digests[index][i] for i in used],
+        }
+        if request.get("controls"):
+            analysis["controls"] = request["controls"]
+        model = (mapping.get("parameters") or {}).get("SwapModelSelection")
+        if model is not None:
+            analysis["swap_model"] = model
+        # Content addressed: a repeated preflight finds the same job, and changed bytes,
+        # controls or swap model make a new one.
+        job_id = "preflight-" + sha256_of(analysis)[:40]
+        jobs.setdefault(job_id, (analysis, []))[1].append(index)
+    entries, statuses, actions = [], [], []
+    for job_id, (analysis, mappings) in jobs.items():
+        entry = {"job_id": job_id, "mappings": mappings}
+        entries.append(entry)
+        try:
+            state = submit({"job_id": job_id, **analysis})
+        except Superseded:
+            raise
+        except Exception as error:
+            entry.update(status="not_queued", error=str(error))
+            statuses.append("blocked")
+            continue
+        entry["status"] = state["status"]
+        if state["status"] in ("queued", "running"):
+            statuses.append("pending")
+            actions.append(act("Wait for it", "job_status", job_id=job_id, wait_seconds=50))
+        elif state["status"] == "completed":
+            result = state.get("result") or {}
+            entry.update({key: result.get(key) for key in ("usable", "errors", "warnings")})
+            entry["findings"] = [
+                {"path": reference["path"], **item}
+                for reference in result.get("references", [])
+                for item in reference.get("findings", [])
+            ]
+            entry["consistency"] = result.get("consistency")
+            if result.get("errors") or result.get("warnings"):
+                statuses.append("blocked" if result.get("errors") else "warning")
+                actions.append(
+                    act("Review the references", "view_artifact", job_id=job_id, name="contact.jpg")
+                )
+            else:
+                statuses.append("passed")
+        else:
+            entry["error"] = state.get("error")
+            statuses.append("blocked" if state["status"] == "failed" else "not_checked")
+            description = (
+                f"The analysis is {state['status']}; delete it, then preflight again with "
+                "analyze_references=true to repeat it"
+            )
+            actions.append(act(description, "delete_job", job_id=job_id))
+    status = min(statuses, key=WORST.index)
+    code, message = {
+        "blocked": (
+            "reference_problems",
+            "Reference analysis found sources submit_swap refuses, or did not run",
+        ),
+        "pending": (
+            "analysis_pending",
+            "Reference analysis is queued or running on the GPU; preflight again when it ends",
+        ),
+        "warning": ("reference_warnings", "Reference analysis flagged sources to review"),
+        "passed": ("references_usable", "Every source the swap reads is usable"),
+        "not_checked": ("analysis_cancelled", "Reference analysis was cancelled"),
+    }[status]
+    return finding("reference_analysis", status, code, message, {"jobs": entries}, actions)
+
+
+def path_checks(request, checks):
+    """Media and reference access. Returns the resolved media path (None if refused), the
+    reference evidence and each mapping's source digests."""
+    try:
+        source = input_path(request["media_path"])
+        if not os.access(source, os.R_OK):
+            raise PermissionError(f"{source} is not readable")
+    except Exception as error:
+        source = None
+        evidence = {"path": request["media_path"]}
+        checks.append(finding("media_path", "blocked", refusal_code(error), str(error), evidence))
+    else:
+        evidence = {"path": str(source), "bytes": source.stat().st_size}
+        message = "The media file is an accepted input"
+        checks.append(finding("media_path", "passed", "path_ok", message, evidence))
+    items, digests = [], []
+    for index, mapping in enumerate(request["mappings"]):
+        sources = mapping["source_faces"]
+        given = mapping.get("source_sha256")
+        given = given if isinstance(given, list) and len(given) == len(sources) else []
+        roles = [("target", mapping["target_face"], mapping.get("target_sha256"))]
+        given = given or [None] * len(sources)
+        roles += [("source", path, digest) for path, digest in zip(sources, given)]
+        digests.append([])
+        for role, value, digest in roles:
+            digest = digest if isinstance(digest, str) else None
+            item = {"mapping": index, "role": role, "path": value}
+            try:
+                path = reference_path(value, digest)  # Hashes the file when a digest is given.
+                item.update(sha256=digest or file_sha256(path), bytes=path.stat().st_size)
+            except Exception as error:
+                item.update(code=refusal_code(error), error=str(error))
+            items.append(item)
+            if role == "source":
+                digests[-1].append(item.get("sha256"))
+    problems = [item for item in items if "error" in item]
+    evidence = {"references": items}
+    if problems:
+        action = act("Fix or replace the listed images; analyze changed ones again")
+        message = f"{len(problems)} reference image(s) would be refused: {problems[0]['error']}"
+        checks.append(
+            finding("references", "blocked", problems[0]["code"], message, evidence, [action])
+        )
+    else:
+        message = "Every target and source is an accepted input; pin them with these sha256 values"
+        checks.append(finding("references", "passed", "references_ok", message, evidence))
+    return source, items, digests
+
+
+def settings_checks(request, checks):
+    """Controls and parameters, then the model files they load. Returns each mapping's model
+    choices (None when Fusion's settings metadata is unreadable) and the model evidence."""
+    try:
+        control, parameters = layouts()
+    except ValueError as error:
+        checks.append(finding("settings", "blocked", "layouts_unreadable", str(error)))
+        checks.append(
+            finding("model_assets", "not_checked", "prerequisite_blocked", "Settings unreadable")
+        )
+        return None, []
+    scopes = [("controls", request.get("controls") or {}, control, CONTROLS)]
+    for index, mapping in enumerate(request["mappings"]):
+        scopes.append((f"mapping {index}", mapping.get("parameters") or {}, parameters, PARAMETERS))
+    errors = []
+    for scope, values, definitions, allowed in scopes:
+        try:
+            validate_settings(values, definitions, allowed)
+        except ValueError as error:
+            errors.append({"scope": scope, "code": refusal_code(error), "error": str(error)})
+    if errors:
+        action = act("Use names, types, options and limits from get_settings", "get_settings")
+        message = f"{errors[0]['scope']}: {errors[0]['error']}"
+        evidence = {"errors": errors}
+        checks.append(
+            finding("settings", "blocked", errors[0]["code"], message, evidence, [action])
+        )
+    else:
+        message = "Controls and parameters are supported values"
+        checks.append(finding("settings", "passed", "settings_ok", message))
+    combos = combinations(request, control, parameters)
+    files = model_catalog()[0]
+    if not files:
+        message = "Fusion's model list (app/processors/models_data.py) is unreadable"
+        checks.append(finding("model_assets", "not_checked", "model_list_unreadable", message))
+        return combos, []
+    needed, unknown, models, absent = set(), [], [], []
+    for choice in combos:
+        found, unmapped = required_models(choice)
+        needed |= found
+        unknown += [item for item in unmapped if item not in unknown]
+    for name in sorted(needed):
+        path = files.get(name, (None, None))[0]
+        entry = {"model": name, "file": path, "present": False}
+        if path is None:
+            unknown.append(f"model {name}")
+        else:
+            with contextlib.suppress(OSError):
+                info = Path(path).stat()
+                entry.update(
+                    present=info.st_size > 0, bytes=info.st_size, mtime_ns=info.st_mtime_ns
+                )
+            if not entry["present"]:
+                absent.append(path)
+        models.append(entry)
+    evidence = {"models": models, "unmapped": unknown}
+    if absent:
+        action = act(
+            "Install the missing files in the Fusion checkout, for example with Fusion's "
+            "download_models.py in its environment (operator)"
+        )
+        message = f"Missing model files: {', '.join(absent)}"
+        checks.append(
+            finding("model_assets", "blocked", "model_missing", message, evidence, [action])
+        )
+    elif unknown:
+        message = f"Model files of {', '.join(unknown)} are not known to this adapter"
+        checks.append(finding("model_assets", "not_checked", "model_unmapped", message, evidence))
+    else:
+        message = f"All {len(needed)} model files the selected settings load are present"
+        checks.append(finding("model_assets", "passed", "models_present", message, evidence))
+    return combos, models
+
+
+def storage_check(media):
+    usage = shutil.disk_usage(STATE)
+    needed = media["estimated_bytes"] if media else PREVIEW_BYTES
+    evidence = {
+        "free_bytes": usage.free,
+        "estimated_bytes": needed,
+        "basis": "estimated from the source bit rate and resolution; nothing is reserved",
+    }
+    prune = act("Report old jobs and uploads to remove", "prune_storage", dry_run=True)
+    if not (writable(STATE) and writable(LOCK_DIR)):
+        message = "state_dir or lock_dir is not writable"
+        return finding("storage", "blocked", "state_not_writable", message, evidence)
+    if usage.free < needed:
+        message = f"{usage.free} bytes free, below the estimated {needed}"
+        return finding("storage", "blocked", "insufficient_space", message, evidence, [prune])
+    if usage.free < needed + HEADROOM:
+        message = f"{usage.free} bytes free leaves under 1 GiB beyond the estimated {needed}"
+        return finding("storage", "warning", "low_space", message, evidence, [prune])
+    return finding("storage", "passed", "space_ok", "Free space exceeds the estimate", evidence)
+
+
+def qualification_check(mode, combos, hardware):
+    entries, covered = [], True
+    for index, choice in enumerate(combos):
+        matches, nearest = [], None
+        for record in QUALIFICATIONS:
+            missing = differences(record, mode, choice, len(combos), hardware)
+            if not missing:
+                matches.append({key: record[key] for key in ("id", "date", "source", "hardware")})
+            elif nearest is None or len(missing) < len(nearest["differs_in"]):
+                nearest = {"record": record["id"], "differs_in": missing}
+        entry = {"mapping": index, "combination": choice, "qualified_by": matches}
+        if not matches:
+            covered = False
+            entry["nearest"] = nearest
+        entries.append(entry)
+    evidence = {"hardware": hardware, "mappings": entries}
+    if covered:
+        message = "Recorded GPU qualification covers these settings on this hardware class"
+        return finding("qualification", "passed", "qualified", message, evidence)
+    message = (
+        "Unqualified: no recorded GPU qualification covers this combination on this hardware "
+        "class. It is allowed, not refused; preview it and inspect the result first."
+    )
+    action = act("Preview a representative frame and inspect it before a long render")
+    return finding("qualification", "warning", "unqualified", message, evidence, [action])
+
+
+def well_formed(request):
+    mappings = request.get("mappings")
+    return (
+        isinstance(request.get("media_path"), str)
+        and isinstance(request.get("controls") or {}, dict)
+        and isinstance(mappings, list)
+        and all(
+            isinstance(m, dict)
+            and isinstance(m.get("target_face"), str)
+            and isinstance(m.get("source_faces"), list)
+            and all(isinstance(path, str) for path in m["source_faces"])
+            and isinstance(m.get("parameters") or {}, dict)
+            for m in mappings
+        )
+    )
+
+
+def preflight(payload):
+    """Request-specific readiness of a submit_swap request without starting it (README)."""
+    request = payload.get("request")
+    if not isinstance(request, dict) or request.get("kind") not in ("preview", "render"):
+        raise ValueError("preflight checks a submit_swap request: kind preview or render")
+    analyze = payload.get("analyze", False)
+    if not isinstance(analyze, bool):
+        raise ValueError("analyze must be a boolean")
+    checked_at, checks = time.time(), []
+
+    def skip(name, reason):
+        checks.append(finding(name, "not_checked", "prerequisite_blocked", reason))
+
+    if CONFIG_ERROR:
+        checks.append(finding("configuration", "blocked", "config_invalid", CONFIG_ERROR))
+        for name in ("fusion_revision", "deployed_code", "job_id", *INPUT_CHECKS):
+            skip(name, "The remote configuration is invalid")
+        for name in ("gpu", "qualification", "request", "reference_analysis"):
+            skip(name, "The remote configuration is invalid")
+        return {
+            "readiness": "blocked",
+            "checked_at": checked_at,
+            "fingerprint": None,
+            "not_checked": [c["check"] for c in checks if c["status"] == "not_checked"],
+            "checks": checks,
+        }
+    checks.append(finding("configuration", "passed", "config_valid", "The configuration is valid"))
+    revision, reason = fusion_compatibility(APP)  # The check health and GPU workers make.
+    evidence = {"revision": revision, "supported_revision": REVISION, "release": RELEASE.name}
+    if reason:
+        action = act(
+            "Return the Fusion checkout to the supported revision without tracked changes, or "
+            "qualify the adapter for the new one (README, Fusion revision guard)"
+        )
+        checks.append(
+            finding("fusion_revision", "blocked", "fusion_incompatible", reason, evidence, [action])
+        )
+    else:
+        message = "Fusion is at the supported revision without tracked changes"
+        checks.append(finding("fusion_revision", "passed", "fusion_compatible", message, evidence))
+    code, client = code_identity()["code"], payload.get("client_code")
+    if not isinstance(client, dict):
+        message = "The client sent no code hashes to compare"
+        checks.append(finding("deployed_code", "not_checked", "client_code_unknown", message))
+    elif client != code:
+        action = act("Deploy this checkout with scripts/deploy.sh, then preflight again")
+        message = "The deployed worker code differs from the client's checkout"
+        checks.append(finding("deployed_code", "warning", "code_mismatch", message, {}, [action]))
+    else:
+        message = "The deployed worker code matches the client's checkout"
+        checks.append(finding("deployed_code", "passed", "code_matches", message))
+
+    request = dict(request)
+    job_id = request.pop("job_id", None)  # Submission stores the request without it.
+    try:
+        existing = None if job_id is None else job_path(job_id) / "request.json"
+        if existing is None:
+            message = "No job_id given; submit_swap generates a new one"
+            checks.append(finding("job_id", "passed", "job_id_generated", message))
+        elif not existing.exists():
+            checks.append(finding("job_id", "passed", "job_id_free", f"No job {job_id} exists"))
+        elif canonical(read_json(existing)) == canonical(request):
+            message = f"Job {job_id} has this request; submit_swap returns it rather than rerun"
+            evidence = {"status": current(existing.parent)["status"]}
+            checks.append(finding("job_id", "warning", "job_exists", message, evidence))
+        else:
+            message = f"Job {job_id} exists with a different request; submit_swap refuses it"
+            action = act("Choose another job_id")
+            checks.append(finding("job_id", "blocked", "job_id_conflict", message, {}, [action]))
+    except (OSError, ValueError, KeyError) as error:
+        checks.append(finding("job_id", "blocked", "job_id_invalid", str(error)))
+
+    source = media = combos = None
+    references, digests, models = [], [], []
+    if well_formed(request):
+        source, references, digests = path_checks(request, checks)
+        combos, models = settings_checks(request, checks)
+        if source is None:
+            skip("media", "The media path is not an accepted input")
+        else:
+            check, media = media_check(request, source)
+            checks.append(check)
+        checks.append(storage_check(media))
+    else:
+        for name in INPUT_CHECKS:
+            skip(name, "The request is not a well-formed submit_swap request")
+
+    hardware = gpu_observation()
+    if hardware is None:
+        message = "nvidia-smi did not report the configured GPU"
+        checks.append(finding("gpu", "not_checked", "gpu_unobserved", message))
+    else:
+        message = "GPU class and memory use as observed now; nothing is reserved"
+        checks.append(finding("gpu", "passed", "gpu_observed", message, hardware))
+    if combos is None:
+        skip("qualification", "The settings, and so the model choices, are unknown")
+    else:
+        checks.append(qualification_check(request["kind"], combos, hardware))
+
+    try:
+        validate_request(copy.deepcopy(request))  # Exactly what submission runs first.
+    except Exception as error:
+        message = f"Submission would refuse the request now: {error}"
+        checks.append(finding("request", "blocked", refusal_code(error), message))
+    else:
+        message = "submit_swap's validation accepts the request now; submission validates again"
+        checks.append(finding("request", "passed", "request_valid", message))
+
+    status = {check["check"]: check["status"] for check in checks}
+    if not analyze or (status["fusion_revision"] == status["request"] == "passed"):
+        checks.append(analysis_check(request, digests, analyze))
+    else:
+        skip("reference_analysis", "Fusion or the request is blocked; nothing was queued")
+
+    worst = min((check["status"] for check in checks), key=WORST.index)
+    media_identity = None
+    with contextlib.suppress(AttributeError, OSError):  # No accepted media, or it vanished.
+        info = source.stat()
+        media_identity = [str(source), info.st_size, info.st_mtime_ns]
+    inputs = {
+        "media": media_identity,
+        "references": [[item["path"], item.get("sha256")] for item in references],
+    }
+    configuration = {
+        "config_sha256": SETTINGS.sha256,
+        "revision": revision,
+        "code": code,
+        "models": [[m["model"], m.get("bytes"), m.get("mtime_ns")] for m in models],
+    }
+    fingerprint = {
+        "request": sha256_of(request),
+        "inputs": sha256_of(inputs),
+        "configuration": sha256_of(configuration),
+    }
+    fingerprint["sha256"] = sha256_of(fingerprint)
+    return {
+        "readiness": READINESS.get(worst, "ready"),
+        "checked_at": checked_at,
+        "fingerprint": fingerprint,
+        "not_checked": [check["check"] for check in checks if check["status"] == "not_checked"],
+        "checks": checks,
+        "notice": "A preflight reserves nothing. submit_swap validates the request, inputs and "
+        "settings again, and the worker rechecks Fusion, the media and the reference bytes.",
+    }
+
+
 def dispatch(action, request):
     if action == "health":
         return health()
+    if action == "preflight":
+        return preflight(request)
     if CONFIG_ERROR:
         raise ValueError(CONFIG_ERROR)
     if action == "settings":
