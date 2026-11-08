@@ -428,6 +428,20 @@ def test_a_malformed_request_is_blocked_without_input_checks(site):
     assert all(checks[name]["status"] == "not_checked" for name in control.INPUT_CHECKS)
 
 
+def test_segments_are_validated_as_submission_validates_them(site):
+    segment = {"id": "a", "start_frame": 0, "end_frame": 2, "parameters": {}}
+    shot = {**segment, "parameters": {"SimilarityThresholdSlider": 70}}
+    ready = by_name(preflight(swap(site, max_frames=4, segments=[shot])))
+    assert ready["request"]["status"] == "passed"
+    overlap = [shot, {**shot, "id": "b", "start_frame": 1, "end_frame": 3}]
+    blocked = by_name(preflight(swap(site, max_frames=4, segments=overlap)))
+    assert blocked["request"]["status"] == "blocked"
+    wide = [{**segment, "parameters": {"SwapModelSelection": "SimSwap512"}}]
+    assert by_name(preflight(swap(site, max_frames=4, segments=wide)))["request"]["status"] == (
+        "blocked"
+    )
+
+
 # Media: the worker's own checks, range-limited timing, normalization as a suggestion
 
 
