@@ -46,13 +46,36 @@ JobId = Annotated[
         "or hyphens, starting with a letter or digit. Omit it (or pass null) to generate one."
     ),
 ]
-Priority = Annotated[
+FAIRNESS = (
+    "Interactive jobs start first; a waiting normal job goes next after 3 interactive jobs in a "
+    "row or 300 s of them. Never interrupts a running job."
+)
+
+
+def priority_field(default):
+    return Annotated[
+        Literal["interactive", "normal"] | None,
+        Field(description=f"GPU queue class. Default: {default}. {FAIRNESS}"),
+    ]
+
+
+Priority = priority_field(
+    "interactive for detection, previews, reference analysis and still comparisons, normal "
+    "for renders and clip comparisons. Pass normal for batch work that should not delay "
+    "others' previews"
+)
+ResumePriority = priority_field(
+    "the earlier render's priority if it was given explicitly, otherwise normal"
+)
+RecipePriority = priority_field(
+    "the priority the recipe stores, otherwise interactive for a preview and normal for a render"
+)
+StoredPriority = Annotated[
     Literal["interactive", "normal"] | None,
     Field(
-        description="GPU queue class. Default: interactive for detection, previews, reference "
-        "analysis and still comparisons, normal for renders and clip comparisons. Interactive jobs start first; a waiting normal job goes next after 3 "
-        "interactive jobs in a row or 300 s of them. Pass normal for batch work that should "
-        "not delay others' previews. Never interrupts a running job."
+        description="GPU queue class stored with the recipe for the jobs run_recipe queues "
+        "from it (run_recipe can override it). Default: none stored, so a preview queues as "
+        f"interactive and a render as normal. {FAIRNESS}"
     ),
 ]
 
@@ -616,14 +639,16 @@ async def job_status(
     """Read durable queued/running/completed/failed/cancelled state, progress and results.
 
     With wait_seconds > 0 the call blocks on the workstation until the job's status, progress
-    stage or queue position/reason differs from its value at call time, the job is terminal,
-    or the wait elapses, then returns the current state. Frame counts advancing within a stage
-    do not end the wait. The worker log tail is returned when include_log is true or the job
-    failed. GPU jobs carry `priority` and `sequence` (FIFO order within a class); while queued,
-    `queue` gives an advisory `position` (1 = next to start), `reason` (next, gpu_busy,
-    behind_earlier, behind_interactive, behind_due_normal, cancel_requested, starting),
-    `interactive_streak` and `waiting_seconds`. Positions can change as jobs arrive, end or
-    become due under the fairness rule; there is no start-time estimate.
+    stage (or a comparison's running variant) or queue position/reason differs from its value
+    at call time, the job is terminal, or the wait elapses, then returns the current state.
+    Frame counts advancing within a stage do not end the wait. The worker log tail is returned
+    when include_log is true or the job failed. GPU jobs carry `priority` and `sequence` (FIFO
+    order within a class); while queued, `queue` gives an advisory `position` (1 = next to
+    start), `reason` (next, gpu_busy, behind_earlier, behind_interactive, behind_due_normal,
+    cancel_requested, or starting: no queue entry yet, while being admitted or, for a render or
+    recipe job, while its inputs are hashed before it joins, with progress stage
+    fingerprinting), `interactive_streak` and `waiting_seconds`. Positions can change as jobs
+    arrive, end or become due under the fairness rule; there is no start-time estimate.
     """
     return await command(
         "status",
@@ -647,8 +672,8 @@ async def list_jobs(
     for normalization; references for reference analysis; frames or start_frame/max_frames
     and variant names for comparisons), created/started/finished
     timestamps, elapsed_seconds since submission (until finish), error and progress; GPU
-    jobs add priority and sequence, and queued ones the advisory queue standing that
-    job_status describes. Use job_status for results and logs.
+    jobs add priority and sequence, queued ones the advisory queue standing that job_status
+    describes, and a resumed render resume_from. Use job_status for results and logs.
     """
     return await command("list", status=status, kind=kind, limit=limit)
 
@@ -665,7 +690,7 @@ async def resume_render(
         str, Field(description="The failed or cancelled render to continue; it is not changed")
     ],
     job_id: JobId = None,
-    priority: Priority = None,
+    priority: ResumePriority = None,
 ) -> dict[str, Any]:
     """Queue a new render that reuses the verified chunks of a failed or cancelled render.
 
@@ -752,7 +777,7 @@ async def save_recipe(
     controls: dict | None = None,
     report: SwapReportOptions | None = None,
     segments: Segments = None,
-    priority: Priority = None,
+    priority: StoredPriority = None,
     note: Annotated[str | None, Field(max_length=2000)] = None,
 ) -> dict[str, Any]:
     """Save a new immutable revision of a named, reusable swap configuration (a recipe).
@@ -846,7 +871,7 @@ async def run_recipe(
         Field(description="Substitute frames; required with a new clip or a changed mode"),
     ] = None,
     report: SwapReportOptions | None = None,
-    priority: Priority = None,
+    priority: RecipePriority = None,
     accept_changes: Annotated[
         bool,
         Field(
