@@ -190,3 +190,17 @@ All 29 findings from the whole-tree code review (`vmcp-review-remediation-qpn`) 
 ## Remaining limits
 
 The supervisor-loss, mirrored-matrix, RGB, 10-bit, anamorphic, VFR and audio-overlap behaviors were verified with synthetic fixtures and stub Fusion workers on both FFmpeg versions, not with live GPU renders. Follow-ups: `vmcp-n88` (artifacts of non-completed jobs are accepted as inputs), `vmcp-y0h` (non-standard source matrices and limited-range gray under FFmpeg 8) and `vmcp-tsb` (descendants survive if the cancellation guard is killed on its own).
+
+# Follow-up fixes on 2026-11-07
+
+Resolves the three follow-ups listed above.
+
+## Changes
+
+- `vmcp-n88`: job artifacts are accepted as inputs only once the producing job's state is `completed`. This applies at submission, in the worker's revalidation and in `inspect_media`, with the state directory inside or outside the media root.
+- `vmcp-y0h`: sources tagged with matrices the scaler cannot apply (ycgco, bt2020c, ictcp, smpte2085, chroma-derived and reserved) are refused before any artifact, with transcoding guidance. FFmpeg 8 rejected them, and 6.1 had silently decoded them with the wrong coefficients. Limited-range gray is now converted at the correct levels on both versions.
+- `vmcp-tsb`: if the process-group guard dies, the supervisor stops the group at once and fails the job. If the supervisor dies as well, reconciliation stops only processes in the recorded group that carry the job's random token, rechecking each one through a pidfd before signalling.
+
+## Automated checks
+
+macOS (FFmpeg 8.1): `uv run --locked pytest -q` gave 471 passed, 2 skipped (two Linux-only guard tests); Ruff check and format and the privacy audit were clean. Linux workstation copy (FFmpeg 6.1, system Python 3.12): 453 passed, 1 skipped, with the 19 privacy-audit tests deselected because the copy had no Git checkout. No test processes remained on either machine. The new tests fail against the previous code: 32 of 36 for artifact inputs, 41 of 53 on FFmpeg 6.1 for matrices and gray, and all of the guard-loss cases.
