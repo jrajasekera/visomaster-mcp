@@ -1,6 +1,8 @@
 """Version-pinned adapter to Fusion's FrameWorker and FunctionWorker."""
 
+import bisect
 import contextlib
+import copy
 import ctypes
 import functools
 import hashlib
@@ -36,6 +38,7 @@ from common import (
     layouts,
     probe,
     read_json,
+    segment_plan,
     validate_request,
     variant_request,
 )
@@ -1046,7 +1049,8 @@ def process(worker, bgr, index):
     worker.frame = np.ascontiguousarray(bgr[..., ::-1])
     worker.frame_number = index
     control = worker.main_window.control
-    worker.telemetry.begin(index)
+    # Mappings a segment leaves unbound are not requested in this frame.
+    worker.telemetry.begin(index, worker.main_window.target_faces)
     # Fusion catches some per-face exceptions. Turn its logged errors into job failures.
     captured = io.StringIO()
     try:
@@ -1675,6 +1679,132 @@ def output_audio(metadata, expected, end, missing):
     return audio
 
 
+SEGMENT_CONVENTION = (
+    "Zero-based source frame indices in decoded order, in half-open ranges: start_frame is the "
+    "first frame and end_frame the first frame after it. Segments are clipped to the rendered "
+    "frames; applied gives the frames each one covers."
+)
+GAPS = "Frames outside every segment use the base mappings, parameters and controls."
+BOUNDARIES = (
+    "Every run starts with fresh temporal state. With tracking or keypoint smoothing on, the "
+    "SequentialDetector is reset at a run's first frame (ByteTrack tracks and history, identity "
+    "memory and keypoint smoothing), and ByteTrack is re-created with the run's controls. The "
+    "per-frame path keeps no state between frames. Passthrough frames are encoded as decoded, "
+    "without detection."
+)
+
+
+class Segments:
+    """A render's segment plan applied frame by frame (DESIGN.md, Segments).
+
+    A frame's run follows from its index alone. Entering a run other than passthrough binds its
+    mappings with their parameters and the segment's overrides, sets its controls and the
+    thresholds telemetry classifies with, and resets the sequential detector.
+    """
+
+    def __init__(self, worker, runs):
+        window = worker.main_window
+        self.worker, self.runs = worker, runs
+        self.starts = [run["start_frame"] for run in runs]
+        self.targets = dict(window.target_faces)
+        self.parameters = {face_id: copy.copy(p) for face_id, p in window.parameters.items()}
+        self.control = dict(window.control)
+        self.thresholds = dict(worker.telemetry.thresholds)
+        self.current = None
+        self.stats = [{"frames": 0, "swaps": 0, "swapped_frames": 0} for _ in runs]
+
+    def at(self, frame):
+        """The number of the run holding `frame`; entering it unless it is the current run."""
+        number = bisect.bisect_right(self.starts, frame) - 1
+        if number != self.current:
+            self.current = number
+            if not self.runs[number]["passthrough"]:
+                self.enter(self.runs[number])
+        return number
+
+    def settings(self, run):
+        """(controls, {mapping ID: parameters}) a run swaps with."""
+        parameters = {}
+        for index in run["mappings"]:
+            values = copy.copy(self.parameters[str(index)])
+            values.update(run["parameters"])
+            parameters[str(index)] = values
+        return {**self.control, **run["controls"]}, parameters
+
+    def enter(self, run):
+        window = self.worker.main_window
+        controls, parameters = self.settings(run)
+        # Fusion and the worker read these live, so they are refilled in place.
+        window.target_faces.clear()
+        window.target_faces.update((face_id, self.targets[face_id]) for face_id in parameters)
+        window.parameters.clear()
+        window.parameters.update(parameters)
+        window.control.update(controls)
+        thresholds = self.worker.telemetry.thresholds
+        thresholds.update(self.thresholds)
+        for face_id, values in parameters.items():
+            thresholds[face_id] = float(values["SimilarityThresholdSlider"])
+        if self.worker.detector is not None:
+            self.worker.detector.reset_state()
+
+    def count(self, number, swaps):
+        stats = self.stats[number]
+        stats["frames"] += 1
+        stats["swaps"] += swaps
+        stats["swapped_frames"] += swaps > 0
+
+    def document(self, segments, start, end):
+        """plan.json: each segment with the frames it covers, and every run with the effective
+        allowlisted controls and per-mapping parameters it swaps with."""
+        applied = {run["segment"]: run for run in self.runs if run["segment"] is not None}
+        entries = []
+        for segment in segments:
+            run = applied[segment["id"]]
+            span = [run["start_frame"], run["end_frame"]]
+            clipped = span != [segment["start_frame"], segment["end_frame"]]
+            entries.append({**segment, "applied": span, "clipped": clipped})
+        runs = []
+        for run in self.runs:
+            controls, parameters = self.settings(run)
+            effective = {
+                "controls": {key: controls[key] for key in sorted(CONTROLS) if key in controls},
+                "parameters": {
+                    face_id: {key: values[key] for key in sorted(PARAMETERS) if key in values}
+                    for face_id, values in parameters.items()
+                },
+            }
+            runs.append({**run, "effective": None if run["passthrough"] else effective})
+        return {
+            "version": 1,
+            "conventions": SEGMENT_CONVENTION,
+            "gaps": GAPS,
+            "boundaries": BOUNDARIES,
+            "start_frame": start,
+            "end_frame": end,
+            "segments": entries,
+            "runs": runs,
+        }
+
+    def summary(self):
+        """Every run with its frame and swap counts, for the result and the swap report."""
+        keys = ("segment", "start_frame", "end_frame", "passthrough", "mappings")
+        return [{**{k: run[k] for k in keys}, **s} for run, s in zip(self.runs, self.stats)]
+
+    def warnings(self):
+        """Advisory: a segment that requested swaps and swapped no face."""
+        found = []
+        for run, stats in zip(self.runs, self.stats):
+            if run["segment"] is not None and not run["passthrough"] and not stats["swaps"]:
+                message = (
+                    f"Segment {run['segment']} [{run['start_frame']}, {run['end_frame']}) "
+                    f"swapped no face in its {stats['frames']} frames"
+                )
+                found.append(
+                    {"segment": run["segment"], "code": "segment_never_swapped", "message": message}
+                )
+        return found
+
+
 def clip_range(source, request):
     """(metadata, video stream, rate, start, frame count) of the CFR range a render processes:
     `start_frame` and at most `max_frames` frames (None: through the end). Renders, comparison
@@ -1722,11 +1852,14 @@ def preview_source(source, frame):
 
 def render_video(window, request, directory, worker):
     artifacts = directory / "artifacts"
+    shown = False
 
     def first(offset, frame, swapped):
-        if offset == 0:
+        nonlocal shown
+        if not shown:  # The first frame processed, which follows any leading passthrough.
             save_image(artifacts / "before.jpg", frame)
             save_image(artifacts / "preview.jpg", swapped)
+            shown = True
 
     clip = encode_range(request, directory, worker, "result.mp4", first)
     report, fps, start = clip.report, clip.fps, clip.start
@@ -1750,8 +1883,9 @@ def render_video(window, request, directory, worker):
             }
         )
     atomic_json(artifacts / "swap-report.json", report)
-    names = [r["artifact"] for r in report["review_images"]]
-    return {
+    names = ["plan.json"] if clip.plan else []
+    names += [r["artifact"] for r in report["review_images"]]
+    result = {
         "frames": clip.frames,
         "fps": str(fps),
         "duration": clip.duration,
@@ -1760,22 +1894,33 @@ def render_video(window, request, directory, worker):
         "swap_report": report_summary(report),
         "artifacts": ["result.mp4", "preview.jpg", "before.jpg", "swap-report.json", *names],
     }
+    if clip.plan:
+        result["plan"] = report["plan"]
+    return result
 
 
 def encode_range(request, directory, worker, name, observe, progress=None):
     """Process a render request's range into the validated video artifact `name`.
 
-    `observe(offset, source frame, swapped frame)` sees each frame before it is encoded.
+    `observe(offset, source frame, swapped frame)` sees each processed frame before it is
+    encoded; passthrough frames of a segmented render are encoded as decoded, unobserved.
     `progress` adds fields to each progress record (stage "rendering" by default). Returns the
-    clip's source, streams, rate, range, audio and swap report (review images not yet added).
+    clip's source, streams, rate, range, audio, segment plan (None for a uniform render) and swap
+    report (review images not yet added).
     """
     source = input_path(request["media_path"])
     metadata, stream, fps, start, expected = clip_range(source, request)
     options = request.get("report") or {}
     telemetry = worker.telemetry
     telemetry.expect(expected_ranges(options, start + expected))
-    video_only = directory / f"{Path(name).stem}.video-only.mp4"
+    segments, plan = request.get("segments"), None
     artifacts = directory / "artifacts"
+    if segments:
+        # The whole plan is resolved, and refused if a segment misses the frames, before work.
+        runs = segment_plan(segments, start, start + expected, len(request["mappings"]))
+        plan = Segments(worker, runs)
+        atomic_json(artifacts / "plan.json", plan.document(segments, start, start + expected))
+    video_only = directory / f"{Path(name).stem}.video-only.mp4"
     encoder = None
     frames = decode(source, stream, start, expected)
     processed = 0
@@ -1788,14 +1933,23 @@ def encode_range(request, directory, worker, name, observe, progress=None):
         started = time.monotonic()
         for offset in range(expected):
             frame = next(frames, None)
+            index = start + offset
             if frame is None:
-                raise RuntimeError(
-                    f"Input decoding stopped at {start + offset}, expected {expected} frames"
-                )
-            swapped = process(worker, frame, start + offset)
-            if swapped.shape[:2] != (height, width):
-                raise RuntimeError("Fusion changed the frame dimensions")
-            observe(offset, frame, swapped)
+                raise RuntimeError(f"Input decoding stopped at {index}, expected {expected} frames")
+            number = plan.at(index) if plan else None
+            swaps = worker.swap_count
+            if plan and plan.runs[number]["passthrough"]:
+                # Decoded pixels go to the encoder unchanged, and no mapping is requested.
+                telemetry.begin(index, ())
+                telemetry.end()
+                swapped = frame
+            else:
+                swapped = process(worker, frame, index)
+                if swapped.shape[:2] != (height, width):
+                    raise RuntimeError("Fusion changed the frame dimensions")
+                observe(offset, frame, swapped)
+            if plan:
+                plan.count(number, worker.swap_count - swaps)
             encoder.stdin.write(swapped.tobytes())
             processed += 1
             rate = processed / max(time.monotonic() - started, 1e-6)
@@ -1809,6 +1963,7 @@ def encode_range(request, directory, worker, name, observe, progress=None):
                     "swapped_faces": worker.swap_count,
                     "frames_per_second": round(rate, 2),
                     "eta_seconds": round((expected - processed) / rate, 1),
+                    **({"segment": plan.runs[number]["segment"]} if plan else {}),
                 },
             )
         encoder.stdin.close()
@@ -1824,9 +1979,16 @@ def encode_range(request, directory, worker, name, observe, progress=None):
             with contextlib.suppress(OSError):
                 encoder.stdin.close()
     if worker.swap_count == 0:
-        raise RuntimeError("No faces matched the target references in the requested range")
+        # Passthrough frames request no swap; the frames that do must swap a face somewhere.
+        raise RuntimeError(
+            "No faces matched the target references in the requested range"
+            + (" outside passthrough segments" if plan else "")
+        )
     telemetry.finish(start + processed)
     report = swap_report(request, telemetry, fps, start)
+    if plan:
+        report["plan"] = {"artifact": "plan.json", "runs": plan.summary()}
+        report["warnings"] += plan.warnings()
     shortfalls = coverage_shortfalls(report)
     if shortfalls:
         raise RuntimeError(
@@ -1858,6 +2020,7 @@ def encode_range(request, directory, worker, name, observe, progress=None):
         frames=processed,
         duration=duration,
         audio="AAC" if emitted else "none",
+        plan=plan,
         report=report,
     )
 

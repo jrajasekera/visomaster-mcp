@@ -1973,7 +1973,7 @@ MAPPING_KEYS = (
 )
 RANGE = {"preview": ("frame",), "render": ("start_frame", "max_frames")}
 # Request fields a recipe carries besides its inputs and range; priority only schedules.
-CARRIED = ("controls", "report", "priority")
+CARRIED = ("controls", "report", "priority", "segments")
 INTENT_KEYS = {"kind", "media_path", "mappings", "frame", "start_frame", "max_frames", *CARRIED}
 RUN_KEYS = {
     "name",
@@ -2403,8 +2403,9 @@ def instantiate(template, request):
         new["kind"] = mode
         for key in RANGE[template["kind"]]:
             new.pop(key)
-        if mode == "preview" and "report" in new:
-            substitutions["report"] = {"recorded": new.pop("report"), "used": None}
+        for key in ("report", "segments") if mode == "preview" else ():
+            if key in new:
+                substitutions[key] = {"recorded": new.pop(key), "used": None}
     if request.get("media_path") is not None:
         path = str(input_path(request["media_path"]))
         if path != template["media_path"]:
@@ -2481,6 +2482,12 @@ def run_recipe(request):
         expected = (template.get("report") or {}).get("expected_visible")
         needed = [key for key in ("targets", "range") if request.get(key) is None]
         needed += ["report"] if expected and request.get("report") is None else []
+        if media != template["media_sha256"] and template.get("segments"):
+            raise ValueError(
+                "media_path has different content from the recipe's clip, and the recipe's "
+                "segments name frames of that clip; save a recipe for the new clip with its own "
+                "segments"
+            )
         if media != template["media_sha256"] and needed:
             raise ValueError(
                 "media_path has different content from the recipe's clip, so applying the "

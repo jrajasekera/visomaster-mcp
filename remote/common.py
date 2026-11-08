@@ -180,6 +180,17 @@ QUALIFICATIONS = (
         "max_sources": 1,
     },
 )
+# Render segments (DESIGN.md, Segments). Selections that load models or choose the detection path
+# hold for the whole render, so a segment cannot set them.
+MAX_SEGMENTS = 100
+SEGMENT_CHANGES = ("mappings", "parameters", "controls")
+SEGMENT_KEYS = {"id", "start_frame", "end_frame", "passthrough", *SEGMENT_CHANGES}
+RENDER_WIDE = {
+    "SwapModelSelection",
+    "DetectorModelSelection",
+    "FaceTrackingEnableToggle",
+    "KPSSmoothingEnableToggle",
+}
 
 
 class ConfigError(Exception):
@@ -759,6 +770,8 @@ def validate_fusion_request(request):
         if request["kind"] != "render":
             raise ValueError("report options apply only to renders")
         validate_report(request["report"], request, len(mappings))
+    if "segments" in request:
+        validate_segments(request, len(mappings), control, parameters)
     return request
 
 
@@ -846,6 +859,135 @@ def validate_comparison(request):
             message = str(error) if isinstance(error, ValueError) else f"invalid request ({error})"
             raise ValueError(f"Variant {variant['name']}: {message}") from None
     return request
+
+
+def validate_segments(request, count, control, parameters):
+    """A render's segments: half-open source-frame ranges [start_frame, end_frame), listed in
+    ascending order without overlap, each with a unique id and either passthrough or changes
+    (mappings, parameters, controls). A segment must intersect the rendered frames; the worker
+    checks again once the video's length is known."""
+    segments = request["segments"]
+    if request["kind"] != "render":
+        raise ValueError("segments apply only to renders")
+    if not isinstance(segments, list) or not 1 <= len(segments) <= MAX_SEGMENTS:
+        raise ValueError(
+            f"segments must list 1–{MAX_SEGMENTS} segments; omit it for a uniform render"
+        )
+    first, limit = request.get("start_frame", 0), request.get("max_frames")
+    names, previous = set(), None
+    for segment in segments:
+        if not isinstance(segment, dict) or not {"id", "start_frame", "end_frame"} <= set(segment):
+            raise ValueError("Each segment needs id, start_frame and end_frame")
+        unknown = sorted(set(segment) - SEGMENT_KEYS)
+        if unknown:
+            raise ValueError(f"Unknown segment fields {', '.join(unknown)}")
+        name, low, high = segment["id"], segment["start_frame"], segment["end_frame"]
+        if not isinstance(name, str) or not JOB_ID.fullmatch(name):
+            raise ValueError(
+                "Segment ids are 1–64 letters, digits, underscores or hyphens, starting with a "
+                "letter or digit"
+            )
+        if name in names:
+            raise ValueError(f"Segment id {name} is used twice")
+        names.add(name)
+        if type(low) is not int or type(high) is not int or not 0 <= low < high:
+            raise ValueError(
+                f"Segment {name} needs integer frames with 0 <= start_frame < end_frame "
+                "(end_frame is the first frame after it)"
+            )
+        if previous is not None and low < previous["end_frame"]:
+            if low < previous["start_frame"]:
+                raise ValueError("Segments must be listed in ascending start_frame order")
+            raise ValueError(
+                f"Segments {previous['id']} [{previous['start_frame']}, {previous['end_frame']}) "
+                f"and {name} [{low}, {high}) overlap; a frame belongs to at most one segment"
+            )
+        previous = segment
+        if high <= first:
+            raise ValueError(
+                f"Segment {name} [{low}, {high}) ends before the rendered frames start at {first}"
+            )
+        changes = [key for key in SEGMENT_CHANGES if key in segment]
+        if "passthrough" in segment:
+            if segment["passthrough"] is not True:
+                raise ValueError(f"Segment {name}: passthrough must be true when given")
+            if changes:
+                raise ValueError(
+                    f"Segment {name} is passthrough, so it cannot also set {', '.join(changes)}"
+                )
+            continue
+        if not any(segment[key] for key in changes):
+            raise ValueError(
+                f"Segment {name} changes nothing; give passthrough, mappings, parameters or controls"
+            )
+        chosen = segment.get("mappings")
+        if chosen is not None and (
+            not isinstance(chosen, list)
+            or not chosen
+            or any(type(i) is not int or not 0 <= i < count for i in chosen)
+            or len(set(chosen)) != len(chosen)
+        ):
+            raise ValueError(
+                f"Segment {name} mappings must list distinct indices into mappings (0–{count - 1})"
+            )
+        for key, specs, allowed in (
+            ("parameters", parameters, PARAMETERS),
+            ("controls", control, CONTROLS),
+        ):
+            values = segment.get(key, {})
+            fixed = sorted(set(values) & RENDER_WIDE) if isinstance(values, dict) else []
+            if fixed:
+                raise ValueError(
+                    f"Segment {name} cannot set {', '.join(fixed)}: model selections and tracking "
+                    "toggles hold for the whole render"
+                )
+            validate_settings(values, specs, allowed)
+    if limit is not None:
+        segment_plan(segments, first, first + limit, count)
+
+
+def segment_plan(segments, start, end, count):
+    """Runs covering the rendered frames [start, end) in order: each segment clipped to them,
+    and the gaps between, which use the base mappings, parameters and controls.
+
+    A run has its segment's id (None for a gap), range, passthrough flag, active mapping indices
+    and the segment's parameter and control overrides. Raises ValueError for a segment outside
+    the frames, or when every frame is passthrough, which leaves nothing to swap.
+    """
+    runs, cursor = [], start
+
+    def run(segment, low, high):
+        segment = segment or {}
+        passthrough = segment.get("passthrough", False)
+        return {
+            "segment": segment.get("id"),
+            "start_frame": low,
+            "end_frame": high,
+            "passthrough": passthrough,
+            "mappings": [] if passthrough else list(segment.get("mappings", range(count))),
+            "parameters": segment.get("parameters", {}),
+            "controls": segment.get("controls", {}),
+        }
+
+    for segment in segments:
+        low, high = max(segment["start_frame"], start), min(segment["end_frame"], end)
+        if low >= high:
+            raise ValueError(
+                f"Segment {segment['id']} [{segment['start_frame']}, {segment['end_frame']}) lies "
+                f"outside the rendered frames [{start}, {end})"
+            )
+        if low > cursor:
+            runs.append(run(None, cursor, low))
+        runs.append(run(segment, low, high))
+        cursor = high
+    if cursor < end:
+        runs.append(run(None, cursor, end))
+    if all(entry["passthrough"] for entry in runs):
+        raise ValueError(
+            f"Every rendered frame [{start}, {end}) is passthrough, so there is nothing to swap; "
+            "use the source media, or render frames outside the passthrough segments"
+        )
+    return runs
 
 
 def validate_analysis(request):

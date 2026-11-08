@@ -148,6 +148,52 @@ class SwapReportOptions(BaseModel):
     )
 
 
+class Segment(BaseModel):
+    """Frames [start_frame, end_frame) of a render with their own intent: passthrough, or any of
+    mappings, parameters and controls replacing the base request's within them."""
+
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+        description="Stable segment ID, unique in the request, reported in plan.json and results",
+    )
+    start_frame: int = Field(ge=0, description="First zero-based source frame")
+    end_frame: int = Field(ge=1, description="First source frame after the segment (exclusive)")
+    passthrough: Literal[True] | None = Field(
+        None,
+        description="Leave these frames exactly as decoded (no detection or swap); excludes the "
+        "other changes",
+    )
+    mappings: list[int] | None = Field(
+        None,
+        min_length=1,
+        max_length=20,
+        description="Zero-based indices into mappings that swap here; the others are not "
+        "requested in these frames. Default: all",
+    )
+    parameters: dict | None = Field(
+        None,
+        description="Fusion parameters (see get_settings) applied over every active mapping's "
+        "own here; SwapModelSelection holds for the whole render",
+    )
+    controls: dict | None = Field(
+        None,
+        description="Controls over the request's here; DetectorModelSelection and the tracking "
+        "toggles hold for the whole render",
+    )
+
+
+Segments = Annotated[
+    list[Segment] | None,
+    Field(
+        max_length=100,
+        description="Renders only: ordered, non-overlapping source-frame segments. Frames outside "
+        "every segment (gaps) use the base mappings, parameters and controls. Segments are "
+        "clipped to the rendered frames and must intersect them. Omit for a uniform render.",
+    ),
+]
+
+
 async def ssh(arguments, data=None, timeout=45, stdin=None, stdout=asyncio.subprocess.PIPE):
     # Settings are validated per call, so discovery works before the client is configured.
     settings = transport()
@@ -279,6 +325,7 @@ async def submit_swap(
     max_frames: int | None = None,
     controls: dict | None = None,
     report: SwapReportOptions | None = None,
+    segments: Segments = None,
     job_id: JobId = None,
     priority: Priority = None,
 ) -> dict[str, Any]:
@@ -310,15 +357,35 @@ async def submit_swap(
 
     preflight_swap takes these same arguments and reports, without starting anything, whether
     this request can start and what to fix.
+
+    `segments` (renders only) change intent by source-frame range [start_frame, end_frame)
+    without changing the timeline: a segment may restrict which `mappings` swap, override
+    `parameters` (for every active mapping) or `controls`, or pass frames through untouched.
+    Gaps use the base settings. Overlaps, unknown or render-wide settings, and contradictory
+    or empty segments are refused at submission; a render whose frames are all passthrough is
+    refused. Frame count, order, timing and audio are unchanged. Temporal tracking state is
+    reset at every segment boundary. The result's `plan` lists each run (segment or gap) with
+    its frames and swaps, and plan.json records the resolved settings of every run; the render
+    still fails when no face swaps outside passthrough frames, and a segment that swapped
+    nothing is a warning.
     """
     request = swap_request(
-        media_path, mappings, mode, frame, start_frame, max_frames, controls, report, priority
+        media_path,
+        mappings,
+        mode,
+        frame,
+        start_frame,
+        max_frames,
+        controls,
+        report,
+        priority,
+        segments,
     )
     return await command("submit", job_id=uuid.uuid4().hex if job_id is None else job_id, **request)
 
 
 def swap_request(
-    media_path, mappings, mode, frame, start_frame, max_frames, controls, report, priority
+    media_path, mappings, mode, frame, start_frame, max_frames, controls, report, priority, segments
 ):
     """The submit_swap request without its job_id; preflight_swap checks exactly this."""
     return {
@@ -331,6 +398,7 @@ def swap_request(
         "max_frames": max_frames,
         "controls": controls or {},
         **({} if report is None else {"report": report.model_dump(exclude_none=True)}),
+        **({} if segments is None else {"segments": dump_segments(segments)}),
         **({} if priority is None else {"priority": priority}),
     }
 
@@ -345,6 +413,7 @@ async def preflight_swap(
     max_frames: int | None = None,
     controls: dict | None = None,
     report: SwapReportOptions | None = None,
+    segments: Segments = None,
     job_id: JobId = None,
     priority: Priority = None,
     analyze_references: Annotated[
@@ -378,7 +447,16 @@ async def preflight_swap(
     files), with `checked_at`. A preflight reserves nothing: submit_swap checks again.
     """
     request = swap_request(
-        media_path, mappings, mode, frame, start_frame, max_frames, controls, report, priority
+        media_path,
+        mappings,
+        mode,
+        frame,
+        start_frame,
+        max_frames,
+        controls,
+        report,
+        priority,
+        segments,
     )
     return await command(
         "preflight",
@@ -387,6 +465,10 @@ async def preflight_swap(
         analyze=analyze_references,
         client_code=local_code(),
     )
+
+
+def dump_segments(segments):
+    return [segment.model_dump(exclude_none=True) for segment in segments]
 
 
 @mcp.tool(annotations=WRITE)
@@ -631,6 +713,7 @@ async def save_recipe(
     max_frames: int | None = None,
     controls: dict | None = None,
     report: SwapReportOptions | None = None,
+    segments: Segments = None,
     priority: Priority = None,
     note: Annotated[str | None, Field(max_length=2000)] = None,
 ) -> dict[str, Any]:
@@ -646,7 +729,7 @@ async def save_recipe(
     Face references are copied into the content-addressed upload store and kept while a recipe
     names them; `retention` says which inputs are retained. Media and models are hashed now,
     so a large video takes a while. Saving again under a name adds a revision; earlier
-    revisions, and jobs that name them, never change.
+    revisions, and jobs that name them, never change. A render's `segments` are kept as given.
     """
     if job_id is not None:
         return await command(
@@ -659,6 +742,7 @@ async def save_recipe(
         frames["max_frames"] = max_frames
     optional = (
         ("report", None if report is None else report.model_dump(exclude_none=True)),
+        ("segments", None if segments is None else dump_segments(segments)),
         ("priority", priority),
         ("note", note),
     )
