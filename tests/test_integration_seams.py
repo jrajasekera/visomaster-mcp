@@ -239,3 +239,53 @@ def test_hard_linked_chunks_count_once_and_only_when_freed(jobs_backend):
     assert preview["total_bytes"] == own["a"] + own["b"] + 1000
     assert control.delete_job("a")["bytes"] == own["a"]
     assert control.delete_job("b")["bytes"] == own["b"] + 1000  # Now its last link.
+
+
+# Sources of weight 0 (finding 5)
+
+
+def test_weight_zero_sources_are_neither_read_nor_required(site):
+    missing = str(site.media / "never-written.png")
+    mapping = {
+        "target_face": site.face,
+        "source_faces": [site.source, missing],
+        "source_weights": [1, 0],
+    }
+    request = swap(site, mode="preview", mappings=[mapping])
+    common.validate_request(request)
+    with pytest.raises(ValueError, match="absolute"):
+        common.validate_request(
+            {**request, "mappings": [{**mapping, "source_faces": [site.source, "relative.png"]}]}
+        )
+    # A pin on an excluded source is not checked; a null pin leaves a read source to submission.
+    pinned = {**mapping, "source_sha256": [None, "0" * 64]}
+    common.validate_request({**request, "mappings": [pinned]})
+    resolved = control.fingerprint(control.resolve_inputs({**request, "mappings": [pinned]}))
+    assert resolved["mappings"][0]["source_sha256"] == [common.file_sha256(site.source), None]
+    assert list(common.recorded_inputs(resolved)) == [
+        "media_path",
+        "mappings[0].target_face",
+        "mappings[0].source_faces[0]",
+    ]
+    report = by_name(preflight(request))
+    assert report["references"]["status"] == "passed"
+    references = report["references"]["evidence"]["references"]
+    assert references[2] == {
+        "mapping": 0,
+        "role": "source",
+        "path": missing,
+        "sha256": None,
+        "weight": 0,
+    }
+
+
+def test_clients_may_leave_a_source_unpinned():
+    from visomaster_mcp import server
+
+    mapping = server.FaceMapping(
+        target_face="/m/t.png",
+        source_faces=["/m/a.png", "/m/b.png"],
+        source_weights=[1, 0],
+        source_sha256=["0" * 64, None],
+    )
+    assert mapping.model_dump(exclude_none=True)["source_sha256"] == ["0" * 64, None]

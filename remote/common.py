@@ -491,16 +491,26 @@ def reference_path(value, expected=None):
 
 
 def digests(values, count, key):
-    """Expected SHA-256 values, one per reference, or Nones when omitted."""
+    """Expected SHA-256 values, one per reference, or Nones when omitted. A null entry pins
+    nothing; submission records the file's SHA-256 unless its weight is 0."""
     if values is None:
         return [None] * count
     if (
         not isinstance(values, list)
         or len(values) != count
-        or not all(isinstance(v, str) and SHA256.fullmatch(v) for v in values)
+        or not all(v is None or isinstance(v, str) and SHA256.fullmatch(v) for v in values)
     ):
-        raise ValueError(f"{key} must list one 64-hex-digit SHA-256 per reference")
+        raise ValueError(f"{key} must list one 64-hex-digit SHA-256 per reference, or null")
     return values
+
+
+def positive(mapping):
+    """Indexes of the sources a mapping reads: those with a positive (or omitted) weight. A
+    source of weight 0 is excluded without being read, hashed or required to exist."""
+    count = len(mapping["source_faces"])
+    weights = mapping.get("source_weights")
+    weights = weights if isinstance(weights, list) and len(weights) == count else [1] * count
+    return [i for i, w in enumerate(weights) if type(w) in (int, float) and w > 0]
 
 
 def validate_weights(weights, count):
@@ -786,9 +796,14 @@ def validate_fusion_request(request):
         if not isinstance(sources, list) or not 1 <= len(sources) <= MAX_REFERENCES:
             raise ValueError("Each mapping requires 1–20 source images")
         expected = digests(mapping.get("source_sha256"), len(sources), "source_sha256")
-        for source, digest in zip(sources, expected):
-            reference_path(source, digest)
         validate_weights(mapping.get("source_weights"), len(sources))
+        read = positive(mapping)
+        for number, (source, digest) in enumerate(zip(sources, expected)):
+            if number in read:
+                reference_path(source, digest)
+            elif not (isinstance(source, str) and os.path.isabs(source)):
+                message = f"Source images must be absolute workstation paths: {source!r}"
+                raise Refusal("path_not_absolute", message)
         validate_settings(mapping.get("parameters", {}), parameters, PARAMETERS)
     if "report" in request:
         if request["kind"] != "render":
@@ -1277,7 +1292,8 @@ def code_identity(directory=None):
 
 
 def recorded_inputs(request):
-    """Each input of a swap request keyed by its place, with the SHA-256 the request records."""
+    """Each input a swap request reads keyed by its place, with the SHA-256 the request
+    records; sources of weight 0 are not read, so they are not inputs."""
     inputs = {"media_path": {"path": request["media_path"], "sha256": request.get("media_sha256")}}
     for index, mapping in enumerate(request["mappings"]):
         place = f"mappings[{index}]"
@@ -1286,8 +1302,10 @@ def recorded_inputs(request):
             "sha256": mapping.get("target_sha256"),
         }
         digests = mapping.get("source_sha256") or [None] * len(mapping["source_faces"])
+        read = positive(mapping)  # The output does not depend on a source of weight 0.
         for number, (path, digest) in enumerate(zip(mapping["source_faces"], digests)):
-            inputs[f"{place}.source_faces[{number}]"] = {"path": path, "sha256": digest}
+            if number in read:
+                inputs[f"{place}.source_faces[{number}]"] = {"path": path, "sha256": digest}
     return inputs
 
 

@@ -65,6 +65,7 @@ from common import (  # noqa: E402
     load_config,
     model_catalog,
     model_choices,
+    positive,
     probe,
     provenance,
     provenance_changes,
@@ -1047,14 +1048,19 @@ def resolve_inputs(request):
 
 def fingerprint(resolved):
     """Record the SHA-256 of each face reference the worker will read, unless the request gave
-    one (validation has compared those), so the worker uses exactly the bytes submitted."""
+    one (validation has compared those), so the worker uses exactly the bytes submitted. A
+    source of weight 0 is never read, so it gets none."""
     if isinstance(resolved.get("references"), list) and resolved.get("reference_sha256") is None:
         resolved["reference_sha256"] = [file_sha256(path) for path in resolved["references"]]
     for mapping in resolved.get("mappings") or []:
         if mapping.get("target_sha256") is None:
             mapping["target_sha256"] = file_sha256(mapping["target_face"])
-        if mapping.get("source_sha256") is None:
-            mapping["source_sha256"] = [file_sha256(path) for path in mapping["source_faces"]]
+        given = mapping.get("source_sha256") or [None] * len(mapping["source_faces"])
+        read = positive(mapping)
+        mapping["source_sha256"] = [
+            (digest or file_sha256(path)) if number in read else None
+            for number, (path, digest) in enumerate(zip(mapping["source_faces"], given))
+        ]
     return resolved
 
 
@@ -1429,14 +1435,6 @@ def gpu_observation():
     }
 
 
-def positive(mapping):
-    """Indexes of the sources a mapping reads: those with a positive (or omitted) weight."""
-    count = len(mapping["source_faces"])
-    weights = mapping.get("source_weights")
-    weights = weights if isinstance(weights, list) and len(weights) == count else [1] * count
-    return [i for i, w in enumerate(weights) if type(w) in (int, float) and w > 0]
-
-
 def combinations(request, control, parameters):
     """Each mapping's model choices (common.model_choices) with its weighted source count, for
     the base settings and then for each segment that overrides them (segment None: the base)."""
@@ -1639,9 +1637,15 @@ def path_checks(request, checks):
         given = given or [None] * len(sources)
         roles += [("source", path, digest) for path, digest in zip(sources, given)]
         digests.append([])
-        for role, value, digest in roles:
+        read = [0, *(1 + number for number in positive(mapping))]  # The target, then sources.
+        for number, (role, value, digest) in enumerate(roles):
             digest = digest if isinstance(digest, str) else None
             item = {"mapping": index, "role": role, "path": value}
+            if number not in read:
+                item.update(sha256=None, weight=0)  # Excluded, so submission never reads it.
+                items.append(item)
+                digests[-1].append(None)
+                continue
             try:
                 path = reference_path(value, digest)  # Hashes the file when a digest is given.
                 item.update(sha256=digest or file_sha256(path), bytes=path.stat().st_size)
@@ -2313,7 +2317,7 @@ def apply_digests(request, inputs):
         place = f"mappings[{index}]"
         mapping["target_sha256"] = inputs[f"{place}.target_face"]["sha256"]
         mapping["source_sha256"] = [
-            inputs[f"{place}.source_faces[{number}]"]["sha256"]
+            inputs.get(f"{place}.source_faces[{number}]", {}).get("sha256")  # None: weight 0.
             for number in range(len(mapping["source_faces"]))
         ]
 
@@ -2382,7 +2386,7 @@ def retain(request):
         for mapping in request["mappings"]:
             mapping["target_face"] = keep(mapping["target_face"], mapping["target_sha256"])
             mapping["source_faces"] = [
-                keep(path, digest)
+                keep(path, digest) if digest else path  # A source of weight 0 is not an input.
                 for path, digest in zip(mapping["source_faces"], mapping["source_sha256"])
             ]
     except BaseException:

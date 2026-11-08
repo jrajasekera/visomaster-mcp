@@ -76,10 +76,11 @@ class FaceMapping(BaseModel):
         "averaged with these weights, then L2-normalized as Fusion's merge does, so only their "
         "ratios matter. Omit for equal weights (the plain average).",
     )
-    source_sha256: list[Digest] | None = Field(
+    source_sha256: list[Digest | None] | None = Field(
         None,
         description="Optional SHA-256 per source image, in source_faces order, as "
-        "analyze_references reported them. Submission fails if any file's bytes changed since.",
+        "analyze_references reported them. Submission fails if any file's bytes changed since. "
+        "null pins nothing for that image; an image with weight 0 is never read or checked.",
     )
     parameters: dict = Field(
         default_factory=dict, description="Validated Fusion keys from get_settings"

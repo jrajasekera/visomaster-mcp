@@ -443,6 +443,22 @@ def test_run_submits_the_explicit_request_and_records_its_parent(site):
         run(job_id="plain")
 
 
+def test_sources_of_weight_zero_are_not_recipe_inputs(site):
+    # Excluded images are never read, so they need not exist and are neither hashed nor kept.
+    missing = os.path.realpath(site.media / "never-written.png")
+    mapping = {"target_face": site.face, "source_faces": [site.source, missing]}
+    document = saved(site, mappings=[{**mapping, "source_weights": [1, 0]}])
+    stored = document["request"]["mappings"][0]
+    assert stored["source_faces"][1] == missing and stored["source_sha256"][1] is None
+    assert "mappings[0].source_faces[1]" not in control.retention_report(document["request"])
+    verified = control.get_recipe({"name": "shot", "verify": True})["verification"]
+    assert verified == {"unchanged": True, "changes": []}
+    assert run()["status"] == "queued"
+    resolved = common.read_json(common.job_path("from-recipe") / "resolved.json")
+    assert resolved["mappings"][0]["source_sha256"][1] is None
+    assert complete("from-recipe")["result"] == {"validated": True}
+
+
 def test_same_content_at_another_path_needs_no_new_decisions(site):
     saved(site)
     moved = Path(site.media) / "moved.mp4"
