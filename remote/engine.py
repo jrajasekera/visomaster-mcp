@@ -678,7 +678,7 @@ def inspect_reference(window, entry, image, model, thresholds):
     entry["faces"] = len(boxes)
     if len(boxes) != 1:
         entry["boxes"] = [[int(v) for v in box[:4]] for box in boxes]
-        if boxes:
+        if len(boxes):
             message = f"{len(boxes)} faces detected; crop it to one face (detect_faces does)"
             finding(entry, "multiple_faces", "error", message)
         else:

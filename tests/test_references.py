@@ -57,6 +57,15 @@ def face(embedding, box=(100, 80, 260, 260)):
     return (list(box), embedding)
 
 
+class Detections(list):
+    """Fusion's detections are a NumPy array, whose truth value is an error unless it has one item."""
+
+    def __bool__(self):
+        if len(self) != 1:
+            raise ValueError("The truth value of an array with more than one element is ambiguous")
+        return True
+
+
 @pytest.fixture
 def fusion(tmp_path, monkeypatch):
     """Stub Fusion for the engine: references, detection, recognition and image output."""
@@ -73,7 +82,8 @@ def fusion(tmp_path, monkeypatch):
         return (None if embedding is None else Vector(embedding)), None
 
     def detect(window, image):
-        return image, [box for box, _ in image.faces], [embedding for _, embedding in image.faces]
+        boxes = Detections(box for box, _ in image.faces)
+        return image, boxes, [embedding for _, embedding in image.faces]
 
     window = SimpleNamespace(
         control={"RecognitionModelSelection": "Inswapper128ArcFace"},
