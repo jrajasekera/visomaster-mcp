@@ -204,3 +204,7 @@ Resolves the three follow-ups listed above.
 ## Automated checks
 
 macOS (FFmpeg 8.1): `uv run --locked pytest -q` gave 471 passed, 2 skipped (two Linux-only guard tests); Ruff check and format and the privacy audit were clean. Linux workstation copy (FFmpeg 6.1, system Python 3.12): 453 passed, 1 skipped, with the 19 privacy-audit tests deselected because the copy had no Git checkout. No test processes remained on either machine. The new tests fail against the previous code: 32 of 36 for artifact inputs, 41 of 53 on FFmpeg 6.1 for matrices and gray, and all of the guard-loss cases.
+
+## Production checks
+
+The release deployed while no jobs were active. Health reported `compatible: true`, with no compatibility reason or configuration error. The GPU smoke test on the close-up clip recorded `hash_status: match`. Detection completed; the preview swapped 1 face; a 24-frame render completed with 24 swaps and AAC audio. The reconnected session found the disconnect render running, and cancellation passed on the running path. No worker, FFmpeg or supervisor processes remained afterwards, and `claude mcp list` reported the server connected.
