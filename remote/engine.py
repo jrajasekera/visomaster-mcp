@@ -95,7 +95,8 @@ def video_stream(metadata):
 
 
 HDR = {"smpte2084": "PQ", "arib-std-b67": "HLG"}
-# FFprobe colorspace names mapped to swscale matrix names.
+# FFprobe colorspace names mapped to swscale matrix names. Other matrices are rejected: swscale
+# has none, so FFmpeg 8 cannot convert them and 6.1 silently applies other coefficients.
 MATRICES = {
     "bt709": "bt709",
     "smpte170m": "smpte170m",
@@ -136,11 +137,18 @@ def color(stream):
         )
     if rgb(stream):
         return None, "pc"
+    space = stream.get("color_space", "unknown")
+    if space != "unknown" and space not in MATRICES:
+        raise ValueError(
+            f"Video with the {space} matrix is not supported because FFmpeg's scaler cannot "
+            "convert it; transcode it to BT.709 with a tool that supports that matrix, such as "
+            "FFmpeg's zscale filter, and use the result"
+        )
     tagged = stream.get("color_range")
     # Untagged gray is full range, as swscale treats it and FFmpeg 8 reports it.
     gray = pixel_format(stream).get("nb_components", 3) < 3 and tagged != "tv"
     full = tagged == "pc" or stream.get("pix_fmt", "").startswith("yuvj") or gray
-    return MATRICES.get(stream.get("color_space")), "pc" if full else "tv"
+    return MATRICES.get(space), "pc" if full else "tv"
 
 
 def output_color(stream):
@@ -150,14 +158,32 @@ def output_color(stream):
     return ("bt709", "tv") if rgb(stream) else source
 
 
+def limited_gray(stream):
+    """Filters presenting limited-range gray as limited-range YUV of the same depth. swscale
+    treats gray as full range whatever its tag (FFmpeg 8 at every depth, 6.1 at 8 bits), so its
+    codes are copied unchanged and only then tagged limited."""
+    format_ = pixel_format(stream)
+    if rgb(stream) or format_.get("nb_components", 3) > 2 or color(stream)[1] != "tv":
+        return []
+    depth = max((c["bit_depth"] for c in format_.get("components", [])), default=8)
+    name = "yuv444p" if depth == 8 else f"yuv444p{depth}le"
+    name = name if name in pixel_formats() else "yuv444p16le"
+    return [
+        f"scale=in_range=pc:out_range=pc:flags={SWS_FLAGS}",
+        f"format={name}",
+        "setparams=range=tv",
+    ]
+
+
 def scale_filter(stream, *sides):
-    """swscale options converting from the source's colors ("in") and to the output's ("out")."""
+    """swscale conversion from the source's colors ("in") and to the output's ("out")."""
     options = []
     for side in sides:
         matrix, value = color(stream) if side == "in" else output_color(stream)
         options += [f"{side}_color_matrix={matrix}"] if matrix else []
         options.append(f"{side}_range={value}")
-    return "scale=" + ":".join(options + [f"flags={SWS_FLAGS}"])
+    convert = "scale=" + ":".join(options + [f"flags={SWS_FLAGS}"])
+    return ",".join((limited_gray(stream) if "in" in sides else []) + [convert])
 
 
 def deep_color(stream):
